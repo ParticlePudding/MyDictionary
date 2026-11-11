@@ -90,7 +90,7 @@ impl Config {
 }
 
 pub fn default_ini() -> String {
-    "; fastdict 設定ファイル(UTF-8)。編集後はトレイアイコンの右クリック →「設定を再読み込み」で反映されます。\r\n\
+    "; MyDictionary 設定ファイル(UTF-8)。編集後はトレイアイコンの右クリック →「設定ファイルを再読み込み」で反映されます。\r\n\
 ; 先頭が ; または # の行はコメントです。\r\n\
 \r\n\
 [general]\r\n\
@@ -180,7 +180,7 @@ pub fn parse_hotkey(s: &str) -> Option<Hotkey> {
 /// `base` と同じフォルダにある辞書はファイル名だけで書く。
 pub fn to_ini(cfg: &Config, base: &Path) -> String {
     let mut s = String::new();
-    s.push_str("; fastdict 設定ファイル(UTF-8)。設定ダイアログからも変更できます。\r\n\r\n[general]\r\n");
+    s.push_str("; MyDictionary 設定ファイル(UTF-8)。設定ダイアログからも変更できます。\r\n\r\n[general]\r\n");
     s.push_str(&format!("hotkey = {}\r\n", cfg.hotkey.as_ref().map_or("none".to_string(), |h| h.text.clone())));
     s.push_str(&format!("close_to_tray = {}\r\n", cfg.close_to_tray));
     s.push_str(&format!("sort = {}\r\n", cfg.sort.key()));

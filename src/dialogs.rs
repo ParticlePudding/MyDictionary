@@ -39,9 +39,9 @@ unsafe fn register_classes() {
     REGISTER.call_once(|| {
         let hinst = GetModuleHandleW(None).unwrap();
         for (name, proc) in [
-            (w!("FastDictEntry"), entry_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
-            (w!("FastDictSettings"), settings_proc),
-            (w!("FastDictSelect"), select_proc),
+            (w!("MyDictionaryEntry"), entry_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
+            (w!("MyDictionarySettings"), settings_proc),
+            (w!("MyDictionarySelect"), select_proc),
         ] {
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -231,7 +231,7 @@ pub unsafe fn entry_dialog(owner: HWND, data: &mut EntryDlg) -> bool {
     data.ok = false;
     let h = entry_height(data.show_choice);
     let title = data.title.clone();
-    run_modal(owner, w!("FastDictEntry"), &title, 540, h, data as *mut EntryDlg as *const c_void);
+    run_modal(owner, w!("MyDictionaryEntry"), &title, 540, h, data as *mut EntryDlg as *const c_void);
     data.ok
 }
 
@@ -487,7 +487,7 @@ fn from_hk_ctrl(v: isize) -> (u32, u32) {
 /// 設定ダイアログ。保存されたら true(結果は `data` に入る)
 pub unsafe fn settings_dialog(owner: HWND, data: &mut SettingsDlg) -> bool {
     data.ok = false;
-    run_modal(owner, w!("FastDictSettings"), "設定", 640, 602, data as *mut SettingsDlg as *const c_void);
+    run_modal(owner, w!("MyDictionarySettings"), "設定", 640, 602, data as *mut SettingsDlg as *const c_void);
     data.ok
 }
 
@@ -1060,7 +1060,7 @@ struct SelectCtl {
 /// 検索に含める辞書を選ぶ。OK なら true(結果は `data.checked`)
 pub unsafe fn select_dialog(owner: HWND, data: &mut SelectDlg) -> bool {
     data.ok = false;
-    run_modal(owner, w!("FastDictSelect"), "検索する辞書", 420, 400, data as *mut SelectDlg as *const c_void);
+    run_modal(owner, w!("MyDictionarySelect"), "検索する辞書", 420, 400, data as *mut SelectDlg as *const c_void);
     data.ok
 }
 

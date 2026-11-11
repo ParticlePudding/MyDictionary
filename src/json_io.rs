@@ -2,7 +2,7 @@
 //!
 //! ```json
 //! {
-//!   "format": "fastdict",
+//!   "format": "MyDictionary",
 //!   "version": 1,
 //!   "entries": [
 //!     {
@@ -30,7 +30,7 @@ fn quote(s: &str) -> String {
 
 /// 辞書の内容を JSON にする(項目の順番を読みやすく保つため、手で組み立てる)
 pub fn export(entries: &[Entry]) -> String {
-    let mut out = String::from("{\n  \"format\": \"fastdict\",\n  \"version\": 1,\n  \"entries\": [");
+    let mut out = String::from("{\n  \"format\": \"MyDictionary\",\n  \"version\": 1,\n  \"entries\": [");
     for (i, e) in entries.iter().enumerate() {
         out.push_str(if i == 0 { "\n" } else { ",\n" });
         let list = |items: Vec<&str>| items.iter().map(|t| quote(t)).collect::<Vec<_>>().join(", ");
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn import_keeps_update_time() {
-        let dir = std::env::temp_dir().join(format!("fastdict-json-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("MyDictionary-json-{}", std::process::id()));
         let path = dir.join("d.db");
         let conn = core::open(&path).unwrap();
         core::migrate(&conn).unwrap();

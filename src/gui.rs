@@ -29,7 +29,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-const CLASS_NAME: PCWSTR = w!("FastDictMainWindow");
+const CLASS_NAME: PCWSTR = w!("MyDictionaryMainWindow");
 const ID_EDIT: usize = 100; // 全体検索
 const ID_LIST: usize = 101;
 const ID_RICH: usize = 102;
@@ -52,7 +52,6 @@ const HOTKEY_ID: i32 = 1;
 const WM_APP_LOADED: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW: u32 = WM_APP + 3;
-const WM_APP_RELOAD: u32 = WM_APP + 4;
 const WM_APP_LINK: u32 = WM_APP + 5; // 本文のリンクがクリックされた(lParam = Box<String>)
 const MENU_OPEN: usize = 1;
 const MENU_SETTINGS: usize = 2;
@@ -184,28 +183,28 @@ struct State {
 
 fn app_dir() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    base.join("fastdict")
+    base.join("MyDictionary")
 }
 
 /// バックアップ置き場(必ずローカル。ローミングされない LocalAppData を使う)
 fn backup_root() -> PathBuf {
     match std::env::var_os("LOCALAPPDATA") {
-        Some(p) => PathBuf::from(p).join("fastdict").join("backup"),
+        Some(p) => PathBuf::from(p).join("MyDictionary").join("backup"),
         None => app_dir().join("backup"),
     }
 }
 
-/// 設定ファイルの場所: exe と同じフォルダにあればそれ(ポータブル)、なければ %AppData%\fastdict
+/// 設定ファイルの場所: exe と同じフォルダにあればそれ(ポータブル)、なければ %AppData%\MyDictionary
 fn config_location() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("fastdict.ini");
+            let p = dir.join("MyDictionary.ini");
             if p.exists() {
                 return p;
             }
         }
     }
-    app_dir().join("fastdict.ini")
+    app_dir().join("MyDictionary.ini")
 }
 
 fn load_config() -> InitData {
@@ -244,7 +243,7 @@ pub fn run() {
         let background = std::env::args().any(|a| a == "--background");
 
         // 二重起動: 既存ウィンドウを呼び出して終了
-        let _mutex = CreateMutexW(None, true, w!("Local\\FastDictSingleInstance"));
+        let _mutex = CreateMutexW(None, true, w!("Local\\MyDictionarySingleInstance"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
             if let Ok(existing) = FindWindowW(CLASS_NAME, PCWSTR::null()) {
                 let _ = PostMessageW(existing, WM_APP_SHOW, WPARAM(0), LPARAM(0));
@@ -360,50 +359,6 @@ pub fn show_report(report: &str) {
         let _ = std::fs::write(&p, report);
         let text = format!("{report}\r\n(保存先: {})", p.display());
         let (t, c) = (wide(&text), wide("MyDictionary ベンチマーク"));
-        MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONINFORMATION);
-    }
-}
-
-/// `--add-sample`: サンプル辞書を作り、設定に追加する。
-/// 「サンプル」(約300語)と「サンプル2」(長い文章の20語)の2つ。普段の辞書とは別ファイルなので、
-/// 不要になったら設定で外すだけでよい。すでにある場合は、足りない語と読みを補う。
-pub fn add_sample() {
-    unsafe {
-        let init = load_config();
-        let mut cfg = init.cfg;
-        let base = init.cfg_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-        let mut lines: Vec<String> = Vec::new();
-        let mut changed = false;
-        for (name, file, tsv) in [("サンプル", "sample.db", core::SAMPLE_TSV), ("サンプル2", "sample2.db", core::SAMPLE2_TSV)] {
-            let path = base.join(file);
-            match core::create_sample(&path, tsv) {
-                Ok((added, updated)) => {
-                    lines.push(match (added, updated) {
-                        (0, 0) => format!("「{name}」は最新です(変更なし)。"),
-                        (a, 0) => format!("「{name}」に {a} 語を追加しました。"),
-                        (0, u) => format!("「{name}」の {u} 語に読みを追加しました。"),
-                        (a, u) => format!("「{name}」に {a} 語を追加し、{u} 語に読みを追加しました。"),
-                    });
-                    if !cfg.dicts.iter().any(|d| d.path == path) {
-                        cfg.dicts.push(config::DictConf { name: name.into(), path, readonly: false });
-                        changed = true;
-                    }
-                }
-                Err(e) => lines.push(format!("「{name}」を作成できませんでした: {e}")),
-            }
-        }
-        if changed {
-            match std::fs::write(&init.cfg_path, config::to_ini(&cfg, &base)) {
-                Ok(()) => lines.push("設定に辞書を追加しました。".into()),
-                Err(e) => lines.push(format!("設定ファイルを更新できませんでした: {e}")),
-            }
-        }
-        // 起動中なら、すぐ反映させる
-        if let Ok(existing) = FindWindowW(CLASS_NAME, PCWSTR::null()) {
-            let _ = PostMessageW(existing, WM_APP_RELOAD, WPARAM(0), LPARAM(0));
-        }
-        let text = format!("{}\n\n場所: {}\n不要になったら、設定の「辞書」から外してください(ファイルは残ります)。", lines.join("\n"), base.display());
-        let (t, c) = (wide(&text), wide("MyDictionary サンプルデータ"));
         MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONINFORMATION);
     }
 }
@@ -2179,13 +2134,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let target = *Box::from_raw(lparam.0 as *mut String);
             if let Some(st) = state(hwnd) {
                 open_link(hwnd, st, &target);
-            }
-            LRESULT(0)
-        }
-        WM_APP_RELOAD => {
-            // 別プロセス(--add-sample)が設定を書き換えたので読み直す
-            if let Some(st) = state(hwnd) {
-                reload_config(hwnd, st);
             }
             LRESULT(0)
         }
