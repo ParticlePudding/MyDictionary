@@ -643,12 +643,14 @@ pub fn link_kind(link: &str) -> LinkKind {
 
 /// 同梱のサンプルデータ(インポートできる TSV と同じ形式)
 pub const SAMPLE_TSV: &str = include_str!("../sample/sample.tsv");
+/// 長い文章のサンプル(複数段落・箇条書き・語どうしのリンク)
+pub const SAMPLE2_TSV: &str = include_str!("../sample/sample2.tsv");
 
 /// サンプル辞書を作る。すでにある場合は、足りない語を追加し、読みが空の語に読みを補う
 /// (利用者が編集した内容は変えない)。戻り値は (追加した語数, 読みを補った語数)。
-pub fn create_sample(path: &Path) -> rusqlite::Result<(usize, usize)> {
+pub fn create_sample(path: &Path, tsv: &str) -> rusqlite::Result<(usize, usize)> {
     let mut conn = open(path)?;
-    let (rows, _) = crate::import::to_rows(crate::import::parse_table(SAMPLE_TSV, '\t'));
+    let (rows, _) = crate::import::to_rows(crate::import::parse_table(tsv, '\t'));
     let tx = conn.transaction()?;
     migrate(&tx)?;
     let mut updated = 0;
@@ -1020,8 +1022,8 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("fastdict-sample-{}", std::process::id()));
         let path = dir.join("sample.db");
-        assert_eq!(create_sample(&path).unwrap(), (300, 0));
-        assert_eq!(create_sample(&path).unwrap(), (0, 0)); // 2回目は何も変えない
+        assert_eq!(create_sample(&path, SAMPLE_TSV).unwrap(), (300, 0));
+        assert_eq!(create_sample(&path, SAMPLE_TSV).unwrap(), (0, 0)); // 2回目は何も変えない
         // 読みの無い古いサンプル辞書は、読みだけ補う(語は増やさない)。利用者が付けた読みは変えない
         {
             let c = open(&path).unwrap();
@@ -1029,7 +1031,7 @@ mod tests {
             c.execute("UPDATE words SET reading = 'じぶんでつけた' WHERE word = '一期一会'", []).unwrap();
             c.execute("DELETE FROM words WHERE word = 'API'", []).unwrap();
         }
-        assert_eq!(create_sample(&path).unwrap(), (1, 158));
+        assert_eq!(create_sample(&path, SAMPLE_TSV).unwrap(), (1, 158));
         {
             let c = open(&path).unwrap();
             let get = |w: &str| c.query_row("SELECT reading FROM words WHERE word = ?1", [w], |r| r.get::<_, String>(0)).unwrap();
@@ -1040,6 +1042,25 @@ mod tests {
         assert_eq!(load_all(&c).unwrap().len(), 300);
         drop(c);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sample2_long_texts() {
+        let (rows, skipped) = crate::import::to_rows(crate::import::parse_table(SAMPLE2_TSV, '\t'));
+        assert_eq!((rows.len(), skipped), (20, 0));
+        // すべて読み付きで、複数段落の長文
+        assert!(rows.iter().all(|r| !r.reading.is_empty() && r.meaning.chars().count() >= 300 && r.meaning.contains("\n\n")));
+        // 文中と参照先の [[語]] は、サンプル1 か サンプル2 のどちらかに実在する語を指している
+        let (s1, _) = crate::import::to_rows(crate::import::parse_table(SAMPLE_TSV, '\t'));
+        let known: std::collections::HashSet<&str> = s1.iter().chain(rows.iter()).map(|r| r.word.as_str()).collect();
+        for r in &rows {
+            let targets = body_links(&r.meaning).1.into_iter().map(|l| l.2).chain(parse_links(&r.link).into_iter().map(|l| l.1));
+            for t in targets {
+                if let Some(w) = t.strip_prefix(WORD_SCHEME) {
+                    assert!(known.contains(w), "{} → [[{}]] が見つからない", r.word, w);
+                }
+            }
+        }
     }
 
     #[test]

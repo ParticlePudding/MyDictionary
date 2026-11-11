@@ -372,3 +372,24 @@ pub unsafe fn select_all_if_edit(msg: &MSG) -> bool {
     }
     false
 }
+
+/// WM_NEXTDLGCTL の処理。複数行の入力欄は、Tab での移動を親ウィンドウへこのメッセージで依頼する。
+/// 通常のダイアログなら既定の処理が行うが、自前のウィンドウでは自分で実装する必要がある。
+pub unsafe fn next_dlg_ctl(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+    let target = if lparam.0 & 0xFFFF != 0 {
+        HWND(wparam.0 as *mut std::ffi::c_void) // wParam が移動先のコントロール
+    } else {
+        // wParam が 0 なら次、0 以外なら前のコントロールへ
+        GetNextDlgTabItem(hwnd, GetFocus(), wparam.0 != 0).unwrap_or_default()
+    };
+    if !target.is_invalid() {
+        let _ = SetFocus(target);
+        // 1行の入力欄へ移ったときは、通常のダイアログと同じく全選択にする
+        let mut cls = [0u16; 16];
+        let n = GetClassNameW(target, &mut cls) as usize;
+        if String::from_utf16_lossy(&cls[..n]).eq_ignore_ascii_case("edit") && (GetWindowLongW(target, GWL_STYLE) as u32 & ES_MULTILINE as u32) == 0 {
+            send(target, 0x00B1 /* EM_SETSEL */, 0, -1);
+        }
+    }
+}
