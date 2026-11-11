@@ -21,6 +21,12 @@ const ID_EDIT: usize = 100;
 const ID_LIST: usize = 101;
 const ID_DETAIL: usize = 102;
 const ID_STATUS: usize = 103;
+const ID_WORD: usize = 104;
+const ID_TAGS: usize = 105;
+const ID_MEANING: usize = 106;
+const ID_ADD: usize = 107;
+const ID_DEL: usize = 108;
+const ID_LABEL: usize = 109;
 const HOTKEY_ID: i32 = 1;
 const WM_APP_LOADED: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
@@ -32,7 +38,14 @@ struct State {
     list: HWND,
     detail: HWND,
     status: HWND,
+    word: HWND,
+    tags: HWND,
+    meaning: HWND,
+    label: HWND,
+    btn_add: HWND,
+    btn_del: HWND,
     font: HFONT,
+    notice: Option<String>,
     entries: Vec<Entry>,
     matches: Vec<u32>,
     loaded: bool,
@@ -128,6 +141,16 @@ pub fn run() {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // 登録欄で Ctrl+Enter → 登録
+            if msg.message == WM_KEYDOWN && msg.wParam.0 == VK_RETURN.0 as usize && GetKeyState(VK_CONTROL.0 as i32) < 0 {
+                if let Some(st) = state(hwnd) {
+                    let f = GetFocus();
+                    if f == st.word || f == st.tags || f == st.meaning {
+                        let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_ADD | (BN_CLICKED as usize) << 16), LPARAM(0));
+                        continue;
+                    }
+                }
+            }
             if !IsDialogMessageW(hwnd, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -240,9 +263,28 @@ unsafe fn on_create(hwnd: HWND) -> State {
         hwnd,
         w!("EDIT"),
         WS_EX_CLIENTEDGE.0,
-        WS_TABSTOP.0 | WS_VSCROLL.0 | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32,
+        WS_VSCROLL.0 | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32,
         ID_DETAIL,
     );
+    let word = create_child(hwnd, w!("EDIT"), WS_EX_CLIENTEDGE.0, WS_TABSTOP.0 | ES_AUTOHSCROLL as u32, ID_WORD);
+    let cue = wide("見出し語");
+    send(word, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
+    let tags = create_child(hwnd, w!("EDIT"), WS_EX_CLIENTEDGE.0, WS_TABSTOP.0 | ES_AUTOHSCROLL as u32, ID_TAGS);
+    let cue = wide("タグ(スペース区切り・任意)");
+    send(tags, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
+    let label = create_child(hwnd, w!("STATIC"), 0, 0, ID_LABEL);
+    set_text(label, "意味(Ctrl+Enter で登録)");
+    let meaning = create_child(
+        hwnd,
+        w!("EDIT"),
+        WS_EX_CLIENTEDGE.0,
+        WS_TABSTOP.0 | WS_VSCROLL.0 | ES_MULTILINE as u32 | ES_WANTRETURN as u32 | ES_AUTOVSCROLL as u32,
+        ID_MEANING,
+    );
+    let btn_add = create_child(hwnd, w!("BUTTON"), 0, WS_TABSTOP.0, ID_ADD);
+    set_text(btn_add, "登録");
+    let btn_del = create_child(hwnd, w!("BUTTON"), 0, WS_TABSTOP.0, ID_DEL);
+    set_text(btn_del, "選択を削除");
     let status = create_child(hwnd, w!("STATIC"), 0, 0x0000000C /* SS_LEFTNOWORDWRAP */, ID_STATUS);
 
     // システムのメッセージフォント(日本語Windowsでは Yu Gothic UI / Meiryo UI)
@@ -257,7 +299,7 @@ unsafe fn on_create(hwnd: HWND) -> State {
         SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
     );
     let font = CreateFontIndirectW(&ncm.lfMessageFont);
-    for h in [edit, list, detail, status] {
+    for h in [edit, list, detail, status, word, tags, label, meaning, btn_add, btn_del] {
         send(h, WM_SETFONT, font.0 as usize, 1);
     }
     let _ = SetFocus(edit);
@@ -267,7 +309,14 @@ unsafe fn on_create(hwnd: HWND) -> State {
         list,
         detail,
         status,
+        word,
+        tags,
+        meaning,
+        label,
+        btn_add,
+        btn_del,
         font,
+        notice: None,
         entries: Vec::new(),
         matches: Vec::new(),
         loaded: false,
@@ -281,17 +330,29 @@ unsafe fn layout(hwnd: HWND, st: &State) {
     let _ = GetClientRect(hwnd, &mut rc);
     let dpi = GetDpiForWindow(hwnd).max(96) as i32;
     let s = |v: i32| v * dpi / 96;
-    let (m, edit_h, status_h, detail_h) = (s(8), s(28), s(20), s(130));
+    let (m, row_h, status_h, detail_h, label_h, meaning_h, btn_w) =
+        (s(8), s(28), s(20), s(90), s(18), s(64), s(100));
     let w = rc.right - 2 * m;
-    let mut y = m;
-    let _ = MoveWindow(st.edit, m, y, w, edit_h, true);
-    y += edit_h + m;
-    let list_h = (rc.bottom - y - m - detail_h - m - status_h - m).max(s(40));
-    let _ = MoveWindow(st.list, m, y, w, list_h, true);
-    y += list_h + m;
-    let _ = MoveWindow(st.detail, m, y, w, detail_h, true);
-    y += detail_h + m;
-    let _ = MoveWindow(st.status, m, y, w, status_h, true);
+    // 下から積む: ステータス / 意味+ボタン / ラベル / 見出し語+タグ / 詳細 、残りが一覧
+    let status_y = rc.bottom - m - status_h;
+    let meaning_y = status_y - m - meaning_h;
+    let label_y = meaning_y - label_h;
+    let word_y = label_y - m / 2 - row_h;
+    let detail_y = word_y - m - detail_h;
+    let list_y = m + row_h + m;
+    let list_h = (detail_y - m - list_y).max(s(40));
+    let _ = MoveWindow(st.edit, m, m, w, row_h, true);
+    let _ = MoveWindow(st.list, m, list_y, w, list_h, true);
+    let _ = MoveWindow(st.detail, m, detail_y, w, detail_h, true);
+    let word_w = w * 6 / 10;
+    let _ = MoveWindow(st.word, m, word_y, word_w, row_h, true);
+    let _ = MoveWindow(st.tags, m + word_w + m, word_y, w - word_w - m, row_h, true);
+    let _ = MoveWindow(st.label, m, label_y, w, label_h, true);
+    let _ = MoveWindow(st.meaning, m, meaning_y, w - btn_w - m, meaning_h, true);
+    let bh = (meaning_h - s(4)) / 2;
+    let _ = MoveWindow(st.btn_add, m + w - btn_w, meaning_y, btn_w, bh, true);
+    let _ = MoveWindow(st.btn_del, m + w - btn_w, meaning_y + bh + s(4), btn_w, bh, true);
+    let _ = MoveWindow(st.status, m, status_y, w, status_h, true);
 }
 
 unsafe fn get_text(h: HWND) -> String {
@@ -307,6 +368,7 @@ unsafe fn set_text(h: HWND, s: &str) {
 }
 
 unsafe fn refresh(st: &mut State) {
+    st.notice = None;
     let q = get_text(st.edit);
     st.matches = core::filter(&st.entries, &q);
     send(st.list, LVM_SETITEMCOUNT, st.matches.len(), 0);
@@ -330,7 +392,12 @@ unsafe fn update_status(st: &State) {
     } else if !st.loaded {
         "読み込み中…".to_string()
     } else {
-        format!("{} 件 / 全 {} 件", st.matches.len(), st.entries.len())
+        let last = core::last_update(&st.entries).map(core::format_jst).unwrap_or_else(|| "-".into());
+        format!("{} 件 / 全 {} 件  最終更新: {}", st.matches.len(), st.entries.len(), last)
+    };
+    let text = match &st.notice {
+        Some(n) => format!("{n}  |  {text}"),
+        None => text,
     };
     set_text(st.status, &text);
 }
@@ -345,6 +412,80 @@ unsafe fn show_detail(st: &State, row: usize) {
         s.push_str(&format!("更新: {}\r\n\r\n", core::format_jst(e.updated_at)));
         s.push_str(&e.meaning.replace("\r\n", "\n").replace('\n', "\r\n"));
         set_text(st.detail, &s);
+    }
+}
+
+unsafe fn notice(st: &mut State, msg: &str) {
+    st.notice = Some(msg.to_string());
+    update_status(st);
+}
+
+unsafe fn message_box(hwnd: HWND, text: &str, caption: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+    let (t, c) = (wide(text), wide(caption));
+    MessageBoxW(hwnd, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), style)
+}
+
+unsafe fn do_add(hwnd: HWND, st: &mut State) {
+    if !st.loaded || st.load_error.is_some() {
+        notice(st, "データベースの読み込みが完了していません");
+        return;
+    }
+    let word = get_text(st.word).trim().to_string();
+    let meaning = get_text(st.meaning).replace("\r\n", "\n").trim().to_string();
+    let tags = core::normalize_tags(&get_text(st.tags));
+    if word.is_empty() {
+        notice(st, "見出し語を入力してください");
+        let _ = SetFocus(st.word);
+        return;
+    }
+    if meaning.is_empty() {
+        notice(st, "意味を入力してください");
+        let _ = SetFocus(st.meaning);
+        return;
+    }
+    match core::open(&db_path()).and_then(|c| core::insert(&c, &word, &meaning, &tags)) {
+        Ok(entry) => {
+            st.entries.push(entry);
+            core::sort_entries(&mut st.entries);
+            set_text(st.word, "");
+            set_text(st.tags, "");
+            set_text(st.meaning, "");
+            refresh(st);
+            notice(st, &format!("「{word}」を登録しました"));
+            let _ = SetFocus(st.word);
+        }
+        Err(e) => {
+            message_box(hwnd, &format!("登録に失敗しました: {e}"), "エラー", MB_OK | MB_ICONERROR);
+        }
+    }
+}
+
+unsafe fn do_delete(hwnd: HWND, st: &mut State) {
+    let sel = send(st.list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize).0;
+    let Some(&idx) = (if sel >= 0 { st.matches.get(sel as usize) } else { None }) else {
+        notice(st, "削除する行を選択してください");
+        return;
+    };
+    let idx = idx as usize;
+    let (id, word) = (st.entries[idx].id, st.entries[idx].word.clone());
+    let ask = message_box(
+        hwnd,
+        &format!("「{word}」を削除しますか?\nこの操作は元に戻せません。"),
+        "削除の確認",
+        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+    );
+    if ask != IDYES {
+        return;
+    }
+    match core::open(&db_path()).and_then(|c| core::delete(&c, id)) {
+        Ok(_) => {
+            st.entries.remove(idx);
+            refresh(st);
+            notice(st, &format!("「{word}」を削除しました"));
+        }
+        Err(e) => {
+            message_box(hwnd, &format!("削除に失敗しました: {e}"), "エラー", MB_OK | MB_ICONERROR);
+        }
     }
 }
 
@@ -391,6 +532,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         refresh(st);
                     }
                 }
+            } else if id == ID_ADD && code == BN_CLICKED {
+                if let Some(st) = state(hwnd) {
+                    do_add(hwnd, st);
+                }
+            } else if id == ID_DEL && code == BN_CLICKED {
+                if let Some(st) = state(hwnd) {
+                    do_delete(hwnd, st);
+                }
             } else if id == IDCANCEL.0 as usize {
                 let _ = ShowWindow(hwnd, SW_HIDE); // Esc で隠す
             }
@@ -417,6 +566,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 .unwrap_or_default();
                             st.cell = wide(&text);
                             di.item.pszText = PWSTR(st.cell.as_mut_ptr());
+                        }
+                    } else if hdr.code == LVN_KEYDOWN {
+                        let kd = &*(lparam.0 as *const NMLVKEYDOWN);
+                        if kd.wVKey == VK_DELETE.0 {
+                            do_delete(hwnd, st);
                         }
                     } else if hdr.code == LVN_ITEMCHANGED {
                         let nm = &*(lparam.0 as *const NMLISTVIEW);
