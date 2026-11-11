@@ -9,7 +9,6 @@ use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Controls::Dialogs::*;
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
@@ -243,6 +242,10 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let tags = ui::field(hwnd, E_TAGS, (s(m), s(y + 22), s(fw), s(38)), dpi, false, &mut fields, fonts.base);
             y += 66;
 
+            label(hwnd, "意味", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
+            let meaning = ui::field(hwnd, E_MEANING, (s(m), s(y + 22), s(fw), s(150)), dpi, true, &mut fields, fonts.body);
+            y += 22 + 150 + 12;
+
             let hinst = GetModuleHandleW(None).unwrap();
             let combo = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -270,10 +273,6 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 let _ = ShowWindow(combo, SW_SHOW);
                 y += 62;
             }
-
-            label(hwnd, "意味", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
-            let meaning = ui::field(hwnd, E_MEANING, (s(m), s(y + 22), s(fw), s(150)), dpi, true, &mut fields, fonts.body);
-            y += 22 + 150 + 12;
 
             let err = label(hwnd, "", (s(m), s(y), s(fw), s(20)), fonts.small, E_ERR);
             y += 24;
@@ -386,14 +385,11 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
 
 pub struct SettingsDlg {
     pub cfg: Config,
-    pub autostart: bool,
     pub ok: bool,
 }
 
 const S_HOTKEY: usize = 401;
-const S_AUTOSTART: usize = 402;
 const S_TRAY: usize = 403;
-const S_TIMING: usize = 404;
 const S_LIST: usize = 410;
 const S_ADD: usize = 411;
 const S_DEL: usize = 412;
@@ -411,9 +407,7 @@ struct SettingsCtl {
     fonts: Fonts,
     dpi: i32,
     hotkey: HWND,
-    autostart: HWND,
     tray: HWND,
-    timing: HWND,
     list: HWND,
     name: HWND,
     path: HWND,
@@ -457,7 +451,7 @@ fn from_hk_ctrl(v: isize) -> (u32, u32) {
 /// 設定ダイアログ。保存されたら true(結果は `data` に入る)
 pub unsafe fn settings_dialog(owner: HWND, data: &mut SettingsDlg) -> bool {
     data.ok = false;
-    run_modal(owner, w!("FastDictSettings"), "設定", 640, 660, data as *mut SettingsDlg as *const c_void);
+    run_modal(owner, w!("FastDictSettings"), "設定", 640, 600, data as *mut SettingsDlg as *const c_void);
     data.ok
 }
 
@@ -600,11 +594,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 S_MUTED,
             );
             y += 46;
-            let autostart = checkbox(hwnd, "Windows にサインインしたとき自動で起動する(トレイに常駐)", S_AUTOSTART, (s(m), s(y), s(fw), s(26)), fonts.base, d.autostart);
-            y += 30;
             let tray = checkbox(hwnd, "閉じるボタンで終了せず、トレイに隠す", S_TRAY, (s(m), s(y), s(fw), s(26)), fonts.base, d.cfg.close_to_tray);
-            y += 30;
-            let timing = checkbox(hwnd, "起動時間の計測ログを timing.log に記録する", S_TIMING, (s(m), s(y), s(fw), s(26)), fonts.base, d.cfg.timing_log);
             y += 44;
 
             // --- 辞書 ---
@@ -666,9 +656,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 fonts,
                 dpi,
                 hotkey,
-                autostart,
                 tray,
-                timing,
                 list,
                 name,
                 path,
@@ -694,7 +682,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
                 let s = |v: i32| scale(v, c.dpi);
-                let ly = s(20 + 34 + 36 + 46 + 30 * 3 + 44 - 14);
+                let ly = s(20 + 34 + 36 + 46 + 44 - 9);
                 ui::fill(hdc, &RECT { left: s(24), top: ly, right: rc.right - s(24), bottom: ly + 1 }, BORDER);
             }
             let _ = EndPaint(hwnd, &ps);
@@ -832,9 +820,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                             }
                         }
                     }
-                    d.autostart = send(c.autostart, BM_GETCHECK_, 0, 0).0 == 1;
                     d.cfg.close_to_tray = send(c.tray, BM_GETCHECK_, 0, 0).0 == 1;
-                    d.cfg.timing_log = send(c.timing, BM_GETCHECK_, 0, 0).0 == 1;
                     d.ok = true;
                     let _ = DestroyWindow(hwnd);
                 }
@@ -859,42 +845,4 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
-}
-
-// ============================================================================
-// 自動起動(HKCU\...\Run)
-// ============================================================================
-
-const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
-const RUN_NAME: PCWSTR = w!("fastdict");
-
-pub unsafe fn autostart_enabled() -> bool {
-    let mut hk = HKEY::default();
-    if RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ, &mut hk).is_err() {
-        return false;
-    }
-    let found = RegQueryValueExW(hk, RUN_NAME, None, None, None, None).is_ok();
-    let _ = RegCloseKey(hk);
-    found
-}
-
-pub unsafe fn set_autostart(on: bool) -> Result<(), String> {
-    let mut hk = HKEY::default();
-    let r = RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_READ | KEY_WRITE, &mut hk);
-    if r.is_err() {
-        return Err(format!("レジストリを開けません ({})", r.0));
-    }
-    let result = if on {
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let cmd = wide(&format!("\"{}\" --background", exe.display()));
-        let bytes = std::slice::from_raw_parts(cmd.as_ptr() as *const u8, cmd.len() * 2);
-        let r = RegSetValueExW(hk, RUN_NAME, 0, REG_SZ, Some(bytes));
-        if r.is_err() { Err(format!("書き込めません ({})", r.0)) } else { Ok(()) }
-    } else {
-        let r = RegDeleteValueW(hk, RUN_NAME);
-        // 元から無い場合(ERROR_FILE_NOT_FOUND = 2)は成功扱い
-        if r.is_err() && r.0 != 2 { Err(format!("削除できません ({})", r.0)) } else { Ok(()) }
-    };
-    let _ = RegCloseKey(hk);
-    result
 }

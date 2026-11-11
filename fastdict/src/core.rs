@@ -45,11 +45,15 @@ pub struct Query {
     pub dict: Option<usize>,
 }
 
+pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let conn = Connection::open(path)?;
+    // 共有フォルダで他の人が書き込み中でも、すぐ失敗せず少し待つ
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS words (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,7 +68,9 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
 
 /// 参照専用で開く(ファイルが無ければエラー)
 pub fn open_ro(path: &Path) -> rusqlite::Result<Connection> {
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    Ok(conn)
 }
 
 /// 全件を読み込む。並べ替えは呼び出し側(sort_entries)で行う。
@@ -116,12 +122,15 @@ pub fn insert(conn: &Connection, word: &str, meaning: &str, tags: &str) -> rusql
     Ok(Entry::new(conn.last_insert_rowid(), word.into(), meaning.into(), tags.into(), ts))
 }
 
-/// 既存レコードを更新し、更新時刻(UNIX秒)を返す
-pub fn update(conn: &Connection, id: i64, word: &str, meaning: &str, tags: &str) -> rusqlite::Result<i64> {
-    let ts = now_unix();
+/// 既存レコードを更新し、新しい更新時刻(UNIX秒)を返す。
+/// `expected_ts`(読み込んだ時点の更新時刻)と一致しない場合は、他の人が先に変更/削除したとみなして
+/// `QueryReturnedNoRows` を返す(上書きしない)。
+pub fn update(conn: &Connection, id: i64, expected_ts: i64, word: &str, meaning: &str, tags: &str) -> rusqlite::Result<i64> {
+    // 同じ秒のうちに再編集しても更新時刻が必ず変わるようにする
+    let ts = now_unix().max(expected_ts + 1);
     let n = conn.execute(
-        "UPDATE words SET word = ?1, meaning = ?2, tags = ?3, updated_at = ?4 WHERE id = ?5",
-        params![word, meaning, tags, ts, id],
+        "UPDATE words SET word = ?1, meaning = ?2, tags = ?3, updated_at = ?4 WHERE id = ?5 AND updated_at = ?6",
+        params![word, meaning, tags, ts, id, expected_ts],
     )?;
     if n == 0 {
         return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -129,25 +138,18 @@ pub fn update(conn: &Connection, id: i64, word: &str, meaning: &str, tags: &str)
     Ok(ts)
 }
 
-/// 複数IDを1トランザクションで削除する(途中で失敗したら何も消さない)
-pub fn delete_many(conn: &mut Connection, ids: &[i64]) -> rusqlite::Result<usize> {
-    let tx = conn.transaction()?;
+/// 複数IDを削除する(トランザクションは呼び出し側で管理)
+pub fn delete_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<usize> {
     let mut n = 0;
     for id in ids {
-        n += tx.execute("DELETE FROM words WHERE id = ?1", params![id])?;
+        n += conn.execute("DELETE FROM words WHERE id = ?1", params![id])?;
     }
-    tx.commit()?;
     Ok(n)
 }
 
 /// 見出し語(大文字小文字無視)→ id 順に並べる(load_all と同じ順序)
 pub fn sort_entries(entries: &mut [Entry]) {
     entries.sort_unstable_by(|a, b| a.word_lc.cmp(&b.word_lc).then(a.dict.cmp(&b.dict)).then(a.id.cmp(&b.id)));
-}
-
-/// 最終更新(UNIX秒)。空なら None
-pub fn last_update(entries: &[Entry]) -> Option<i64> {
-    entries.iter().map(|e| e.updated_at).max()
 }
 
 fn split_tags(input: &str) -> impl Iterator<Item = &str> {
@@ -246,6 +248,65 @@ pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Ve
     }
     hits.sort_by_key(|h| h.0); // 安定ソート
     hits.into_iter().map(|h| h.1).collect()
+}
+
+impl Query {
+    /// 強調表示する語(小文字)。(見出し語用, 意味用, タグ用)
+    pub fn mark_terms(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let ws = |s: &str| s.to_lowercase().split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        let all = ws(&self.all);
+        let mut word = all.clone();
+        word.extend(ws(&self.word));
+        let mut meaning = all.clone();
+        meaning.extend(ws(&self.meaning));
+        let mut tag = all;
+        tag.extend(split_tags(&self.tag.to_lowercase()).map(str::to_owned));
+        (word, meaning, tag)
+    }
+}
+
+/// `text` の中で `terms`(小文字)に一致する範囲を、UTF-16 単位の (開始, 終了) で返す。
+/// 大文字小文字は無視。重なる範囲はまとめる。
+pub fn mark_ranges(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
+    if terms.is_empty() || text.is_empty() {
+        return Vec::new();
+    }
+    let low = |c: char| c.to_lowercase().next().unwrap_or(c);
+    let chars: Vec<char> = text.chars().map(low).collect();
+    // 各文字の UTF-16 上の開始位置
+    let mut pos16 = Vec::with_capacity(chars.len() + 1);
+    let mut p = 0;
+    for c in text.chars() {
+        pos16.push(p);
+        p += c.len_utf16();
+    }
+    pos16.push(p);
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for t in terms {
+        let tc: Vec<char> = t.chars().map(low).collect();
+        if tc.is_empty() || tc.len() > chars.len() {
+            continue;
+        }
+        let mut i = 0;
+        while i + tc.len() <= chars.len() {
+            if chars[i..i + tc.len()] == tc[..] {
+                ranges.push((pos16[i], pos16[i + tc.len()]));
+                i += tc.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for r in ranges {
+        match merged.last_mut() {
+            Some(last) if r.0 <= last.1 => last.1 = last.1.max(r.1),
+            _ => merged.push(r),
+        }
+    }
+    merged
 }
 
 /// 表示用: UNIX秒(UTC)を日本時間(UTC+9)の "yyyy/MM/dd HH:mm:ss" にする。
@@ -371,6 +432,23 @@ mod tests {
     }
 
     #[test]
+    fn marks() {
+        let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(mark_ranges("Apple pie, apple", &t(&["app"])), vec![(0, 3), (11, 14)]);
+        // 重なり・隣接はまとめる
+        assert_eq!(mark_ranges("abcd", &t(&["abc", "bcd"])), vec![(0, 4)]);
+        // 日本語、サロゲートペア(😀 は UTF-16 で2単位)
+        assert_eq!(mark_ranges("😀辞書の辞", &t(&["辞書"])), vec![(2, 4)]);
+        assert!(mark_ranges("abc", &t(&[])).is_empty());
+        assert!(mark_ranges("abc", &t(&["zzz", ""])).is_empty());
+        let q = Query { all: "A b".into(), word: "W".into(), tag: "t1,t2".into(), ..Default::default() };
+        let (w, m, tg) = q.mark_terms();
+        assert_eq!(w, t(&["a", "b", "w"]));
+        assert_eq!(m, t(&["a", "b"]));
+        assert_eq!(tg, t(&["a", "b", "t1", "t2"]));
+    }
+
+    #[test]
     fn jst_format() {
         assert_eq!(format_jst(0), "1970/01/01 09:00:00");
         assert_eq!(format_jst(1_700_000_000), "2023/11/15 07:13:20");
@@ -388,8 +466,6 @@ mod tests {
         ];
         sort_entries(&mut e);
         assert_eq!(e.iter().map(|x| x.id).collect::<Vec<_>>(), vec![3, 1, 2]);
-        assert_eq!(last_update(&e), Some(9));
-        assert_eq!(last_update(&[]), None);
     }
 
     #[test]
@@ -402,14 +478,15 @@ mod tests {
         let mut all = load_all(&conn).unwrap();
         sort_entries(&mut all);
         assert_eq!(all.iter().map(|e| e.word.as_str()).collect::<Vec<_>>(), vec!["A", "b"]);
-        let ts = update(&conn, a.id, "b2", "second!", "t1 t2").unwrap();
-        assert!(ts > 0);
-        assert!(update(&conn, 9999, "x", "y", "").is_err());
+        let ts = update(&conn, a.id, a.updated_at, "b2", "second!", "t1 t2").unwrap();
+        assert!(ts > a.updated_at);
+        assert!(update(&conn, 9999, 0, "x", "y", "").is_err());
+        // 他の人が先に変更していた(更新時刻が違う)場合は上書きしない
+        assert!(update(&conn, a.id, a.updated_at, "stale", "stale", "").is_err());
         let all = load_all(&conn).unwrap();
         let b = all.iter().find(|e| e.id == a.id).unwrap();
         assert_eq!((b.word.as_str(), b.meaning.as_str(), b.tags.as_str()), ("b2", "second!", "t1 t2"));
-        let mut conn = conn;
-        assert_eq!(delete_many(&mut conn, &[a.id, 12345]).unwrap(), 1);
+        assert_eq!(delete_ids(&conn, &[a.id, 12345]).unwrap(), 1);
         assert_eq!(load_all(&conn).unwrap().len(), 1);
         let ro = open_ro(&path).unwrap();
         assert_eq!(load_all(&ro).unwrap().len(), 1);
