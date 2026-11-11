@@ -25,6 +25,8 @@ pub const DANGER_SOFT: COLORREF = rgb(253, 236, 234);
 /// 検索語の強調表示
 pub const MARK: COLORREF = rgb(214, 32, 32);
 pub const HAIRLINE: COLORREF = rgb(236, 238, 241);
+/// しおりの ★
+pub const STAR: COLORREF = rgb(232, 163, 23);
 
 /// プログラムから入力欄を操作している間、通知(EN_CHANGE など)を無視するためのカウンタ
 pub static BUSY: AtomicU32 = AtomicU32::new(0);
@@ -323,4 +325,50 @@ pub unsafe fn text_width(hdc: HDC, text: &str) -> i32 {
     let mut s = SIZE::default();
     let _ = GetTextExtentPoint32W(hdc, &w, &mut s);
     s.cx
+}
+
+/// テキストをクリップボードへコピーする
+pub unsafe fn set_clipboard(hwnd: HWND, text: &str) -> bool {
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    let w = wide(&text.replace("\r\n", "\n").replace('\n', "\r\n"));
+    if OpenClipboard(hwnd).is_err() {
+        return false;
+    }
+    let _ = EmptyClipboard();
+    let ok = match GlobalAlloc(GMEM_MOVEABLE, w.len() * 2) {
+        Ok(h) => {
+            let p = GlobalLock(h) as *mut u16;
+            if p.is_null() {
+                false
+            } else {
+                std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
+                let _ = GlobalUnlock(h);
+                SetClipboardData(13 /* CF_UNICODETEXT */, HANDLE(h.0)).is_ok()
+            }
+        }
+        Err(_) => false,
+    };
+    let _ = CloseClipboard();
+    ok
+}
+
+/// Ctrl+A: フォーカスが入力欄(EDIT)にあれば全選択する。処理したら true。
+/// 複数行の入力欄は標準では Ctrl+A に対応していないため、メッセージループで補う。
+pub unsafe fn select_all_if_edit(msg: &MSG) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU};
+    if msg.message != WM_KEYDOWN || msg.wParam.0 != 'A' as usize {
+        return false;
+    }
+    if GetKeyState(VK_CONTROL.0 as i32) >= 0 || GetKeyState(VK_MENU.0 as i32) < 0 {
+        return false;
+    }
+    let f = GetFocus();
+    let mut cls = [0u16; 16];
+    let n = GetClassNameW(f, &mut cls) as usize;
+    if String::from_utf16_lossy(&cls[..n]).eq_ignore_ascii_case("edit") {
+        send(f, 0x00B1 /* EM_SETSEL */, 0, -1);
+        return true;
+    }
+    false
 }

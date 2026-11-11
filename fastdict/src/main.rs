@@ -1,6 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod bench;
+mod bookmarks;
 mod config;
 #[cfg(windows)]
 mod dialogs;

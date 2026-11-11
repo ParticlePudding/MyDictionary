@@ -37,11 +37,44 @@ pub struct DictConf {
     pub readonly: bool,
 }
 
+/// 候補リストの並び順
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sort {
+    /// 見出し語順(検索中は一致度の高い順)
+    Word,
+    /// 更新日時の古い順
+    UpdatedAsc,
+    /// 更新日時の新しい順
+    UpdatedDesc,
+    /// しおりに追加した順(しおり表示のときだけ。設定には保存しない)
+    Bookmark,
+}
+
+impl Sort {
+    pub fn key(self) -> &'static str {
+        match self {
+            Sort::UpdatedAsc => "updated_asc",
+            Sort::UpdatedDesc => "updated_desc",
+            _ => "word",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Sort> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "word" => Some(Sort::Word),
+            "updated_asc" => Some(Sort::UpdatedAsc),
+            "updated_desc" => Some(Sort::UpdatedDesc),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// None ならホットキー無効
     pub hotkey: Option<Hotkey>,
     pub close_to_tray: bool,
+    pub sort: Sort,
     pub dicts: Vec<DictConf>,
 }
 
@@ -50,6 +83,7 @@ impl Config {
         Config {
             hotkey: parse_hotkey("Ctrl+Alt+D"),
             close_to_tray: true,
+            sort: Sort::Word,
             dicts: vec![DictConf { name: "メイン".into(), path: base.join("dictionary.db"), readonly: false }],
         }
     }
@@ -149,6 +183,7 @@ pub fn to_ini(cfg: &Config, base: &Path) -> String {
     s.push_str("; fastdict 設定ファイル(UTF-8)。設定ダイアログからも変更できます。\r\n\r\n[general]\r\n");
     s.push_str(&format!("hotkey = {}\r\n", cfg.hotkey.as_ref().map_or("none".to_string(), |h| h.text.clone())));
     s.push_str(&format!("close_to_tray = {}\r\n", cfg.close_to_tray));
+    s.push_str(&format!("sort = {}\r\n", cfg.sort.key()));
     for (i, d) in cfg.dicts.iter().enumerate() {
         let path = match d.path.parent() {
             Some(p) if p == base => d.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
@@ -279,6 +314,10 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
                     Some(b) => cfg.close_to_tray = b,
                     None => warns.push(format!("設定: {}行目 close_to_tray は true / false", n + 1)),
                 },
+                "sort" => match Sort::from_key(v) {
+                    Some(x) => cfg.sort = x,
+                    None => warns.push(format!("設定: {}行目 sort は word / updated_asc / updated_desc", n + 1)),
+                },
                 "timing_log" => {} // 廃止した設定(古い設定ファイルに残っていても無視する)
                 _ => warns.push(format!("設定: {}行目 未知のキー {}", n + 1, k)),
             }
@@ -357,6 +396,7 @@ mod tests {
         let cfg = Config {
             hotkey: parse_hotkey("Ctrl+Shift+F5"),
             close_to_tray: false,
+            sort: Sort::UpdatedDesc,
             dicts: vec![
                 DictConf { name: "メイン".into(), path: base.join("dictionary.db"), readonly: false },
                 DictConf { name: "参照 用".into(), path: PathBuf::from("/other/dir/ref.db"), readonly: true },
@@ -366,6 +406,7 @@ mod tests {
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(back.hotkey, cfg.hotkey);
         assert!(!back.close_to_tray);
+        assert_eq!(back.sort, Sort::UpdatedDesc);
         assert_eq!(back.dicts, cfg.dicts);
         // ホットキー無し
         let none = Config { hotkey: None, ..cfg };

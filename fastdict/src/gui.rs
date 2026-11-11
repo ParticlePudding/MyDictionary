@@ -5,14 +5,15 @@
 //! - 登録・編集・設定はモーダルダイアログ。書き込みは safe モジュール経由(バックアップ + 検査 + ロールバック)
 //! - DBの読み込みは別スレッド。他の人の変更はウィンドウを前面に出したときに検知して読み直す
 
-use crate::config::{self, Config};
+use crate::bookmarks::Bookmarks;
+use crate::config::{self, Config, Sort};
 use crate::core::{self, Entry, Query};
 use crate::dialogs::{self, EntryDlg, SelectDlg, SettingsDlg};
 use crate::safe::{self, WriteError};
 use crate::ui::{self, quiet, scale, Btn, Fonts, BTN_W, CTL_H};
 use crate::ui::{get_text, send, set_text, wide};
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -44,16 +45,33 @@ const ID_NEW: usize = 116;
 const ID_SETTINGS: usize = 117;
 const ID_DEL: usize = 118;
 const ID_OPENLINK: usize = 119;
+const ID_SORT: usize = 121; // 並び順
+const ID_BMVIEW: usize = 122; // しおりだけ表示
+const ID_BM: usize = 123; // しおりを付ける/外す
+const ID_BACK: usize = 124; // リンクで移動する前に戻る
 const HOTKEY_ID: i32 = 1;
 const WM_APP_LOADED: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW: u32 = WM_APP + 3;
 const WM_APP_RELOAD: u32 = WM_APP + 4;
+const WM_APP_LINK: u32 = WM_APP + 5; // 本文のリンクがクリックされた(lParam = Box<String>)
 const MENU_OPEN: usize = 1;
 const MENU_SETTINGS: usize = 2;
 const MENU_OPEN_CFG: usize = 3;
 const MENU_RELOAD: usize = 4;
 const MENU_EXIT: usize = 5;
+// 右クリックメニュー
+const CM_COPY: usize = 201;
+const CM_SELECT_ALL: usize = 202;
+const CM_OPEN_LINK: usize = 203;
+const CM_COPY_LINK: usize = 204;
+const CM_COPY_WORD: usize = 211;
+const CM_COPY_MEANING: usize = 212;
+const CM_COPY_BOTH: usize = 213;
+const CM_EDIT: usize = 214;
+const CM_DELETE: usize = 215;
+const CM_BOOKMARK: usize = 216;
+const CM_SORT_BASE: usize = 300;
 
 const EN_SETFOCUS_: usize = 0x0100;
 const EN_KILLFOCUS_: usize = 0x0200;
@@ -107,11 +125,15 @@ struct State {
     btn_new: HWND,
     btn_set: HWND,
     // 左: 候補リスト
+    btn_bmview: HWND,
+    btn_sort: HWND,
+    list_sep: i32,
     list: HWND,
     imglist: HIMAGELIST,
     // 右: 本文
     rich: HWND,
     rich_ok: bool,
+    btn_bm: HWND,
     btn_edit: HWND,
     btn_del: HWND,
     status: HWND,
@@ -148,6 +170,19 @@ struct State {
     pending_select: Option<(usize, i64)>,
     /// 破損時の復元を一度たずねた辞書(同じ質問を繰り返さない)
     asked_restore: HashSet<PathBuf>,
+
+    /// しおり(各自の設定フォルダに保存)
+    bookmarks: Bookmarks,
+    bm_path: PathBuf,
+    /// (辞書の添字, id) → しおりの追加日時。描画・絞り込み用の索引
+    bm_map: HashMap<(usize, i64), i64>,
+    /// しおりだけを表示中
+    bm_view: bool,
+    sort: Sort,
+    /// しおり表示に入る前の並び順
+    prev_sort: Sort,
+    /// リンクで別の語へ移動する前の (検索語, 選択していた語)。Alt+← で戻る
+    history: Vec<(String, Option<(usize, i64)>)>,
 }
 
 fn app_dir() -> PathBuf {
@@ -282,6 +317,8 @@ pub fn run() {
                     Some(ID_SETTINGS)
                 } else if ctrl && vk == 'O' as u16 {
                     Some(ID_OPENLINK)
+                } else if ctrl && vk == 'D' as u16 {
+                    Some(ID_BM)
                 } else if vk == VK_F2.0 {
                     Some(ID_EDITBTN)
                 } else {
@@ -305,6 +342,14 @@ pub fn run() {
                         continue;
                     }
                 }
+            }
+            // Alt+←: リンクで移動する前の語に戻る
+            if msg.message == WM_SYSKEYDOWN && msg.wParam.0 == VK_LEFT.0 as usize && GetActiveWindow() == hwnd {
+                let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_BACK | BN_CLICKED_ << 16), LPARAM(0));
+                continue;
+            }
+            if ui::select_all_if_edit(&msg) {
+                continue;
             }
             if !IsDialogMessageW(hwnd, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
@@ -440,6 +485,8 @@ unsafe fn start_load(hwnd: HWND, st: &mut State, keep: bool) {
             .collect();
         st.dict_mask = vec![true; st.dicts.len()];
         update_dict_button(st);
+        rebuild_bm_map(st);
+        st.history.clear();
         send(st.list, LVM_SETITEMCOUNT, 0, 0);
         update_detail(st);
         update_status(st);
@@ -575,6 +622,8 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
     let qm = adv_edit(ID_QM, "意味で絞り込み");
     let qt = adv_edit(ID_QT, "タグで絞り込み(複数はスペース区切りで AND)");
 
+    let btn_bmview = owner_button(hwnd, ID_BMVIEW, "★ しおり");
+    let btn_sort = owner_button(hwnd, ID_SORT, "並び: 見出し語順");
     // 候補リスト: 1列・見出し無し・行は自前で描画
     let list = create_child(
         hwnd,
@@ -596,19 +645,23 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
     let (rich, rich_ok) = match create_child(hwnd, w!("RICHEDIT50W"), 0, rich_style, ID_RICH) {
         Some(h) => {
             send(h, EM_SETBKGNDCOLOR, 0, ui::WHITE.0 as isize);
-            // 本文中の URL を自動でリンクにし、クリックを EN_LINK で受け取る
-            send(h, EM_AUTOURLDETECT, 1, 0);
-            send(h, EM_SETEVENTMASK, 0, ENM_LINK as isize);
+            // リンクは自前で範囲を管理し、マウス操作(EN_MSGFILTER)から判定する。
+            // RichEdit の URL 自動検出は、URL の形をしていない表示名のリンク属性を消してしまうので使わない
+            send(h, EM_AUTOURLDETECT, 0, 0);
+            send(h, EM_SETEVENTMASK, 0, 0x0002_0000 /* ENM_MOUSEEVENTS */);
             (h, true)
         }
         None => (create_child(hwnd, w!("EDIT"), 0, rich_style, ID_RICH).unwrap(), false),
     };
+    let btn_bm = owner_button(hwnd, ID_BM, "☆ しおり");
     let btn_edit = owner_button(hwnd, ID_EDITBTN, "編集");
     let btn_del = owner_button(hwnd, ID_DEL, "削除");
     let status = create_child(hwnd, w!("STATIC"), 0, 0x0000000C | 0x80 /* SS_LEFTNOWORDWRAP | SS_NOPREFIX */, ID_STATUS).unwrap();
     let hint = create_child(hwnd, w!("STATIC"), 0, 0x2 | 0x80 /* SS_RIGHT | SS_NOPREFIX */, ID_HINT).unwrap();
-    set_text(hint, "↑↓ 候補    Ctrl+N 新規    F2 編集    Del 削除    Ctrl+O 参照先を開く    Esc 消去/閉じる");
+    set_text(hint, "↑↓ 候補    Ctrl+N 新規    F2 編集    Ctrl+D しおり    Alt+← 戻る    Esc 消去/閉じる");
 
+    let bm_path = init.cfg_path.with_file_name("bookmarks.tsv");
+    let sort = init.cfg.sort;
     let st = State {
         edit,
         btn_dict,
@@ -618,10 +671,14 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         qt,
         btn_new,
         btn_set,
+        btn_bmview,
+        btn_sort,
+        list_sep: 0,
         list,
         imglist,
         rich,
         rich_ok,
+        btn_bm,
         btn_edit,
         btn_del,
         status,
@@ -651,8 +708,16 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         cell: Vec::new(),
         pending_select: None,
         asked_restore: HashSet::new(),
+        bookmarks: Bookmarks::load(&bm_path),
+        bm_path,
+        bm_map: HashMap::new(),
+        bm_view: false,
+        sort,
+        prev_sort: sort,
+        history: Vec::new(),
     };
     apply_fonts(&st);
+    update_sort_button(&st);
     let _ = SetFocus(edit);
     st
 }
@@ -720,10 +785,16 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
     let h = (bottom - top).max(s(80));
 
     // --- 左: 候補リスト(枠の内側に置く) ---
-    let list_w = (w * 36 / 100).clamp(s(280), s(440));
+    let list_w = (w * 36 / 100).clamp(s(320), s(440));
     st.list_box = RECT { left: m, top, right: m + list_w, bottom: top + h };
     let inset = s(2);
-    let _ = MoveWindow(st.list, m + inset, top + inset, list_w - 2 * inset, h - 2 * inset, true);
+    // 枠の上部: しおり表示の切替と並び順
+    let hp = s(8);
+    let _ = MoveWindow(st.btn_bmview, m + hp, top + hp, s(BTN_W), s(CTL_H), true);
+    let _ = MoveWindow(st.btn_sort, m + hp + s(BTN_W) + gap, top + hp, list_w - 2 * hp - s(BTN_W) - gap, s(CTL_H), true);
+    st.list_sep = top + hp + s(CTL_H) + hp;
+    let list_top = st.list_sep + 1;
+    let _ = MoveWindow(st.list, m + inset, list_top, list_w - 2 * inset, top + h - inset - list_top, true);
     send(st.list, LVM_SETCOLUMNWIDTH_, 0, -2); // LVSCW_AUTOSIZE_USEHEADER: 幅いっぱい
 
     // --- 右: 本文 ---
@@ -736,6 +807,7 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
     let _ = MoveWindow(st.rich, ix, top + s(20), iw + pad - s(6), (btn_y - s(12) - (top + s(20))).max(s(30)), true);
     let _ = MoveWindow(st.btn_del, ix + iw - bw, btn_y, bw, btn_h, true);
     let _ = MoveWindow(st.btn_edit, ix + iw - 2 * bw - bgap, btn_y, bw, btn_h, true);
+    let _ = MoveWindow(st.btn_bm, ix, btn_y, bw, btn_h, true);
     // 絞り込み欄の出し入れで残像が出ないよう、背景ごと描き直す
     let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
@@ -750,6 +822,7 @@ unsafe fn paint(hwnd: HWND, st: &State) {
     let r = scale(12, st.dpi);
     ui::round_box(hdc, &st.list_box, ui::WHITE, ui::BORDER, r);
     ui::round_box(hdc, &st.pane, ui::WHITE, ui::BORDER, r);
+    ui::fill(hdc, &RECT { left: st.list_box.left + 1, top: st.list_sep, right: st.list_box.right - 1, bottom: st.list_sep + 1 }, ui::HAIRLINE);
     ui::paint_fields(hdc, &st.fields, st.dpi);
     let _ = EndPaint(hwnd, &ps);
 }
@@ -793,9 +866,19 @@ unsafe fn draw_row(st: &State, hdc: HDC, row: usize) {
     let r2 = RECT { left: x0, top: y2, right: x1 - dict_w - if dict_w > 0 { s(10) } else { 0 }, bottom: rc.bottom };
     ui::draw_marked(hdc, &snippet, &core::mark_ranges(&snippet, &st.marks.1), &r2, ui::MUTED, ui::MARK);
 
+    // しおり付きは、タグの左に ★
+    let star_w = if st.bm_map.contains_key(&(e.dict, e.id)) {
+        let sw = ui::text_width(hdc, "★");
+        let sx = x1 - tags_w - if tags_w > 0 { s(8) } else { 0 } - sw;
+        ui::draw_marked(hdc, "★", &[], &RECT { left: sx, top: y1 + s(3), right: sx + sw, bottom: y2 }, ui::STAR, ui::MARK);
+        sw + s(8)
+    } else {
+        0
+    };
+
     // 1行目: 見出し語
     SelectObject(hdc, st.fonts.heading);
-    let r1 = RECT { left: x0, top: y1, right: x1 - tags_w - if tags_w > 0 { s(10) } else { 0 }, bottom: y2 };
+    let r1 = RECT { left: x0, top: y1, right: x1 - tags_w - star_w - if tags_w > 0 { s(10) } else { 0 }, bottom: y2 };
     ui::draw_marked(hdc, &e.word, &core::mark_ranges(&e.word, &st.marks.0), &r1, ui::TEXT, ui::MARK);
     SelectObject(hdc, old);
 }
@@ -877,6 +960,21 @@ unsafe fn refresh(st: &mut State) {
     };
     st.marks = q.mark_terms();
     st.last_query = Some(q);
+    // しおり表示: しおり付きの語だけ残す(検索はその中で効く)
+    if st.bm_view {
+        let (entries, map) = (&st.entries, &st.bm_map);
+        st.matches.retain(|&i| map.contains_key(&(entries[i as usize].dict, entries[i as usize].id)));
+    }
+    // 並び順(安定ソートなので、同じ日時の語は見出し語順のまま)
+    {
+        let (entries, map) = (&st.entries, &st.bm_map);
+        match st.sort {
+            Sort::Word => {}
+            Sort::UpdatedAsc => st.matches.sort_by_key(|&i| entries[i as usize].updated_at),
+            Sort::UpdatedDesc => st.matches.sort_by_key(|&i| std::cmp::Reverse(entries[i as usize].updated_at)),
+            Sort::Bookmark => st.matches.sort_by_key(|&i| map.get(&(entries[i as usize].dict, entries[i as usize].id)).copied().unwrap_or(i64::MAX)),
+        }
+    }
 
     quiet(|| {
         send(st.list, LVM_SETITEMCOUNT, st.matches.len(), 0);
@@ -965,7 +1063,16 @@ unsafe fn rich_link(rich: HWND, range: (usize, usize)) {
 
 /// 本文を描く: 見出し語(大)/ 補足(小・灰)/ 意味 / 参照先(末尾にまとめる)。
 /// `*_marks` は各部分の中での強調範囲(UTF-16)。
-unsafe fn render(st: &State, title: &str, meta: &str, body: &str, links: &[(String, String)], title_marks: &[(usize, usize)], meta_marks: &[(usize, usize)], body_marks: &[(usize, usize)]) {
+#[allow(clippy::too_many_arguments)]
+unsafe fn render(
+    st: &State,
+    title: &str,
+    meta: &str,
+    body: &str,
+    body_links: &[(usize, usize, String)],
+    links: &[(String, String)],
+    title_marks: &[(usize, usize)], meta_marks: &[(usize, usize)], body_marks: &[(usize, usize)],
+) {
     let body = body.replace("\r\n", "\n");
     // 文字位置は UTF-16 単位で数える。RichEdit 内部では改行は1文字なので、'\n' = 1 のままでよい
     let mut text = String::new();
@@ -1025,6 +1132,13 @@ unsafe fn render(st: &State, title: &str, meta: &str, body: &str, links: &[(Stri
         rich_link(st.rich, *name);
         store.push((name.0 as i32, name.1 as i32, links[i].1.clone()));
     }
+    // 意味の文中のリンク([[語]] と URL)
+    for (a, b, target) in body_links {
+        let r = (r_body.0 + a, r_body.0 + b);
+        rich_format(st.rich, r, None, false, ui::ACCENT);
+        rich_link(st.rich, r);
+        store.push((r.0 as i32, r.1 as i32, target.clone()));
+    }
     for &(a, b) in title_marks {
         rich_format(st.rich, (r_title.0 + a, r_title.0 + b), None, true, ui::MARK);
     }
@@ -1055,7 +1169,12 @@ unsafe fn update_detail(st: &State) {
             } else {
                 ("", "")
             };
-            render(st, t, m, "", &[], &[], &[], &[]);
+            let m = if st.bm_view && st.loaded && !st.entries.is_empty() && st.bm_map.is_empty() {
+                "しおりはまだありません。語を選んで「☆ しおり」(Ctrl+D)で付けられます。"
+            } else {
+                m
+            };
+            render(st, t, m, "", &[], &[], &[], &[], &[]);
         }
         1 => {
             let e = &st.entries[sel[0]];
@@ -1069,13 +1188,28 @@ unsafe fn update_detail(st: &State) {
             }
             parts.push(format!("更新 {}", core::format_jst(e.updated_at)));
             let meta = parts.join("    ·    ");
-            let body = e.meaning.replace("\r\n", "\n");
+            // 意味の文中の [[語]] と URL をリンクにする(表示は [[ ]] を外した形)
+            let (body, body_links) = core::body_links(&e.meaning.replace("\r\n", "\n"));
             // タグは meta の先頭にあるので、強調位置はそのまま使える
             let meta_marks = if tags.is_empty() { Vec::new() } else { core::mark_ranges(&tags, &st.marks.2) };
-            render(st, &e.word, &meta, &body, &core::parse_links(&e.link), &core::mark_ranges(&e.word, &st.marks.0), &meta_marks, &core::mark_ranges(&body, &st.marks.1));
+            render(
+                st,
+                &e.word,
+                &meta,
+                &body,
+                &body_links,
+                &core::parse_links(&e.link),
+                &core::mark_ranges(&e.word, &st.marks.0),
+                &meta_marks,
+                &core::mark_ranges(&body, &st.marks.1),
+            );
         }
-        n => render(st, &format!("{n} 件を選択中"), "Delete キーまたは「削除」でまとめて削除できます。", "", &[], &[], &[], &[]),
+        n => render(st, &format!("{n} 件を選択中"), "Delete キーまたは「削除」でまとめて削除できます。", "", &[], &[], &[], &[], &[]),
     }
+    let marked = sel.len() == 1 && st.bm_map.contains_key(&(st.entries[sel[0]].dict, st.entries[sel[0]].id));
+    set_text(st.btn_bm, if marked { "★ しおり" } else { "☆ しおり" });
+    let _ = EnableWindow(st.btn_bm, sel.len() == 1);
+    let _ = InvalidateRect(st.btn_bm, None, false);
     let can_edit = sel.len() == 1 && writable(&st.dicts[st.entries[sel[0]].dict]).is_ok();
     let can_del = !sel.is_empty() && sel.iter().all(|&i| writable(&st.dicts[st.entries[i].dict]).is_ok());
     let _ = EnableWindow(st.btn_edit, can_edit);
@@ -1095,6 +1229,11 @@ unsafe fn open_link(hwnd: HWND, st: &mut State, link: &str) {
         return;
     }
     match core::link_kind(&link) {
+        core::LinkKind::Word => {
+            let word = link[core::WORD_SCHEME.len()..].trim().to_string();
+            jump_to_word(st, &word);
+            return;
+        }
         core::LinkKind::Web => {}
         core::LinkKind::Other => {
             let text = format!("次の参照先を開きますか?\n\n{link}");
@@ -1115,6 +1254,285 @@ unsafe fn open_link(hwnd: HWND, st: &mut State, link: &str) {
     let r = ShellExecuteW(hwnd, w!("open"), PCWSTR(w.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
     if r.0 as isize <= 32 {
         notice(st, &format!("参照先を開けませんでした: {link}"));
+    }
+}
+
+/// リンクから別の語へ移動する。検索欄をその語にして、完全一致する語を選ぶ。Alt+← で戻れる
+unsafe fn jump_to_word(st: &mut State, word: &str) {
+    let sel = selected_entries(st);
+    let current = if sel.len() == 1 { Some((st.entries[sel[0]].dict, st.entries[sel[0]].id)) } else { None };
+    st.history.push((get_text(st.edit), current));
+    if st.history.len() > 50 {
+        st.history.remove(0);
+    }
+    if st.bm_view {
+        set_bm_view(st, false);
+    }
+    for h in [st.qw, st.qm, st.qt] {
+        set_text(h, "");
+    }
+    set_text(st.edit, word);
+    refresh(st);
+    let lw = word.to_lowercase();
+    let row = st.matches.iter().position(|&i| st.entries[i as usize].word.to_lowercase() == lw);
+    match row {
+        Some(r) => {
+            select_row(st, Some(r));
+            update_detail(st);
+            notice(st, &format!("「{word}」へ移動しました(Alt+← で戻る)"));
+        }
+        None => notice(st, &format!("「{word}」は登録されていません(Ctrl+N で登録できます。Alt+← で戻る)")),
+    }
+}
+
+unsafe fn go_back(st: &mut State) {
+    let Some((text, sel)) = st.history.pop() else {
+        notice(st, "戻る先がありません");
+        return;
+    };
+    set_text(st.edit, &text);
+    refresh(st);
+    if let Some((d, id)) = sel {
+        select_entry(st, d, id);
+    }
+}
+
+// ---- しおり・並び順 ---------------------------------------------------------
+
+/// しおりの索引を作り直す(辞書の構成やしおりが変わったとき)
+unsafe fn rebuild_bm_map(st: &mut State) {
+    st.bm_map.clear();
+    let paths: Vec<String> = st.dicts.iter().map(|d| d.path.to_string_lossy().to_lowercase()).collect();
+    for b in &st.bookmarks.items {
+        let k = b.dict.to_lowercase();
+        if let Some(d) = paths.iter().position(|p| *p == k) {
+            st.bm_map.insert((d, b.id), b.added);
+        }
+    }
+}
+
+unsafe fn save_bookmarks(st: &mut State) {
+    if let Err(e) = st.bookmarks.save(&st.bm_path) {
+        notice(st, &format!("しおりを保存できません: {e}"));
+    }
+}
+
+unsafe fn toggle_bookmark(st: &mut State) {
+    let sel = selected_entries(st);
+    if sel.len() != 1 {
+        notice(st, "しおりを付ける語を1つ選択してください");
+        return;
+    }
+    let (d, id, word) = (st.entries[sel[0]].dict, st.entries[sel[0]].id, st.entries[sel[0]].word.clone());
+    let path = st.dicts[d].path.to_string_lossy().to_string();
+    let on = st.bookmarks.toggle(&path, id, &word, core::now_unix());
+    rebuild_bm_map(st);
+    if st.bm_view {
+        refresh(st);
+        select_entry(st, d, id);
+    } else {
+        let _ = InvalidateRect(st.list, None, false);
+        update_detail(st);
+    }
+    notice(st, &if on { format!("「{word}」にしおりを付けました") } else { format!("「{word}」のしおりを外しました") });
+    save_bookmarks(st);
+}
+
+fn sort_label(sort: Sort) -> &'static str {
+    match sort {
+        Sort::Word => "見出し語順",
+        Sort::UpdatedAsc => "更新が古い順",
+        Sort::UpdatedDesc => "更新が新しい順",
+        Sort::Bookmark => "しおりに追加した順",
+    }
+}
+
+unsafe fn update_sort_button(st: &State) {
+    set_text(st.btn_sort, &format!("並び: {} ▼", sort_label(st.sort)));
+    let _ = InvalidateRect(st.btn_sort, None, false);
+    let _ = InvalidateRect(st.btn_bmview, None, false);
+}
+
+/// しおり表示の切替。入るときは「しおりに追加した順」にし、出るときは元の並び順に戻す
+unsafe fn set_bm_view(st: &mut State, on: bool) {
+    if st.bm_view == on {
+        return;
+    }
+    st.bm_view = on;
+    if on {
+        st.prev_sort = st.sort;
+        st.sort = Sort::Bookmark;
+    } else if st.sort == Sort::Bookmark {
+        st.sort = if st.prev_sort == Sort::Bookmark { Sort::Word } else { st.prev_sort };
+    }
+    st.last_query = None;
+    update_sort_button(st);
+}
+
+unsafe fn set_sort(st: &mut State, sort: Sort) {
+    st.sort = sort;
+    update_sort_button(st);
+    if sort != Sort::Bookmark && st.cfg.sort != sort {
+        // 次回起動時も同じ並び順にする
+        st.cfg.sort = sort;
+        let base = st.cfg_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let _ = std::fs::write(&st.cfg_path, config::to_ini(&st.cfg, &base));
+    }
+    if st.loaded {
+        remember_selection(st);
+        refresh(st);
+        if let Some((d, id)) = st.pending_select.take() {
+            select_entry(st, d, id);
+        }
+    }
+}
+
+unsafe fn sort_menu(hwnd: HWND, st: &mut State) {
+    let Ok(menu) = CreatePopupMenu() else { return };
+    let mut items = vec![Sort::Word, Sort::UpdatedAsc, Sort::UpdatedDesc];
+    if st.bm_view {
+        items.push(Sort::Bookmark);
+    }
+    for (i, &sort) in items.iter().enumerate() {
+        let t = wide(sort_label(sort));
+        let flags = if sort == st.sort { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let _ = AppendMenuW(menu, flags, CM_SORT_BASE + i, PCWSTR(t.as_ptr()));
+    }
+    let mut rc = RECT::default();
+    let _ = GetWindowRect(st.btn_sort, &mut rc);
+    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTBUTTON, rc.left, rc.bottom, 0, hwnd, None);
+    let _ = DestroyMenu(menu);
+    if let Some(&sort) = (cmd.0 as usize).checked_sub(CM_SORT_BASE).and_then(|i| items.get(i)) {
+        set_sort(st, sort);
+    }
+}
+
+// ---- コピー・右クリックメニュー ------------------------------------------------
+
+/// 選択中の語を、指定の形でクリップボードへコピーする
+unsafe fn copy_selected(hwnd: HWND, st: &mut State, what: usize) {
+    let sel = selected_entries(st);
+    if sel.is_empty() {
+        return;
+    }
+    let lines: Vec<String> = sel
+        .iter()
+        .map(|&i| {
+            let e = &st.entries[i];
+            match what {
+                CM_COPY_WORD => e.word.clone(),
+                CM_COPY_MEANING => e.meaning.clone(),
+                _ => format!("{}\t{}", e.word, e.meaning.replace("\r\n", "\n").replace('\n', " ")),
+            }
+        })
+        .collect();
+    if ui::set_clipboard(hwnd, &lines.join("\n")) {
+        notice(st, &if sel.len() == 1 { "コピーしました".to_string() } else { format!("{} 件をコピーしました", sel.len()) });
+    } else {
+        notice(st, "コピーできませんでした(クリップボードを他のアプリが使用中です)");
+    }
+}
+
+/// 候補リストの右クリックメニュー
+unsafe fn list_menu(hwnd: HWND, st: &mut State) {
+    let sel = selected_entries(st);
+    if sel.is_empty() {
+        return;
+    }
+    let Ok(menu) = CreatePopupMenu() else { return };
+    let single = sel.len() == 1;
+    let editable = sel.iter().all(|&i| writable(&st.dicts[st.entries[i].dict]).is_ok());
+    let gray = |on: bool| if on { MF_STRING } else { MF_STRING | MF_GRAYED };
+    let marked = single && st.bm_map.contains_key(&(st.entries[sel[0]].dict, st.entries[sel[0]].id));
+    let _ = AppendMenuW(menu, MF_STRING, CM_COPY_WORD, w!("見出し語をコピー"));
+    let _ = AppendMenuW(menu, MF_STRING, CM_COPY_MEANING, w!("意味をコピー"));
+    let _ = AppendMenuW(menu, MF_STRING, CM_COPY_BOTH, w!("見出し語と意味をコピー\tCtrl+C"));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, gray(single), CM_BOOKMARK, if marked { w!("しおりを外す\tCtrl+D") } else { w!("しおりを付ける\tCtrl+D") });
+    let _ = AppendMenuW(menu, gray(single && editable), CM_EDIT, w!("編集…\tF2"));
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    let _ = AppendMenuW(menu, gray(editable), CM_DELETE, w!("削除…\tDel"));
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
+    let _ = DestroyMenu(menu);
+    match cmd.0 as usize {
+        c @ (CM_COPY_WORD | CM_COPY_MEANING | CM_COPY_BOTH) => copy_selected(hwnd, st, c),
+        CM_BOOKMARK => toggle_bookmark(st),
+        CM_EDIT => do_edit(hwnd, st),
+        CM_DELETE => do_delete(hwnd, st),
+        _ => {}
+    }
+}
+
+unsafe fn rich_pos(rich: HWND, index: i32) -> POINTL {
+    let mut p = POINTL::default();
+    send(rich, EM_POSFROMCHAR, &mut p as *mut _ as usize, index as isize);
+    p
+}
+
+/// 本文欄の座標 (x, y) にあるリンクの開く先
+unsafe fn link_at(st: &State, x: i32, y: i32) -> Option<String> {
+    let pt = POINTL { x, y };
+    let idx = send(st.rich, EM_CHARFROMPOS, 0, &pt as *const _ as isize).0 as i32;
+    let line_h = scale(26, st.dpi);
+    for (a, b, target) in st.links.borrow().iter() {
+        if idx < *a || idx > *b {
+            continue;
+        }
+        // 文字位置だけだと、行の右側の余白でも最後の文字とみなされるので、座標でも確かめる
+        let (ps, pe) = (rich_pos(st.rich, *a), rich_pos(st.rich, *b));
+        let hit = if ps.y == pe.y {
+            x >= ps.x - 2 && x <= pe.x + 2 && y >= ps.y && y <= ps.y + line_h
+        } else {
+            y >= ps.y && y <= pe.y + line_h // 折り返して複数行になったリンク
+        };
+        if hit {
+            return Some(target.clone());
+        }
+    }
+    None
+}
+
+/// 本文欄の右クリックメニュー(コピー / すべて選択 / リンク)
+unsafe fn rich_menu(hwnd: HWND, st: &mut State, x: i32, y: i32) {
+    let Ok(menu) = CreatePopupMenu() else { return };
+    let mut cr = CHARRANGE::default();
+    send(st.rich, EM_EXGETSEL, 0, &mut cr as *mut _ as isize);
+    let has_sel = cr.cpMax > cr.cpMin;
+    let link = link_at(st, x, y);
+    if link.is_some() {
+        let _ = AppendMenuW(menu, MF_STRING, CM_OPEN_LINK, w!("リンクを開く"));
+        let _ = AppendMenuW(menu, MF_STRING, CM_COPY_LINK, w!("リンク先をコピー"));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+    }
+    let _ = AppendMenuW(menu, if has_sel { MF_STRING } else { MF_STRING | MF_GRAYED }, CM_COPY, w!("コピー\tCtrl+C"));
+    let _ = AppendMenuW(menu, MF_STRING, CM_SELECT_ALL, w!("すべて選択\tCtrl+A"));
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
+    let _ = DestroyMenu(menu);
+    match cmd.0 as usize {
+        CM_COPY => {
+            send(st.rich, WM_COPY, 0, 0);
+        }
+        CM_SELECT_ALL => {
+            let all = CHARRANGE { cpMin: 0, cpMax: -1 };
+            send(st.rich, EM_EXSETSEL, 0, &all as *const _ as isize);
+            let _ = SetFocus(st.rich);
+        }
+        CM_OPEN_LINK => {
+            if let Some(l) = link {
+                open_link(hwnd, st, &l);
+            }
+        }
+        CM_COPY_LINK => {
+            if let Some(l) = link {
+                let shown = l.strip_prefix(core::WORD_SCHEME).unwrap_or(&l).to_string();
+                ui::set_clipboard(hwnd, &shown);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1350,6 +1768,18 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
         }
     }
     st.entries.retain(|e| !removed.contains(&(e.dict, e.id)));
+    // 削除した語のしおりも外す
+    let mut dropped = 0;
+    for (d, ids) in by_dict.iter().enumerate() {
+        let gone: Vec<i64> = ids.iter().copied().filter(|&id| removed.contains(&(d, id))).collect();
+        if !gone.is_empty() {
+            dropped += st.bookmarks.remove_ids(&st.dicts[d].path.to_string_lossy(), &gone);
+        }
+    }
+    if dropped > 0 {
+        rebuild_bm_map(st);
+        save_bookmarks(st);
+    }
     if any_stale {
         start_load(hwnd, st, true);
     } else {
@@ -1444,7 +1874,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_GETMINMAXINFO => {
             let mmi = &mut *(lparam.0 as *mut MINMAXINFO);
             let dpi = state(hwnd).map_or(96, |s| s.dpi);
-            mmi.ptMinTrackSize.x = scale(900, dpi);
+            mmi.ptMinTrackSize.x = scale(960, dpi);
             mmi.ptMinTrackSize.y = scale(520, dpi);
             LRESULT(0)
         }
@@ -1500,6 +1930,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     ID_ADV => Btn::Toggle(st.advanced),
                     ID_DICTS => Btn::Toggle(!st.dict_mask.iter().all(|&b| b)),
                     ID_DEL => Btn::Danger,
+                    ID_BMVIEW => Btn::Toggle(st.bm_view),
+                    ID_BM => Btn::Toggle(dis.itemState.0 & 0x4 == 0 && get_text(st.btn_bm).starts_with('★')),
                     _ => Btn::Secondary,
                 };
                 ui::draw_button(dis, kind, st.fonts.base, ui::WHITE, st.dpi);
@@ -1583,6 +2015,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 (ID_OPENLINK, BN_CLICKED_) => do_open_link(hwnd, st),
                 (ID_DEL, BN_CLICKED_) => do_delete(hwnd, st),
                 (ID_SETTINGS, BN_CLICKED_) => do_settings(hwnd, st),
+                (ID_BM, BN_CLICKED_) => toggle_bookmark(st),
+                (ID_BACK, BN_CLICKED_) => go_back(st),
+                (ID_SORT, BN_CLICKED_) => sort_menu(hwnd, st),
+                (ID_BMVIEW, BN_CLICKED_) => {
+                    let on = !st.bm_view;
+                    set_bm_view(st, on);
+                    if on {
+                        // まず全部のしおりが見えるよう、検索語は空にする(この後、しおりの中を検索できる)
+                        for h in [st.edit, st.qw, st.qm, st.qt] {
+                            set_text(h, "");
+                        }
+                    }
+                    if st.loaded {
+                        refresh(st);
+                    }
+                    let _ = SetFocus(st.edit);
+                }
                 _ => {
                     if id == IDCANCEL.0 as usize {
                         // Esc: 入力があれば消す。なければウィンドウを隠す
@@ -1607,22 +2056,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let hdr = &*(lparam.0 as *const NMHDR);
             let Some(st) = state(hwnd) else { return LRESULT(0) };
             if hdr.idFrom == ID_RICH {
-                // 本文中のリンクのクリック
-                if hdr.code == EN_LINK {
-                    let en = &*(lparam.0 as *const ENLINK);
-                    if en.msg == WM_LBUTTONUP {
-                        let (a, b) = (en.chrg.cpMin, en.chrg.cpMax);
-                        if b > a && b - a < 2048 {
-                            let mut buf = vec![0u16; (b - a) as usize + 1];
-                            let mut tr = TEXTRANGEW { chrg: CHARRANGE { cpMin: a, cpMax: b }, lpstrText: PWSTR(buf.as_mut_ptr()) };
-                            let n = send(st.rich, EM_GETTEXTRANGE, 0, &mut tr as *mut _ as isize).0.max(0) as usize;
-                            let text = String::from_utf16_lossy(&buf[..n.min(buf.len() - 1)]);
-                            // 「参照先」に並べたリンクは、表示名ではなく登録された開く先を使う。
-                            // それ以外(意味の文中の URL)は、表示されている文字列がそのまま開く先
-                            let target = st.links.borrow().iter().find(|l| a >= l.0 && a < l.1).map(|l| l.2.clone());
-                            let link = target.unwrap_or(text);
-                            open_link(hwnd, st, &link);
+                if hdr.code == EN_MSGFILTER {
+                    let mf = &*(lparam.0 as *const MSGFILTER);
+                    let (m, lp) = (mf.msg, mf.lParam.0);
+                    let (x, y) = ((lp & 0xFFFF) as i16 as i32, ((lp >> 16) & 0xFFFF) as i16 as i32);
+                    if m == WM_LBUTTONUP {
+                        // 文字を選択するドラッグではなく、単なるクリックのときだけリンクを開く
+                        let mut cr = CHARRANGE::default();
+                        send(st.rich, EM_EXGETSEL, 0, &mut cr as *mut _ as isize);
+                        if cr.cpMin == cr.cpMax {
+                            if let Some(target) = link_at(st, x, y) {
+                                // RichEdit がマウス処理を終えてから開く(処理の途中で本文を書き換えない)
+                                let boxed = Box::into_raw(Box::new(target));
+                                if PostMessageW(hwnd, WM_APP_LINK, WPARAM(0), LPARAM(boxed as isize)).is_err() {
+                                    drop(Box::from_raw(boxed));
+                                }
+                            }
                         }
+                    } else if m == WM_RBUTTONUP {
+                        rich_menu(hwnd, st, x, y);
+                        return LRESULT(1); // 既定の処理はさせない
                     }
                 }
                 return LRESULT(0);
@@ -1653,7 +2106,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else if !ui::is_busy() {
                 if hdr.code == LVN_KEYDOWN {
                     let kd = &*(lparam.0 as *const NMLVKEYDOWN);
-                    if kd.wVKey == VK_DELETE.0 {
+                    if kd.wVKey == 'C' as u16 && GetKeyState(VK_CONTROL.0 as i32) < 0 {
+                        copy_selected(hwnd, st, CM_COPY_BOTH);
+                    } else if kd.wVKey == VK_DELETE.0 {
                         do_delete(hwnd, st);
                     } else if kd.wVKey == VK_RETURN.0 {
                         do_edit(hwnd, st);
@@ -1668,7 +2123,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     update_detail(st);
                 } else if hdr.code == NM_DBLCLK {
                     do_edit(hwnd, st);
+                } else if hdr.code == NM_RCLICK {
+                    list_menu(hwnd, st);
                 }
+            }
+            LRESULT(0)
+        }
+        WM_APP_LINK => {
+            let target = *Box::from_raw(lparam.0 as *mut String);
+            if let Some(st) = state(hwnd) {
+                open_link(hwnd, st, &target);
             }
             LRESULT(0)
         }
