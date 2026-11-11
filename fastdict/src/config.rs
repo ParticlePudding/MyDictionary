@@ -85,6 +85,24 @@ path = dictionary.db\r\n\
         .to_string()
 }
 
+/// 修飾キーとキーコードから Hotkey を作る(表現できないキーは None)
+pub fn hotkey_from_parts(mods: u32, vk: u32) -> Option<Hotkey> {
+    let mut parts: Vec<String> = Vec::new();
+    for (bit, name) in [(MOD_CONTROL, "Ctrl"), (MOD_ALT, "Alt"), (MOD_SHIFT, "Shift"), (MOD_WIN, "Win")] {
+        if mods & bit != 0 {
+            parts.push(name.to_string());
+        }
+    }
+    let key = match vk {
+        0x20 => "Space".to_string(),
+        0x30..=0x39 | 0x41..=0x5A => (vk as u8 as char).to_string(),
+        0x70..=0x87 => format!("F{}", vk - 0x6F),
+        _ => return None,
+    };
+    parts.push(key);
+    parse_hotkey(&parts.join("+"))
+}
+
 pub fn parse_hotkey(s: &str) -> Option<Hotkey> {
     let mut mods = 0u32;
     let mut vk: Option<u32> = None;
@@ -127,6 +145,27 @@ pub fn parse_hotkey(s: &str) -> Option<Hotkey> {
         return None; // 修飾キー無しのグローバルホットキーは通常のタイピングを奪うため不可
     }
     Some(Hotkey { mods, vk, text: names.join("+") })
+}
+
+/// 設定をINIテキストにする(設定ダイアログからの保存用)。
+/// `base` と同じフォルダにある辞書はファイル名だけで書く。
+pub fn to_ini(cfg: &Config, base: &Path) -> String {
+    let mut s = String::new();
+    s.push_str("; fastdict 設定ファイル(UTF-8)。設定ダイアログからも変更できます。\r\n\r\n[general]\r\n");
+    s.push_str(&format!("hotkey = {}\r\n", cfg.hotkey.as_ref().map_or("none".to_string(), |h| h.text.clone())));
+    s.push_str(&format!("close_to_tray = {}\r\n", cfg.close_to_tray));
+    s.push_str(&format!("timing_log = {}\r\n", cfg.timing_log));
+    for (i, d) in cfg.dicts.iter().enumerate() {
+        let path = match d.path.parent() {
+            Some(p) if p == base => d.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
+            _ => d.path.to_string_lossy().to_string(),
+        };
+        s.push_str(&format!("\r\n[dictionary.d{}]\r\nname = {}\r\npath = {}\r\n", i + 1, d.name, path));
+        if d.readonly {
+            s.push_str("readonly = true\r\n");
+        }
+    }
+    s
 }
 
 /// `%NAME%` を環境変数で置換する。未定義ならそのまま残す。
@@ -320,6 +359,37 @@ mod tests {
         assert!(warns.iter().any(|w| w.contains("bogus")));
         assert!(warns.iter().any(|w| w.contains("path がありません")));
         assert!(warns.iter().any(|w| w.contains("未知のセクション")));
+    }
+
+    #[test]
+    fn to_ini_roundtrip() {
+        let base = Path::new("/base");
+        let cfg = Config {
+            hotkey: parse_hotkey("Ctrl+Shift+F5"),
+            close_to_tray: false,
+            timing_log: true,
+            dicts: vec![
+                DictConf { name: "メイン".into(), path: base.join("dictionary.db"), readonly: false },
+                DictConf { name: "参照 用".into(), path: PathBuf::from("/other/dir/ref.db"), readonly: true },
+            ],
+        };
+        let (back, warns) = parse(&to_ini(&cfg, base), base, &env);
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(back.hotkey, cfg.hotkey);
+        assert!(!back.close_to_tray && back.timing_log);
+        assert_eq!(back.dicts, cfg.dicts);
+        // ホットキー無し
+        let none = Config { hotkey: None, ..cfg };
+        assert!(parse(&to_ini(&none, base), base, &env).0.hotkey.is_none());
+    }
+
+    #[test]
+    fn hotkey_parts() {
+        let h = hotkey_from_parts(MOD_CONTROL | MOD_ALT, 'D' as u32).unwrap();
+        assert_eq!(h.text, "Ctrl+Alt+D");
+        assert_eq!(hotkey_from_parts(MOD_SHIFT | MOD_CONTROL, 0x74).unwrap().text, "Ctrl+Shift+F5");
+        assert!(hotkey_from_parts(MOD_CONTROL, 0x1B).is_none()); // Esc は不可
+        assert!(hotkey_from_parts(0, 'A' as u32).is_none()); // 修飾キー無し
     }
 
     #[test]
