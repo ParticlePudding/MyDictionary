@@ -56,7 +56,6 @@ pub fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-#[allow(dead_code)]
 pub fn insert(conn: &Connection, word: &str, meaning: &str, tags: &str) -> rusqlite::Result<Entry> {
     let ts = now_unix();
     conn.execute(
@@ -66,9 +65,29 @@ pub fn insert(conn: &Connection, word: &str, meaning: &str, tags: &str) -> rusql
     Ok(Entry::new(conn.last_insert_rowid(), word.into(), meaning.into(), tags.into(), ts))
 }
 
-#[allow(dead_code)]
 pub fn delete(conn: &Connection, id: i64) -> rusqlite::Result<usize> {
     conn.execute("DELETE FROM words WHERE id = ?1", params![id])
+}
+
+/// 見出し語(大文字小文字無視)→ id 順に並べる(load_all と同じ順序)
+pub fn sort_entries(entries: &mut [Entry]) {
+    entries.sort_by(|a, b| a.word_lc.cmp(&b.word_lc).then(a.id.cmp(&b.id)));
+}
+
+/// 最終更新(UNIX秒)。空なら None
+pub fn last_update(entries: &[Entry]) -> Option<i64> {
+    entries.iter().map(|e| e.updated_at).max()
+}
+
+/// タグの空白(全角含む)を単一スペースに正規化し、重複を除く
+pub fn normalize_tags(input: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for t in input.split(|c: char| c.is_whitespace()).filter(|t| !t.is_empty()) {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out.join(" ")
 }
 
 /// 空白区切りの全語を含む(AND・大小文字無視・部分一致)エントリの添字を返す。
@@ -163,6 +182,21 @@ mod tests {
     fn jst_format() {
         assert_eq!(format_jst(0), "1970/01/01 09:00:00");
         assert_eq!(format_jst(1_700_000_000), "2023/11/15 07:13:20");
+    }
+
+    #[test]
+    fn tags_normalize_and_sort() {
+        assert_eq!(normalize_tags("  a　b\tb  c "), "a b c");
+        assert_eq!(normalize_tags(""), "");
+        let mut e = vec![
+            Entry::new(2, "b".into(), "".into(), "".into(), 5),
+            Entry::new(1, "B".into(), "".into(), "".into(), 9),
+            Entry::new(3, "a".into(), "".into(), "".into(), 1),
+        ];
+        sort_entries(&mut e);
+        assert_eq!(e.iter().map(|x| x.id).collect::<Vec<_>>(), vec![3, 1, 2]);
+        assert_eq!(last_update(&e), Some(9));
+        assert_eq!(last_update(&[]), None);
     }
 
     #[test]
