@@ -268,7 +268,8 @@ pub fn run() {
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap(),
             hbrBackground: CreateSolidBrush(ui::WHITE),
             lpszClassName: CLASS_NAME,
-            hIcon: LoadIconW(None, IDI_APPLICATION).unwrap(),
+            hIcon: ui::app_icon(),
+            hIconSm: ui::app_icon(),
             ..Default::default()
         };
         RegisterClassExW(&wc);
@@ -277,7 +278,7 @@ pub fn run() {
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             CLASS_NAME,
-            w!("辞書"),
+            w!("MyDictionary"),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -358,7 +359,7 @@ pub fn show_report(report: &str) {
         let _ = std::fs::create_dir_all(app_dir());
         let _ = std::fs::write(&p, report);
         let text = format!("{report}\r\n(保存先: {})", p.display());
-        let (t, c) = (wide(&text), wide("fastdict ベンチマーク"));
+        let (t, c) = (wide(&text), wide("MyDictionary ベンチマーク"));
         MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONINFORMATION);
     }
 }
@@ -402,7 +403,7 @@ pub fn add_sample() {
             let _ = PostMessageW(existing, WM_APP_RELOAD, WPARAM(0), LPARAM(0));
         }
         let text = format!("{}\n\n場所: {}\n不要になったら、設定の「辞書」から外してください(ファイルは残ります)。", lines.join("\n"), base.display());
-        let (t, c) = (wide(&text), wide("fastdict サンプルデータ"));
+        let (t, c) = (wide(&text), wide("MyDictionary サンプルデータ"));
         MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONINFORMATION);
     }
 }
@@ -435,7 +436,7 @@ unsafe fn tray_data(hwnd: HWND, tip: &str) -> NOTIFYICONDATAW {
         uID: 1,
         uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
         uCallbackMessage: WM_APP_TRAY,
-        hIcon: LoadIconW(None, IDI_APPLICATION).unwrap(),
+        hIcon: ui::app_icon(),
         ..Default::default()
     };
     for (i, c) in tip.encode_utf16().take(120).enumerate() {
@@ -445,13 +446,13 @@ unsafe fn tray_data(hwnd: HWND, tip: &str) -> NOTIFYICONDATAW {
 }
 
 unsafe fn add_tray_icon(hwnd: HWND) {
-    let _ = Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd, "辞書"));
+    let _ = Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd, ui::APP_NAME));
 }
 
 unsafe fn set_tray_tip(hwnd: HWND, st: &State) {
     let tip = match &st.cfg.hotkey {
-        Some(h) => format!("辞書 ({})", h.text),
-        None => "辞書".to_string(),
+        Some(h) => format!("{} ({})", ui::APP_NAME, h.text),
+        None => ui::APP_NAME.to_string(),
     };
     let _ = Shell_NotifyIconW(NIM_MODIFY, &tray_data(hwnd, &tip));
 }
@@ -2203,7 +2204,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 WM_RBUTTONUP => {
                     if let Ok(menu) = CreatePopupMenu() {
-                        let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN, w!("辞書を開く"));
+                        let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN, w!("MyDictionary を開く"));
                         let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("設定"));
                         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
                         let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN_CFG, w!("設定ファイルを開く"));

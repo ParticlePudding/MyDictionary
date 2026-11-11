@@ -1,4 +1,4 @@
-//! 件数が多いときの読み込み・検索時間の計測(`fastdict --bench [件数]`)。
+//! 件数が多いときの読み込み・検索時間の計測(`MyDictionary --bench [件数]`)。
 
 use crate::core::{self, Entry, Query};
 use std::time::Instant;
@@ -51,7 +51,7 @@ pub fn run(n: usize) -> String {
         out.push_str(&s);
         out.push_str("\r\n");
     };
-    line(format!("fastdict ベンチマーク: {n} 件"));
+    line(format!("MyDictionary ベンチマーク: {n} 件"));
 
     // 1) テストデータ作成(計測対象外だが所要時間は参考に記録)
     let t = Instant::now();

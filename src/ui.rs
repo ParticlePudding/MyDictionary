@@ -89,6 +89,16 @@ pub unsafe fn font(face: &str, pt: i32, dpi: i32, bold: bool) -> HFONT {
     )
 }
 
+/// アプリの名前と版(ウィンドウのタイトル、設定画面の表示に使う)
+pub const APP_NAME: &str = "MyDictionary";
+pub const APP_VERSION: &str = "2.00";
+
+/// 実行ファイルに埋め込んだアイコン(リソース ID 1)。読み込めなければ Windows 標準のアイコン
+pub unsafe fn app_icon() -> HICON {
+    let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).unwrap_or_default();
+    LoadIconW(hinst, PCWSTR(1 as *const u16)).or_else(|_| LoadIconW(None, IDI_APPLICATION)).unwrap_or_default()
+}
+
 /// 画面全体で共通の寸法(96dpi 基準)。ボタンと1行入力欄は、どの画面でもこの大きさにそろえる。
 pub const CTL_H: i32 = 36;
 pub const BTN_W: i32 = 108;

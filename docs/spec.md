@@ -1,6 +1,6 @@
-# fastdict 仕様書(開発者向け)
+# MyDictionary 仕様書(開発者向け)
 
-この文書は、fastdict の構成・データ形式・動作の仕様をまとめたものです。使い方は [取扱説明書](manual.md) を参照してください。
+この文書は、MyDictionary の構成・データ形式・動作の仕様をまとめたものです。使い方は [取扱説明書](manual.md) を参照してください。
 
 - [1. 概要](#1-概要)
 - [2. 構成](#2-構成)
@@ -27,7 +27,18 @@
 | 言語 | Rust(edition 2021) |
 | GUI | Win32 API を直接使用(`windows` クレート 0.58)。標準コントロール + 一部を自前で描画 |
 | 保存 | SQLite(`rusqlite` 0.32、`bundled` で静的リンク) |
-| 配布 | 実行ファイル1つ(約1.6MB)。依存は Windows 標準の DLL のみ |
+| 配布 | 実行ファイル1つ(`MyDictionary.exe`、約1.6MB)。依存は Windows 標準の DLL のみ |
+| 版 | 2.00(Cargo のパッケージは `mydictionary` 2.0.0) |
+
+### 名前について
+アプリの名前と実行ファイル名は MyDictionary ですが、開発時の名前 `fastdict` が、次の場所に残っています。これまでのデータを引き継ぐためで、変える場合は移行の処理が必要です。
+
+| 場所 | 名前 |
+|---|---|
+| データのフォルダ | `%AppData%\fastdict\`、`%LocalAppData%\fastdict\` |
+| 設定ファイル | `fastdict.ini` |
+| ウィンドウクラス、ミューテックス | `FastDictMainWindow`、`FastDictEntry` など、`Local\FastDictSingleInstance` |
+| JSON の `format` | `"fastdict"` |
 
 ### 設計の方針
 - **起動を待たせない**: ウィンドウを先に出し、辞書の読み込みは別スレッドで行う。
@@ -41,9 +52,11 @@
 
 ```
 Cargo.toml / Cargo.lock
-build.rs          マニフェスト(app.manifest)を実行ファイルに埋め込む(対象が Windows のときだけ)
+build.rs          リソース(app.rc)を実行ファイルに埋め込む(対象が Windows のときだけ)
 app.manifest      Common Controls v6、DPI 対応(PerMonitorV2)、長いパス
-app.rc            マニフェストを指すリソース定義
+app.rc            リソース定義: アイコン、マニフェスト、バージョン情報
+assets/app.ico    アイコン(256 / 48 / 32 / 16)
+.github/workflows/release.yml   タグの push で Windows 向けにビルドし、Release を作る
 src/
   main.rs         入口。起動時の指定(--bench / --add-sample)の振り分け
   core.rs         語のデータ、DB の読み書き、検索、並べ替え、リンクの解析      ← 画面に依存しない
@@ -487,9 +500,19 @@ cargo test
 
 開発時は、Linux 上で Wine と仮想ディスプレイ(Xvfb)を使い、実行ファイルを起動して画面を撮影・操作して確認しました。Wine に日本語フォントが無い場合は、レジストリの `FontSubstitutes` で `Yu Gothic UI` などを手元のフォントに割り当てる必要があります。
 
+### 版を上げてリリースする
+1. 次の3か所の版をそろえて変える。
+   - `Cargo.toml` の `version`
+   - `app.rc` の `FILEVERSION` / `PRODUCTVERSION` と、`FileVersion` / `ProductVersion`
+   - `src/ui.rs` の `APP_VERSION`
+2. `docs/release-notes.md` を、その版の内容に書き換える。
+3. 既定のブランチに反映し、`v2.00` のようなタグを付けて push する。
+
+タグが push されると、GitHub Actions(`.github/workflows/release.yml`)が Windows 上でテストとビルドを行い、Release を作って `MyDictionary.exe` を添付します。
+
 ### 計測
 ```
-fastdict.exe --bench 100000
+MyDictionary.exe --bench 100000
 ```
 指定した件数のテスト用データを一時フォルダに作り、読み込み・並べ替え・検索の時間を表示します。実際の辞書には触りません。
 
