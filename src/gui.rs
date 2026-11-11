@@ -406,8 +406,8 @@ unsafe fn add_tray_icon(hwnd: HWND) {
 
 unsafe fn set_tray_tip(hwnd: HWND, st: &State) {
     let tip = match &st.cfg.hotkey {
-        Some(h) => format!("{} ({})", ui::APP_NAME, h.text),
-        None => ui::APP_NAME.to_string(),
+        Some(h) => format!("{} ({})", config::window_title(&st.cfg, ui::APP_NAME), h.text),
+        None => config::window_title(&st.cfg, ui::APP_NAME),
     };
     let _ = Shell_NotifyIconW(NIM_MODIFY, &tray_data(hwnd, &tip));
 }
@@ -620,6 +620,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
 
     let bm_path = init.cfg_path.with_file_name("bookmarks.tsv");
     let sort = init.cfg.sort;
+    let init_shared = init.cfg.shared;
     let st = State {
         edit,
         btn_dict,
@@ -666,7 +667,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         cell: Vec::new(),
         pending_select: None,
         asked_restore: HashSet::new(),
-        bookmarks: Bookmarks::load(&bm_path),
+        bookmarks: if init_shared { Bookmarks::default() } else { Bookmarks::load(&bm_path) },
         bm_path,
         bm_map: HashMap::new(),
         bm_view: false,
@@ -675,6 +676,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
     };
     apply_fonts(&st);
     update_sort_button(&st);
+    apply_mode(hwnd, &st);
     let _ = SetFocus(edit);
     st
 }
@@ -747,8 +749,13 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
     let inset = s(2);
     // 枠の上部: しおり表示の切替と並び順
     let hp = s(8);
-    let _ = MoveWindow(st.btn_bmview, m + hp, top + hp, s(BTN_W), s(CTL_H), true);
-    let _ = MoveWindow(st.btn_sort, m + hp + s(BTN_W) + gap, top + hp, list_w - 2 * hp - s(BTN_W) - gap, s(CTL_H), true);
+    if st.cfg.shared {
+        // 共用フォルダでの運用: しおりは使わないので、並び順のボタンを幅いっぱいにする
+        let _ = MoveWindow(st.btn_sort, m + hp, top + hp, list_w - 2 * hp, s(CTL_H), true);
+    } else {
+        let _ = MoveWindow(st.btn_bmview, m + hp, top + hp, s(BTN_W), s(CTL_H), true);
+        let _ = MoveWindow(st.btn_sort, m + hp + s(BTN_W) + gap, top + hp, list_w - 2 * hp - s(BTN_W) - gap, s(CTL_H), true);
+    }
     st.list_sep = top + hp + s(CTL_H) + hp;
     let list_top = st.list_sep + 1;
     let _ = MoveWindow(st.list, m + inset, list_top, list_w - 2 * inset, top + h - inset - list_top, true);
@@ -1274,9 +1281,30 @@ unsafe fn jump_to_word(st: &mut State, word: &str) {
 
 // ---- しおり・並び順 ---------------------------------------------------------
 
+/// 設定に応じて、ウィンドウのタイトルと、しおりの部品の表示を切り替える
+unsafe fn apply_mode(hwnd: HWND, st: &State) {
+    let t = wide(&config::window_title(&st.cfg, ui::APP_NAME));
+    let _ = SetWindowTextW(hwnd, PCWSTR(t.as_ptr()));
+    // 共用フォルダでの運用では、しおりを使わない(設定の場所に個人の情報を書き込まないため)
+    let show = if st.cfg.shared { SW_HIDE } else { SW_SHOW };
+    let _ = ShowWindow(st.btn_bmview, show);
+    let _ = ShowWindow(st.btn_bm, show);
+    set_text(
+        st.hint,
+        if st.cfg.shared {
+            "↑↓ 候補    Ctrl+N 新規    F2 編集    Del 削除    Esc 閉じる"
+        } else {
+            "↑↓ 候補    Ctrl+N 新規    F2 編集    Ctrl+D しおり    Esc 閉じる"
+        },
+    );
+}
+
 /// しおりの索引を作り直す(辞書の構成やしおりが変わったとき)
 unsafe fn rebuild_bm_map(st: &mut State) {
     st.bm_map.clear();
+    if st.cfg.shared {
+        return; // 共用フォルダでの運用では、しおりを使わない
+    }
     let paths: Vec<String> = st.dicts.iter().map(|d| d.path.to_string_lossy().to_lowercase()).collect();
     for b in &st.bookmarks.items {
         let k = b.dict.to_lowercase();
@@ -1293,6 +1321,10 @@ unsafe fn save_bookmarks(st: &mut State) {
 }
 
 unsafe fn toggle_bookmark(st: &mut State) {
+    if st.cfg.shared {
+        notice(st, "共用フォルダでの運用では、しおりは使えません");
+        return;
+    }
     let sel = selected_entries(st);
     if sel.len() != 1 {
         notice(st, "しおりを付ける語を1つ選択してください");
@@ -1347,8 +1379,8 @@ unsafe fn set_bm_view(st: &mut State, on: bool) {
 unsafe fn set_sort(st: &mut State, sort: Sort) {
     st.sort = sort;
     update_sort_button(st);
-    if sort != Sort::Bookmark && st.cfg.sort != sort {
-        // 次回起動時も同じ並び順にする
+    if sort != Sort::Bookmark && st.cfg.sort != sort && !st.cfg.shared {
+        // 次回起動時も同じ並び順にする(共用の設定には書き込まない)
         st.cfg.sort = sort;
         let base = st.cfg_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         let _ = std::fs::write(&st.cfg_path, config::to_ini(&st.cfg, &base));
@@ -1423,7 +1455,9 @@ unsafe fn list_menu(hwnd: HWND, st: &mut State) {
     let _ = AppendMenuW(menu, MF_STRING, CM_COPY_MEANING, w!("意味をコピー"));
     let _ = AppendMenuW(menu, MF_STRING, CM_COPY_BOTH, w!("見出し語と意味をコピー\tCtrl+C"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(menu, gray(single), CM_BOOKMARK, if marked { w!("しおりを外す\tCtrl+D") } else { w!("しおりを付ける\tCtrl+D") });
+    if !st.cfg.shared {
+        let _ = AppendMenuW(menu, gray(single), CM_BOOKMARK, if marked { w!("しおりを外す\tCtrl+D") } else { w!("しおりを付ける\tCtrl+D") });
+    }
     let _ = AppendMenuW(menu, gray(single && editable), CM_EDIT, w!("編集…\tF2"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, gray(editable), CM_DELETE, w!("削除\tDel"));
@@ -1790,7 +1824,7 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
 }
 
 unsafe fn do_settings(hwnd: HWND, st: &mut State) {
-    let mut dlg = SettingsDlg { cfg: st.cfg.clone(), backup_root: backup_root(), imported: false, ok: false };
+    let mut dlg = SettingsDlg { cfg: st.cfg.clone(), backup_root: backup_root(), cfg_path: st.cfg_path.clone(), imported: false, ok: false };
     if !dialogs::settings_dialog(hwnd, &mut dlg) {
         // キャンセルでも、インポートを実行していたら辞書を読み直す
         if dlg.imported {
@@ -1798,8 +1832,22 @@ unsafe fn do_settings(hwnd: HWND, st: &mut State) {
         }
         return;
     }
+    // 共用の設定を書き換えると、同じ設定ファイルを使う全員に影響する
+    if st.cfg.shared {
+        let text = format!(
+            "この設定は、共用フォルダで運用しています。\n保存すると、同じ設定ファイルを使う全員に反映されます。\n\n{}\n\n保存しますか?",
+            st.cfg_path.display()
+        );
+        if message_box(hwnd, &text, "共用の設定の変更", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES {
+            if dlg.imported {
+                start_load(hwnd, st, true);
+            }
+            return;
+        }
+    }
     let mut problems: Vec<String> = Vec::new();
     let dicts_changed = dlg.cfg.dicts != st.cfg.dicts;
+    let was_shared = st.cfg.shared;
     let base = st.cfg_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     if let Err(e) = std::fs::write(&st.cfg_path, config::to_ini(&dlg.cfg, &base)) {
         problems.push(format!("設定ファイルを保存できません: {e}"));
@@ -1810,6 +1858,16 @@ unsafe fn do_settings(hwnd: HWND, st: &mut State) {
         problems.push(w);
     }
     set_tray_tip(hwnd, st);
+    // 共用 / 個人の切替: しおりの読み込みと、部品の表示を切り替える
+    if was_shared != st.cfg.shared {
+        if st.bm_view {
+            set_bm_view(st, false);
+        }
+        st.bookmarks = if st.cfg.shared { Bookmarks::default() } else { Bookmarks::load(&st.bm_path) };
+        rebuild_bm_map(st);
+    }
+    apply_mode(hwnd, st);
+    layout(hwnd, st);
     if dicts_changed {
         st.warns = problems.clone();
         start_load(hwnd, st, false);
@@ -1836,6 +1894,12 @@ unsafe fn reload_config(hwnd: HWND, st: &mut State) {
         st.warns.push(w);
     }
     set_tray_tip(hwnd, st);
+    if st.bm_view {
+        set_bm_view(st, false);
+    }
+    st.bookmarks = if st.cfg.shared { Bookmarks::default() } else { Bookmarks::load(&st.bm_path) };
+    apply_mode(hwnd, st);
+    layout(hwnd, st);
     start_load(hwnd, st, false);
 }
 

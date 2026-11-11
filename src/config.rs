@@ -75,6 +75,11 @@ pub struct Config {
     pub hotkey: Option<Hotkey>,
     pub close_to_tray: bool,
     pub sort: Sort,
+    /// ウィンドウのタイトルに表示する名前(何の辞書かを示す)。そのまま表示する。空ならアプリの名前
+    pub title: String,
+    /// 共用フォルダでの運用(この設定ファイルを複数人で使う)。
+    /// 個人ごとの情報を設定の場所に書き込まないよう、しおりを無効にし、並び順も保存しない
+    pub shared: bool,
     pub dicts: Vec<DictConf>,
 }
 
@@ -84,6 +89,8 @@ impl Config {
             hotkey: parse_hotkey("Ctrl+Alt+D"),
             close_to_tray: false,
             sort: Sort::Word,
+            title: String::new(),
+            shared: false,
             dicts: vec![DictConf { name: "メイン".into(), path: base.join("dictionary.db"), readonly: false }],
         }
     }
@@ -98,6 +105,12 @@ pub fn default_ini() -> String {
 hotkey = Ctrl+Alt+D\r\n\
 ; 閉じるボタン / Esc で終了せず、トレイに隠して常駐する(既定は false = 閉じると終了)\r\n\
 close_to_tray = false\r\n\
+\r\n\
+; ウィンドウのタイトルに表示する名前(例: 社内用語集)。書いたとおりに表示します。空なら MyDictionary\r\n\
+title =\r\n\
+; 共用フォルダで運用する(この設定ファイルを複数人で使う)ときは true。\r\n\
+; しおりが無効になり、並び順の変更も保存されなくなります\r\n\
+shared = false\r\n\
 \r\n\
 ; 辞書の定義。[dictionary.任意のID] を必要なだけ書きます。先頭が既定の登録先です。\r\n\
 ; path は相対パスなら、この設定ファイルのあるフォルダ基準。%APPDATA% などの環境変数も使えます。\r\n\
@@ -176,6 +189,16 @@ pub fn parse_hotkey(s: &str) -> Option<Hotkey> {
     Some(Hotkey { mods, vk, text: names.join("+") })
 }
 
+/// ウィンドウのタイトル。設定した名前をそのまま表示する(何も足さない)。空ならアプリの名前
+pub fn window_title(cfg: &Config, app: &str) -> String {
+    let name = cfg.title.trim();
+    if name.is_empty() {
+        app.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 /// 設定をINIテキストにする(設定ダイアログからの保存用)。
 /// `base` と同じフォルダにある辞書はファイル名だけで書く。
 pub fn to_ini(cfg: &Config, base: &Path) -> String {
@@ -184,6 +207,8 @@ pub fn to_ini(cfg: &Config, base: &Path) -> String {
     s.push_str(&format!("hotkey = {}\r\n", cfg.hotkey.as_ref().map_or("none".to_string(), |h| h.text.clone())));
     s.push_str(&format!("close_to_tray = {}\r\n", cfg.close_to_tray));
     s.push_str(&format!("sort = {}\r\n", cfg.sort.key()));
+    s.push_str(&format!("title = {}\r\n", cfg.title));
+    s.push_str(&format!("shared = {}\r\n", cfg.shared));
     for (i, d) in cfg.dicts.iter().enumerate() {
         let path = match d.path.parent() {
             Some(p) if p == base => d.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
@@ -318,6 +343,11 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
                     Some(x) => cfg.sort = x,
                     None => warns.push(format!("設定: {}行目 sort は word / updated_asc / updated_desc", n + 1)),
                 },
+                "title" => cfg.title = v.to_string(),
+                "shared" => match parse_bool(v) {
+                    Some(b) => cfg.shared = b,
+                    None => warns.push(format!("設定: {}行目 shared は true / false", n + 1)),
+                },
                 "timing_log" => {} // 廃止した設定(古い設定ファイルに残っていても無視する)
                 _ => warns.push(format!("設定: {}行目 未知のキー {}", n + 1, k)),
             }
@@ -367,6 +397,7 @@ mod tests {
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(cfg.hotkey.as_ref().unwrap().text, "Ctrl+Alt+D");
         assert!(!cfg.close_to_tray); // 既定では、閉じるボタンで終了する
+        assert!(cfg.title.is_empty() && !cfg.shared); // 既定では、名前なし・個人での運用
         assert_eq!(cfg.dicts.len(), 1);
         assert_eq!(cfg.dicts[0].name, "メイン");
         assert_eq!(cfg.dicts[0].path, base.join("dictionary.db"));
@@ -397,6 +428,8 @@ mod tests {
             hotkey: parse_hotkey("Ctrl+Shift+F5"),
             close_to_tray: true,
             sort: Sort::UpdatedDesc,
+            title: "社内 用語集".into(),
+            shared: true,
             dicts: vec![
                 DictConf { name: "メイン".into(), path: base.join("dictionary.db"), readonly: false },
                 DictConf { name: "参照 用".into(), path: PathBuf::from("/other/dir/ref.db"), readonly: true },
@@ -407,10 +440,31 @@ mod tests {
         assert_eq!(back.hotkey, cfg.hotkey);
         assert!(back.close_to_tray);
         assert_eq!(back.sort, Sort::UpdatedDesc);
+        assert_eq!(back.title, "社内 用語集");
+        assert!(back.shared);
         assert_eq!(back.dicts, cfg.dicts);
         // ホットキー無し
         let none = Config { hotkey: None, ..cfg };
         assert!(parse(&to_ini(&none, base), base, &env).0.hotkey.is_none());
+    }
+
+    #[test]
+    fn titles() {
+        let mut c = Config::default_for(Path::new("/b"));
+        assert_eq!(window_title(&c, "MyDictionary"), "MyDictionary");
+        // 設定した名前を、そのまま表示する(アプリの名前や「共用」は足さない)
+        c.title = " 社内用語集 ".into();
+        assert_eq!(window_title(&c, "MyDictionary"), "社内用語集");
+        c.shared = true;
+        assert_eq!(window_title(&c, "MyDictionary"), "社内用語集");
+        c.title = "営業部の辞書 - MyDictionary".into();
+        assert_eq!(window_title(&c, "MyDictionary"), "営業部の辞書 - MyDictionary");
+        c.title.clear();
+        assert_eq!(window_title(&c, "MyDictionary"), "MyDictionary");
+        // 設定ファイルから読める
+        let (c, w) = parse("[general]\ntitle = 営業部 用語集\nshared = yes\n", Path::new("/b"), &env);
+        assert!(w.is_empty());
+        assert_eq!((c.title.as_str(), c.shared), ("営業部 用語集", true));
     }
 
     #[test]
