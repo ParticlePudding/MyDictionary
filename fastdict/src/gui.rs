@@ -558,7 +558,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
     let mut fields: Vec<(RECT, HWND)> = Vec::new();
 
     let edit = ui::field(hwnd, ID_EDIT, (0, 0, 10, 10), dpi, false, &mut fields, fonts.base);
-    let cue = wide("検索 — 見出し語・意味・タグ(スペース区切りで AND)");
+    let cue = wide("検索 — 見出し語・意味・タグ(スペースで AND、#タグ、* はワイルドカード)");
     send(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
     let btn_dict = owner_button(hwnd, ID_DICTS, "辞書: すべて");
     let adv = owner_button(hwnd, ID_ADV, "絞り込み");
