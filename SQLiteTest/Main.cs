@@ -1,8 +1,6 @@
 ﻿using System;
 using System.Windows.Forms;
 using MyDictionary;
-﻿using MyDictionary;
-
 
 class Program
 {
