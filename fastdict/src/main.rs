@@ -22,6 +22,19 @@ fn main() {
         println!("{report}");
         return;
     }
+    if let Some(i) = args.iter().position(|a| a == "--add-sample") {
+        #[cfg(windows)]
+        {
+            let _ = i;
+            gui::add_sample();
+        }
+        #[cfg(not(windows))]
+        match args.get(i + 1) {
+            Some(p) => println!("{:?}", core::create_sample(std::path::Path::new(p))),
+            None => eprintln!("usage: fastdict --add-sample <path>"),
+        }
+        return;
+    }
     #[cfg(windows)]
     gui::run();
     #[cfg(not(windows))]

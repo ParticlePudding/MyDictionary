@@ -181,6 +181,8 @@ pub struct EntryDlg {
     pub word: String,
     pub tags: String,
     pub meaning: String,
+    /// 参照先(URL またはファイル/フォルダのパス)
+    pub link: String,
     /// 登録先の候補(書き込み可能な辞書名)。表示は choices.len() > 1 のときだけ
     pub choices: Vec<String>,
     pub choice: usize,
@@ -194,6 +196,7 @@ const E_MEANING: usize = 303;
 const E_COMBO: usize = 304;
 const E_ERR: usize = 305;
 const E_HINT: usize = 306;
+const E_LINK: usize = 307;
 
 struct EntryCtl {
     data: *mut EntryDlg,
@@ -202,6 +205,7 @@ struct EntryCtl {
     word: HWND,
     tags: HWND,
     meaning: HWND,
+    link: HWND,
     combo: HWND,
     err: HWND,
     fields: Vec<(RECT, HWND)>,
@@ -209,7 +213,7 @@ struct EntryCtl {
 
 fn entry_height(show_choice: bool) -> i32 {
     // 20 + [見出し語] + [タグ] + [辞書] + [意味] + エラー + ボタン
-    20 + 66 + 66 + if show_choice { 62 } else { 0 } + (22 + 150 + 12) + 24 + 36 + 20
+    20 + 66 + 66 + (22 + 150 + 12) + 66 + if show_choice { 62 } else { 0 } + 24 + 36 + 20
 }
 
 /// 登録・編集ダイアログを表示する。保存されたら true(結果は `data` に入る)
@@ -236,15 +240,18 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let mut y = 20;
 
             label(hwnd, "見出し語", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
-            let word = ui::field(hwnd, E_WORD, (s(m), s(y + 22), s(fw), s(38)), dpi, false, &mut fields, fonts.search);
+            let word = ui::field(hwnd, E_WORD, (s(m), s(y + 22), s(fw), s(CTL_H)), dpi, false, &mut fields, fonts.base);
             y += 66;
             label(hwnd, "タグ(スペースまたはカンマ区切り・任意)", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
-            let tags = ui::field(hwnd, E_TAGS, (s(m), s(y + 22), s(fw), s(38)), dpi, false, &mut fields, fonts.base);
+            let tags = ui::field(hwnd, E_TAGS, (s(m), s(y + 22), s(fw), s(CTL_H)), dpi, false, &mut fields, fonts.base);
             y += 66;
 
             label(hwnd, "意味", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
-            let meaning = ui::field(hwnd, E_MEANING, (s(m), s(y + 22), s(fw), s(150)), dpi, true, &mut fields, fonts.body);
+            let meaning = ui::field(hwnd, E_MEANING, (s(m), s(y + 22), s(fw), s(150)), dpi, true, &mut fields, fonts.base);
             y += 22 + 150 + 12;
+            label(hwnd, "参照先(URL、またはファイル・フォルダのパス。任意)", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
+            let link = ui::field(hwnd, E_LINK, (s(m), s(y + 22), s(fw), s(CTL_H)), dpi, false, &mut fields, fonts.base);
+            y += 66;
 
             let hinst = GetModuleHandleW(None).unwrap();
             let combo = CreateWindowExW(
@@ -277,15 +284,16 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let err = label(hwnd, "", (s(m), s(y), s(fw), s(20)), fonts.small, E_ERR);
             y += 24;
             label(hwnd, "Ctrl+Enter でも保存できます", (s(m), s(y + 9), s(220), s(20)), fonts.small, E_HINT);
-            button(hwnd, "保存", ID_OK, (s(m + fw - 110 - 12 - 110), s(y), s(110), s(36)), true);
-            button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - 110), s(y), s(110), s(36)), true);
+            button(hwnd, "保存", ID_OK, (s(m + fw - 2 * BTN_W - 10), s(y), s(BTN_W), s(CTL_H)), true);
+            button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
 
             set_text(word, &d.word);
+            set_text(link, &d.link);
             set_text(tags, &d.tags);
             set_text(meaning, &d.meaning.replace("\r\n", "\n").replace('\n', "\r\n"));
             let _ = SetWindowTextW(hwnd, PCWSTR(wide(&d.title).as_ptr()));
 
-            let c = Box::new(EntryCtl { data, fonts, dpi, word, tags, meaning, combo, err, fields });
+            let c = Box::new(EntryCtl { data, fonts, dpi, word, tags, meaning, link, combo, err, fields });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(c) as isize);
             let _ = SetFocus(word);
             send(word, EM_SETSEL, 0, -1);
@@ -324,7 +332,7 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             }
             let c = &mut *ctl;
             match (id, code) {
-                (E_WORD | E_TAGS | E_MEANING, EN_SETFOCUS_ | EN_KILLFOCUS_) => {
+                (E_WORD | E_TAGS | E_MEANING | E_LINK, EN_SETFOCUS_ | EN_KILLFOCUS_) => {
                     ui::invalidate_field(hwnd, &c.fields, HWND(lparam.0 as *mut c_void));
                 }
                 (E_WORD | E_TAGS | E_MEANING, EN_CHANGE_) => {
@@ -346,6 +354,7 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         d.word = word;
                         d.meaning = meaning;
                         d.tags = crate::core::normalize_tags(&get_text(c.tags));
+                        d.link = get_text(c.link).trim().to_string();
                         if d.show_choice {
                             let sel = send(c.combo, CB_GETCURSEL, 0, 0).0;
                             if sel >= 0 {
@@ -451,7 +460,7 @@ fn from_hk_ctrl(v: isize) -> (u32, u32) {
 /// 設定ダイアログ。保存されたら true(結果は `data` に入る)
 pub unsafe fn settings_dialog(owner: HWND, data: &mut SettingsDlg) -> bool {
     data.ok = false;
-    run_modal(owner, w!("FastDictSettings"), "設定", 640, 600, data as *mut SettingsDlg as *const c_void);
+    run_modal(owner, w!("FastDictSettings"), "設定", 640, 604, data as *mut SettingsDlg as *const c_void);
     data.ok
 }
 
@@ -566,7 +575,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             let mut y = 20;
             label(hwnd, "全般", (s(m), s(y), s(fw), s(24)), fonts.heading, 0);
             y += 34;
-            label(hwnd, "呼び出しホットキー", (s(m), s(y + 5), s(180), s(24)), fonts.base, 0);
+            label(hwnd, "呼び出しホットキー", (s(m), s(y + 8), s(180), s(24)), fonts.base, 0);
             let hotkey = CreateWindowExW(
                 WS_EX_CLIENTEDGE,
                 w!("msctls_hotkey32"),
@@ -575,7 +584,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 s(m + 190),
                 s(y),
                 s(240),
-                s(32),
+                s(CTL_H),
                 hwnd,
                 HMENU(S_HOTKEY as *mut c_void),
                 hinst,
@@ -585,7 +594,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             send(hotkey, WM_SETFONT, fonts.base.0 as usize, 1);
             send(hotkey, HKM_SETRULES, 0x3, 0x6); // 修飾キー無し/Shiftのみは不可(代替: Ctrl+Alt)
             send(hotkey, HKM_SETHOTKEY, d.cfg.hotkey.as_ref().map_or(0, to_hk_ctrl) as usize, 0);
-            y += 36;
+            y += 40;
             label(
                 hwnd,
                 "枠を選んでキーを押します。BackSpace で無効。Win キーを使う場合は設定ファイルで指定します。",
@@ -607,7 +616,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | LVS_REPORT as u32 | LVS_SINGLESEL as u32 | LVS_SHOWSELALWAYS as u32),
                 s(m),
                 s(y),
-                s(fw - 112),
+                s(fw - BTN_W - 12),
                 s(150),
                 hwnd,
                 HMENU(S_LIST as *mut c_void),
@@ -629,27 +638,27 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 };
                 send(list, LVM_INSERTCOLUMNW, i, &col as *const _ as isize);
             }
-            let bx = m + fw - 100;
-            button(hwnd, "追加…", S_ADD, (s(bx), s(y), s(100), s(34)), true);
-            button(hwnd, "削除", S_DEL, (s(bx), s(y + 40), s(100), s(34)), true);
-            button(hwnd, "↑ 上へ", S_UP, (s(bx), s(y + 80), s(100), s(34)), true);
-            button(hwnd, "↓ 下へ", S_DOWN, (s(bx), s(y + 116), s(100), s(34)), true);
+            let bx = m + fw - BTN_W;
+            button(hwnd, "追加…", S_ADD, (s(bx), s(y), s(BTN_W), s(CTL_H)), true);
+            button(hwnd, "削除", S_DEL, (s(bx), s(y + 38), s(BTN_W), s(CTL_H)), true);
+            button(hwnd, "↑ 上へ", S_UP, (s(bx), s(y + 76), s(BTN_W), s(CTL_H)), true);
+            button(hwnd, "↓ 下へ", S_DOWN, (s(bx), s(y + 114), s(BTN_W), s(CTL_H)), true);
             y += 162;
 
             label(hwnd, "名前", (s(m), s(y + 8), s(60), s(24)), fonts.base, 0);
-            let name = ui::field(hwnd, S_NAME, (s(m + 70), s(y), s(fw - 70), s(38)), dpi, false, &mut fields, fonts.base);
+            let name = ui::field(hwnd, S_NAME, (s(m + 70), s(y), s(fw - 70), s(CTL_H)), dpi, false, &mut fields, fonts.base);
             y += 46;
             label(hwnd, "パス", (s(m), s(y + 8), s(60), s(24)), fonts.base, 0);
-            let path = ui::field(hwnd, S_PATH, (s(m + 70), s(y), s(fw - 70 - 110), s(38)), dpi, false, &mut fields, fonts.base);
-            button(hwnd, "参照…", S_BROWSE, (s(m + fw - 100), s(y + 1), s(100), s(36)), true);
+            let path = ui::field(hwnd, S_PATH, (s(m + 70), s(y), s(fw - 70 - BTN_W - 12), s(CTL_H)), dpi, false, &mut fields, fonts.base);
+            button(hwnd, "参照…", S_BROWSE, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
             y += 46;
             let ro = checkbox(hwnd, "参照のみ(この辞書では登録・編集・削除をしない)", S_RO, (s(m + 70), s(y), s(fw - 70), s(26)), fonts.base, false);
             y += 40;
 
             let err = label(hwnd, "", (s(m), s(y), s(fw), s(22)), fonts.small, S_ERR);
             y += 26;
-            button(hwnd, "保存", ID_OK, (s(m + fw - 110 - 12 - 110), s(y), s(110), s(36)), true);
-            button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - 110), s(y), s(110), s(36)), true);
+            button(hwnd, "保存", ID_OK, (s(m + fw - 2 * BTN_W - 10), s(y), s(BTN_W), s(CTL_H)), true);
+            button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
 
             let c = Box::new(SettingsCtl {
                 data,
@@ -682,7 +691,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
                 let s = |v: i32| scale(v, c.dpi);
-                let ly = s(20 + 34 + 36 + 46 + 44 - 9);
+                let ly = s(20 + 34 + 40 + 46 + 44 - 9);
                 ui::fill(hdc, &RECT { left: s(24), top: ly, right: rc.right - s(24), bottom: ly + 1 }, BORDER);
             }
             let _ = EndPaint(hwnd, &ps);

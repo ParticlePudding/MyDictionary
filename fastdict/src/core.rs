@@ -15,6 +15,8 @@ pub struct Entry {
     pub tags: String,
     /// UNIX秒(UTC)
     pub updated_at: i64,
+    /// 参照先(URL またはファイル/フォルダのパス)。無ければ空
+    pub link: String,
     // 検索用の小文字化済み文字列
     word_lc: String,
     meaning_lc: String,
@@ -24,11 +26,16 @@ pub struct Entry {
 impl Entry {
     pub fn new(id: i64, word: String, meaning: String, tags: String, updated_at: i64) -> Self {
         let (word_lc, meaning_lc, tags_lc) = (word.to_lowercase(), meaning.to_lowercase(), tags.to_lowercase());
-        Entry { dict: 0, id, word, meaning, tags, updated_at, word_lc, meaning_lc, tags_lc }
+        Entry { dict: 0, id, word, meaning, tags, updated_at, link: String::new(), word_lc, meaning_lc, tags_lc }
     }
 
     pub fn with_dict(mut self, dict: usize) -> Self {
         self.dict = dict;
+        self
+    }
+
+    pub fn with_link(mut self, link: String) -> Self {
+        self.link = link;
         self
     }
 }
@@ -60,10 +67,25 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
             word       TEXT NOT NULL,
             meaning    TEXT NOT NULL,
             tags       TEXT NOT NULL DEFAULT '',
-            updated_at INTEGER NOT NULL
+            updated_at INTEGER NOT NULL,
+            link       TEXT NOT NULL DEFAULT ''
          );",
     )?;
     Ok(conn)
+}
+
+/// words テーブルに参照先(link)列があるか。古い版で作った辞書には無い。
+pub fn has_link(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.prepare("SELECT 1 FROM pragma_table_info('words') WHERE name = 'link'")?.exists([])
+}
+
+/// 古い版で作った辞書に、参照先(link)列を追加する。書き込みの直前に呼ぶ。
+/// 列を足すだけなので、古い版のアプリからも引き続き読み書きできる。
+pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    if !has_link(conn)? {
+        conn.execute_batch("ALTER TABLE words ADD COLUMN link TEXT NOT NULL DEFAULT ''")?;
+    }
+    Ok(())
 }
 
 /// 参照専用で開く(ファイルが無ければエラー)
@@ -76,12 +98,18 @@ pub fn open_ro(path: &Path) -> rusqlite::Result<Connection> {
 /// 全件を読み込む。並べ替えは呼び出し側(sort_entries)で行う。
 /// 件数が多いときは、検索用の小文字化を複数スレッドで行う。
 pub fn load_all(conn: &Connection) -> rusqlite::Result<Vec<Entry>> {
-    type Raw = (i64, String, String, String, i64);
-    let mut stmt = conn.prepare("SELECT id, word, meaning, tags, updated_at FROM words")?;
+    type Raw = (i64, String, String, String, i64, String);
+    // 参照専用で開いた古い辞書には link 列が無いことがある(その場合は空として読む)
+    let sql = if has_link(conn)? {
+        "SELECT id, word, meaning, tags, updated_at, link FROM words"
+    } else {
+        "SELECT id, word, meaning, tags, updated_at, '' FROM words"
+    };
+    let mut stmt = conn.prepare(sql)?;
     let raw: Vec<Raw> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let build = |(id, w, m, t, u): Raw| Entry::new(id, w, m, t, u);
+    let build = |(id, w, m, t, u, l): Raw| Entry::new(id, w, m, t, u).with_link(l);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4);
     if raw.len() < 20_000 || threads < 2 {
         return Ok(raw.into_iter().map(build).collect());
@@ -100,7 +128,7 @@ pub fn load_all(conn: &Connection) -> rusqlite::Result<Vec<Entry>> {
     std::thread::scope(|sc| {
         let handles: Vec<_> = parts
             .into_iter()
-            .map(|p| sc.spawn(move || p.into_iter().map(|r| Entry::new(r.0, r.1, r.2, r.3, r.4)).collect::<Vec<_>>()))
+            .map(|p| sc.spawn(move || p.into_iter().map(|r| Entry::new(r.0, r.1, r.2, r.3, r.4).with_link(r.5)).collect::<Vec<_>>()))
             .collect();
         for h in handles {
             out.extend(h.join().expect("load thread"));
@@ -113,24 +141,24 @@ pub fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-pub fn insert(conn: &Connection, word: &str, meaning: &str, tags: &str) -> rusqlite::Result<Entry> {
+pub fn insert(conn: &Connection, word: &str, meaning: &str, tags: &str, link: &str) -> rusqlite::Result<Entry> {
     let ts = now_unix();
     conn.execute(
-        "INSERT INTO words (word, meaning, tags, updated_at) VALUES (?1, ?2, ?3, ?4)",
-        params![word, meaning, tags, ts],
+        "INSERT INTO words (word, meaning, tags, updated_at, link) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![word, meaning, tags, ts, link],
     )?;
-    Ok(Entry::new(conn.last_insert_rowid(), word.into(), meaning.into(), tags.into(), ts))
+    Ok(Entry::new(conn.last_insert_rowid(), word.into(), meaning.into(), tags.into(), ts).with_link(link.into()))
 }
 
 /// 既存レコードを更新し、新しい更新時刻(UNIX秒)を返す。
 /// `expected_ts`(読み込んだ時点の更新時刻)と一致しない場合は、他の人が先に変更/削除したとみなして
 /// `QueryReturnedNoRows` を返す(上書きしない)。
-pub fn update(conn: &Connection, id: i64, expected_ts: i64, word: &str, meaning: &str, tags: &str) -> rusqlite::Result<i64> {
+pub fn update(conn: &Connection, id: i64, expected_ts: i64, word: &str, meaning: &str, tags: &str, link: &str) -> rusqlite::Result<i64> {
     // 同じ秒のうちに再編集しても更新時刻が必ず変わるようにする
     let ts = now_unix().max(expected_ts + 1);
     let n = conn.execute(
-        "UPDATE words SET word = ?1, meaning = ?2, tags = ?3, updated_at = ?4 WHERE id = ?5 AND updated_at = ?6",
-        params![word, meaning, tags, ts, id, expected_ts],
+        "UPDATE words SET word = ?1, meaning = ?2, tags = ?3, updated_at = ?4, link = ?7 WHERE id = ?5 AND updated_at = ?6",
+        params![word, meaning, tags, ts, id, expected_ts, link],
     )?;
     if n == 0 {
         return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -309,6 +337,73 @@ pub fn mark_ranges(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
     merged
 }
 
+/// 参照先の種類。開く前の確認の強さを決める。
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum LinkKind {
+    /// http / https の Web ページ。そのまま開く
+    Web,
+    /// 実行される可能性のあるファイル(.exe / .bat / .lnk など)。強い警告を出す
+    Executable,
+    /// それ以外(文書ファイル、フォルダ、その他のスキーム)。開く前に確認する
+    Other,
+}
+
+pub fn link_kind(link: &str) -> LinkKind {
+    let l = link.trim().trim_matches('"').to_lowercase();
+    if l.starts_with("http://") || l.starts_with("https://") {
+        return LinkKind::Web;
+    }
+    const EXEC: &[&str] = &[
+        "exe", "com", "bat", "cmd", "scr", "pif", "msi", "msp", "ps1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta", "lnk", "url",
+        "reg", "jar", "cpl", "dll", "appref-ms",
+    ];
+    // mailto: などファイルではないスキーム(2文字以上。1文字はドライブ名)は、拡張子で判定しない
+    if let Some((scheme, _)) = l.split_once(':') {
+        let is_scheme = scheme.len() >= 2
+            && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'));
+        if is_scheme && scheme != "file" {
+            return LinkKind::Other;
+        }
+    }
+    let name = l.rsplit(['\\', '/']).next().unwrap_or("");
+    match name.rsplit_once('.') {
+        Some((_, ext)) if EXEC.contains(&ext.trim()) => LinkKind::Executable,
+        _ => LinkKind::Other,
+    }
+}
+
+/// 同梱のサンプルデータ(見出し語<TAB>タグ<TAB>参照先<TAB>意味)を解析する
+pub fn parse_sample(tsv: &str) -> Vec<(String, String, String, String)> {
+    tsv.lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .filter_map(|l| {
+            let mut it = l.splitn(4, '\t');
+            let (w, t, k, m) = (it.next()?, it.next()?, it.next()?, it.next()?);
+            Some((w.trim().to_string(), normalize_tags(t), k.trim().to_string(), m.trim().to_string()))
+        })
+        .collect()
+}
+
+pub const SAMPLE_TSV: &str = include_str!("../sample/sample.tsv");
+
+/// サンプル辞書を作る(すでに語が入っていれば何もしない)。追加した件数を返す
+pub fn create_sample(path: &Path) -> rusqlite::Result<usize> {
+    let mut conn = open(path)?;
+    migrate(&conn)?;
+    let existing: i64 = conn.query_row("SELECT COUNT(*) FROM words", [], |r| r.get(0))?;
+    if existing > 0 {
+        return Ok(0);
+    }
+    let rows = parse_sample(SAMPLE_TSV);
+    let tx = conn.transaction()?;
+    for (w, t, k, m) in &rows {
+        insert(&tx, w, m, t, k)?;
+    }
+    tx.commit()?;
+    Ok(rows.len())
+}
+
 /// 表示用: UNIX秒(UTC)を日本時間(UTC+9)の "yyyy/MM/dd HH:mm:ss" にする。
 pub fn format_jst(unix: i64) -> String {
     let t = unix + 9 * 3600;
@@ -449,6 +544,73 @@ mod tests {
     }
 
     #[test]
+    fn link_kinds() {
+        assert_eq!(link_kind("https://example.com/a.exe"), LinkKind::Web); // Web 上のファイルはブラウザが扱う
+        assert_eq!(link_kind(" HTTP://example.com "), LinkKind::Web);
+        assert_eq!(link_kind("C:\\docs\\spec.pdf"), LinkKind::Other);
+        assert_eq!(link_kind("\\\\server\\share\\folder"), LinkKind::Other);
+        assert_eq!(link_kind("mailto:a@example.com"), LinkKind::Other);
+        assert_eq!(link_kind("\\\\server\\share\\tool.EXE"), LinkKind::Executable);
+        assert_eq!(link_kind("\"C:\\x\\run.bat\""), LinkKind::Executable);
+        assert_eq!(link_kind("file:///C:/x/a.lnk"), LinkKind::Executable);
+        assert_eq!(link_kind("C:\\my.folder\\readme"), LinkKind::Other);
+    }
+
+    #[test]
+    fn old_schema_without_link_column() {
+        let dir = std::env::temp_dir().join(format!("fastdict-old-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("old.db");
+        let _ = std::fs::remove_file(&path);
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE words (id INTEGER PRIMARY KEY AUTOINCREMENT, word TEXT NOT NULL, meaning TEXT NOT NULL,
+                 tags TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);
+                 INSERT INTO words (word, meaning, tags, updated_at) VALUES ('old', 'entry', '', 1);",
+            )
+            .unwrap();
+        }
+        // 参照専用でも読める(link は空)
+        let ro = open_ro(&path).unwrap();
+        assert!(!has_link(&ro).unwrap());
+        let v = load_all(&ro).unwrap();
+        assert_eq!((v[0].word.as_str(), v[0].link.as_str()), ("old", ""));
+        drop(ro);
+        // 書き込み前の移行で列が増え、既存データは残る
+        let c = open(&path).unwrap();
+        migrate(&c).unwrap();
+        migrate(&c).unwrap(); // 2回呼んでも問題ない
+        insert(&c, "new", "entry", "", "https://example.com/").unwrap();
+        let mut v = load_all(&c).unwrap();
+        sort_entries(&mut v);
+        assert_eq!(v.iter().map(|e| e.link.as_str()).collect::<Vec<_>>(), vec!["https://example.com/", ""]);
+        drop(c);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sample_data() {
+        let rows = parse_sample(SAMPLE_TSV);
+        assert_eq!(rows.len(), 300);
+        assert!(rows.iter().all(|r| !r.0.is_empty() && !r.3.is_empty() && !r.1.is_empty()));
+        assert!(rows.iter().filter(|r| !r.2.is_empty()).all(|r| link_kind(&r.2) == LinkKind::Web));
+        let mut words: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        words.sort_unstable();
+        words.dedup();
+        assert_eq!(words.len(), 300); // 見出し語の重複なし
+
+        let dir = std::env::temp_dir().join(format!("fastdict-sample-{}", std::process::id()));
+        let path = dir.join("sample.db");
+        assert_eq!(create_sample(&path).unwrap(), 300);
+        assert_eq!(create_sample(&path).unwrap(), 0); // 2回目は追加しない
+        let c = open(&path).unwrap();
+        assert_eq!(load_all(&c).unwrap().len(), 300);
+        drop(c);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn jst_format() {
         assert_eq!(format_jst(0), "1970/01/01 09:00:00");
         assert_eq!(format_jst(1_700_000_000), "2023/11/15 07:13:20");
@@ -473,19 +635,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fastdict-test-{}", std::process::id()));
         let path = dir.join("d.db");
         let conn = open(&path).unwrap();
-        let a = insert(&conn, "b", "second", "t").unwrap();
-        insert(&conn, "A", "first", "").unwrap();
+        let a = insert(&conn, "b", "second", "t", "https://example.com/").unwrap();
+        insert(&conn, "A", "first", "", "").unwrap();
         let mut all = load_all(&conn).unwrap();
         sort_entries(&mut all);
         assert_eq!(all.iter().map(|e| e.word.as_str()).collect::<Vec<_>>(), vec!["A", "b"]);
-        let ts = update(&conn, a.id, a.updated_at, "b2", "second!", "t1 t2").unwrap();
+        let ts = update(&conn, a.id, a.updated_at, "b2", "second!", "t1 t2", "C:\\doc\\a.pdf").unwrap();
         assert!(ts > a.updated_at);
-        assert!(update(&conn, 9999, 0, "x", "y", "").is_err());
+        assert!(update(&conn, 9999, 0, "x", "y", "", "").is_err());
         // 他の人が先に変更していた(更新時刻が違う)場合は上書きしない
-        assert!(update(&conn, a.id, a.updated_at, "stale", "stale", "").is_err());
+        assert!(update(&conn, a.id, a.updated_at, "stale", "stale", "", "").is_err());
         let all = load_all(&conn).unwrap();
         let b = all.iter().find(|e| e.id == a.id).unwrap();
         assert_eq!((b.word.as_str(), b.meaning.as_str(), b.tags.as_str()), ("b2", "second!", "t1 t2"));
+        assert_eq!(b.link, "C:\\doc\\a.pdf");
         assert_eq!(delete_ids(&conn, &[a.id, 12345]).unwrap(), 1);
         assert_eq!(load_all(&conn).unwrap().len(), 1);
         let ro = open_ro(&path).unwrap();

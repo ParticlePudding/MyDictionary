@@ -216,7 +216,8 @@ fn write_impl<T>(
             snapshot(&reader, &pre).map_err(WriteError::Backup)?;
         }
         rotate(&dir, &pre);
-        // 4. 書き込み
+        // 4. 書き込み(古い版で作った辞書なら、先に参照先の列を追加する)
+        core::migrate(&tx).map_err(classify)?;
         let r = f(&tx).map_err(classify)?;
         tx.commit().map_err(classify)?;
         r
@@ -269,8 +270,8 @@ mod tests {
     fn normal_write_and_backup() {
         let d = tmp("normal");
         let (db, root) = (d.join("share").join("dict.db"), d.join("local"));
-        write(&db, &root, |c| core::insert(c, "a", "1", "")).unwrap();
-        write(&db, &root, |c| core::insert(c, "b", "2", "")).unwrap();
+        write(&db, &root, |c| core::insert(c, "a", "1", "", "")).unwrap();
+        write(&db, &root, |c| core::insert(c, "b", "2", "", "")).unwrap();
         assert_eq!(words(&db), vec!["a", "b"]);
         // 直前(b を入れる前)の状態がローカルに残っている
         let pre = backup_dir(&root, &db).join("pre-write.db");
@@ -283,10 +284,10 @@ mod tests {
     fn failed_closure_changes_nothing() {
         let d = tmp("fail");
         let (db, root) = (d.join("dict.db"), d.join("local"));
-        write(&db, &root, |c| core::insert(c, "a", "1", "")).unwrap();
+        write(&db, &root, |c| core::insert(c, "a", "1", "", "")).unwrap();
         let r = write(&db, &root, |c| {
-            core::insert(c, "b", "2", "")?;
-            core::update(c, 9999, 0, "x", "y", "") // 存在しない → 失敗
+            core::insert(c, "b", "2", "", "")?;
+            core::update(c, 9999, 0, "x", "y", "", "") // 存在しない → 失敗
         });
         assert!(matches!(r, Err(WriteError::Conflict)));
         assert_eq!(words(&db), vec!["a"]); // b も入っていない(1トランザクション)
@@ -297,14 +298,14 @@ mod tests {
     fn corruption_after_write_is_rolled_back() {
         let d = tmp("rollback");
         let (db, root) = (d.join("dict.db"), d.join("local"));
-        write(&db, &root, |c| core::insert(c, "a", "1", "")).unwrap();
+        write(&db, &root, |c| core::insert(c, "a", "1", "", "")).unwrap();
         // 書き込み直後にファイルが壊れた、という状況を作る
-        let r = write_impl(&db, &root, |c| core::insert(c, "b", "2", ""), &|p| corrupt(p));
+        let r = write_impl(&db, &root, |c| core::insert(c, "b", "2", "", ""), &|p| corrupt(p));
         assert!(matches!(r, Err(WriteError::RolledBack)), "{r:?}");
         assert!(file_ok(&db));
         assert_eq!(words(&db), vec!["a"]); // 書き込み前の状態に戻っている
         // その後も普通に書ける
-        write(&db, &root, |c| core::insert(c, "c", "3", "")).unwrap();
+        write(&db, &root, |c| core::insert(c, "c", "3", "", "")).unwrap();
         assert_eq!(words(&db), vec!["a", "c"]);
         let _ = std::fs::remove_dir_all(d);
     }
@@ -313,10 +314,10 @@ mod tests {
     fn corrupt_before_write_is_refused_and_restorable() {
         let d = tmp("before");
         let (db, root) = (d.join("dict.db"), d.join("local"));
-        write(&db, &root, |c| core::insert(c, "a", "1", "")).unwrap();
-        write(&db, &root, |c| core::insert(c, "b", "2", "")).unwrap();
+        write(&db, &root, |c| core::insert(c, "a", "1", "", "")).unwrap();
+        write(&db, &root, |c| core::insert(c, "b", "2", "", "")).unwrap();
         corrupt(&db); // 他の人の書き込みで壊れた、という状況
-        let r = write(&db, &root, |c| core::insert(c, "c", "3", ""));
+        let r = write(&db, &root, |c| core::insert(c, "c", "3", "", ""));
         assert!(matches!(r, Err(WriteError::CorruptBefore)), "{r:?}");
         // 最新の正常なバックアップ(自分の最後の書き込み b の直後の状態)から復元できる
         let (bk, ts) = latest_backup(&db, &root).unwrap();
