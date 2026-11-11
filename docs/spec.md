@@ -29,7 +29,7 @@
 | 保存 | SQLite(`rusqlite` 0.32、`bundled` で静的リンク) |
 | 配布 | 実行ファイル1つ(`MyDictionary.exe`、約1.7MB)。依存は Windows 標準の DLL のみ |
 | ライセンス | MIT |
-| 版 | 2.00(Cargo のパッケージは `mydictionary` 2.0.0) |
+| 版 | 2.01(Cargo のパッケージは `mydictionary` 2.0.1) |
 
 ### 設計の方針
 - **起動を待たせない**: ウィンドウを先に出し、辞書の読み込みは別スレッドで行う。
@@ -380,6 +380,8 @@ RichEdit の URL 自動検出(`EM_AUTOURLDETECT`)は使いません。URL の形
 - 左ボタンを離したとき、選択範囲が空なら(= ドラッグではなくクリックなら)、`EM_CHARFROMPOS` で文字位置を求め、`EM_POSFROMCHAR` で座標も確かめて、リンクの上かを判定する(`gui::link_at`)。
 - 本文を書き換える処理を RichEdit のマウス処理の途中で行わないよう、`WM_APP_LINK` を自分に送ってから開く。
 - リンクの上では、RichEdit をサブクラス化して `WM_SETCURSOR` を処理し、カーソルを指のマークにする。
+
+- マウスがリンクの上にある間は、開く先をステータス欄に表示する(`State::hover_link`)。本文欄から出たことは、`TrackMouseEvent` で依頼した `WM_MOUSELEAVE` で知る。
 
 `CFE_LINK` は、見た目(下線)のためだけに付けています。
 
