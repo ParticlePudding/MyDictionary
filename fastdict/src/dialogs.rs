@@ -446,6 +446,8 @@ struct SettingsCtl {
     fields: Vec<(RECT, HWND)>,
     sel: Option<usize>,
     orig_hotkey: Option<Hotkey>,
+    /// 保存/キャンセルの上に引く区切り線の位置
+    footer_line: i32,
 }
 
 fn to_hk_ctrl(h: &Hotkey) -> isize {
@@ -481,7 +483,7 @@ fn from_hk_ctrl(v: isize) -> (u32, u32) {
 /// 設定ダイアログ。保存されたら true(結果は `data` に入る)
 pub unsafe fn settings_dialog(owner: HWND, data: &mut SettingsDlg) -> bool {
     data.ok = false;
-    run_modal(owner, w!("FastDictSettings"), "設定", 640, 610, data as *mut SettingsDlg as *const c_void);
+    run_modal(owner, w!("FastDictSettings"), "設定", 640, 602, data as *mut SettingsDlg as *const c_void);
     data.ok
 }
 
@@ -624,7 +626,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 S_MUTED,
             );
             y += 46;
-            let tray = checkbox(hwnd, "閉じるボタンで終了せず、トレイに隠す", S_TRAY, (s(m), s(y), s(fw), s(26)), fonts.base, d.cfg.close_to_tray);
+            let tray = checkbox(hwnd, "閉じるボタンや Esc で終了せず、トレイに隠して常駐する", S_TRAY, (s(m), s(y), s(fw), s(26)), fonts.base, d.cfg.close_to_tray);
             y += 44;
 
             // --- 辞書 ---
@@ -679,7 +681,10 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             y += 46;
 
             let err = label(hwnd, "", (s(m), s(y), s(fw), s(22)), fonts.small, S_ERR);
-            y += 26;
+            y += 28;
+            // ここから下は、画面全体(全般・辞書の両方)の保存/キャンセル。区切り線で分ける
+            let footer_line = s(y);
+            y += 16;
             button(hwnd, "保存", ID_OK, (s(m + fw - 2 * BTN_W - 10), s(y), s(BTN_W), s(CTL_H)), true);
             button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
 
@@ -697,6 +702,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 fields,
                 sel: None,
                 orig_hotkey: d.cfg.hotkey.clone(),
+                footer_line,
             });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(c) as isize);
             let c = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsCtl);
@@ -716,6 +722,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 let s = |v: i32| scale(v, c.dpi);
                 let ly = s(20 + 34 + 40 + 46 + 44 - 9);
                 ui::fill(hdc, &RECT { left: s(24), top: ly, right: rc.right - s(24), bottom: ly + 1 }, BORDER);
+                ui::fill(hdc, &RECT { left: 0, top: c.footer_line, right: rc.right, bottom: c.footer_line + 1 }, BORDER);
             }
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
