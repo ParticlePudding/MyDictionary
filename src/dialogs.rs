@@ -415,6 +415,8 @@ pub struct SettingsDlg {
     pub cfg: Config,
     /// 書き込み前バックアップの置き場(インポートで使う)
     pub backup_root: PathBuf,
+    /// 設定ファイルの場所(画面に表示する)
+    pub cfg_path: PathBuf,
     /// インポートを実行した(キャンセルで閉じても、辞書の読み直しが必要)
     pub imported: bool,
     pub ok: bool,
@@ -422,6 +424,8 @@ pub struct SettingsDlg {
 
 const S_HOTKEY: usize = 401;
 const S_TRAY: usize = 403;
+const S_TITLE: usize = 405;
+const S_SHARED: usize = 406;
 const S_LIST: usize = 410;
 const S_ADD: usize = 411;
 const S_DEL: usize = 412;
@@ -442,6 +446,9 @@ struct SettingsCtl {
     dpi: i32,
     hotkey: HWND,
     tray: HWND,
+    title: HWND,
+    shared: HWND,
+    section_line: i32,
     list: HWND,
     name: HWND,
     path: HWND,
@@ -487,7 +494,7 @@ fn from_hk_ctrl(v: isize) -> (u32, u32) {
 /// 設定ダイアログ。保存されたら true(結果は `data` に入る)
 pub unsafe fn settings_dialog(owner: HWND, data: &mut SettingsDlg) -> bool {
     data.ok = false;
-    run_modal(owner, w!("MyDictionarySettings"), "設定", 640, 602, data as *mut SettingsDlg as *const c_void);
+    run_modal(owner, w!("MyDictionarySettings"), "設定", 640, 680, data as *mut SettingsDlg as *const c_void);
     data.ok
 }
 
@@ -630,8 +637,18 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 S_MUTED,
             );
             y += 46;
+label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(24)), fonts.base, 0);
+            let title = ui::field(hwnd, S_TITLE, (s(m + 190), s(y), s(fw - 190), s(CTL_H)), dpi, false, &mut fields, fonts.base);
+            let cue = wide("例: 社内用語集(空なら MyDictionary と表示します)");
+            send(title, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
+            set_text(title, &d.cfg.title);
+            y += 46;
             let tray = checkbox(hwnd, "閉じるボタンや Esc で終了せず、トレイに隠して常駐する", S_TRAY, (s(m), s(y), s(fw), s(26)), fonts.base, d.cfg.close_to_tray);
-            y += 44;
+            y += 30;
+            let shared = checkbox(hwnd, "共用フォルダで運用する(この設定を複数人で使う。しおりは無効、並び順は保存しない)", S_SHARED, (s(m), s(y), s(fw), s(26)), fonts.base, d.cfg.shared);
+            y += 34;
+            let section_line = s(y);
+            y += 10;
 
             // --- 辞書 ---
             label(hwnd, "辞書", (s(m), s(y), s(fw), s(24)), fonts.heading, 0);
@@ -690,7 +707,26 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             let footer_line = s(y);
             y += 16;
             // 左下に、アプリの名前と版
-            label(hwnd, &format!("{} {}", ui::APP_NAME, ui::APP_VERSION), (s(m), s(y + 9), s(220), s(20)), fonts.small, S_MUTED);
+            // 左下に、アプリの版と、いま使っている設定ファイルの場所(個人の設定か、共用の設定かが分かるように)
+            let info = format!("{} {}  設定: {}", ui::APP_NAME, ui::APP_VERSION, d.cfg_path.display());
+            let hinst2 = GetModuleHandleW(None).unwrap();
+            let t = wide(&info);
+            let info_h = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                PCWSTR(t.as_ptr()),
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 0x8000 /* SS_PATHELLIPSIS */ | 0x80 /* SS_NOPREFIX */),
+                s(m),
+                s(y + 9),
+                s(fw - 2 * BTN_W - 30),
+                s(20),
+                hwnd,
+                HMENU(S_MUTED as *mut c_void),
+                hinst2,
+                None,
+            )
+            .unwrap();
+            send(info_h, WM_SETFONT, fonts.small.0 as usize, 1);
             button(hwnd, "保存", ID_OK, (s(m + fw - 2 * BTN_W - 10), s(y), s(BTN_W), s(CTL_H)), true);
             button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
 
@@ -700,6 +736,9 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 dpi,
                 hotkey,
                 tray,
+                title,
+                shared,
+                section_line,
                 list,
                 name,
                 path,
@@ -726,8 +765,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
                 let s = |v: i32| scale(v, c.dpi);
-                let ly = s(20 + 34 + 40 + 46 + 44 - 9);
-                ui::fill(hdc, &RECT { left: s(24), top: ly, right: rc.right - s(24), bottom: ly + 1 }, BORDER);
+                ui::fill(hdc, &RECT { left: s(24), top: c.section_line, right: rc.right - s(24), bottom: c.section_line + 1 }, BORDER);
                 ui::fill(hdc, &RECT { left: 0, top: c.footer_line, right: rc.right, bottom: c.footer_line + 1 }, BORDER);
             }
             let _ = EndPaint(hwnd, &ps);
@@ -774,7 +812,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             let c = &mut *ctl;
             let d = &mut *c.data;
             match (id, code) {
-                (S_NAME | S_PATH, EN_SETFOCUS_ | EN_KILLFOCUS_) => {
+                (S_NAME | S_PATH | S_TITLE, EN_SETFOCUS_ | EN_KILLFOCUS_) => {
                     ui::invalidate_field(hwnd, &c.fields, HWND(lparam.0 as *mut c_void));
                 }
                 (S_NAME, EN_CHANGE_) if !ui::is_busy() => {
@@ -888,6 +926,8 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         }
                     }
                     d.cfg.close_to_tray = send(c.tray, BM_GETCHECK_, 0, 0).0 == 1;
+                    d.cfg.shared = send(c.shared, BM_GETCHECK_, 0, 0).0 == 1;
+                    d.cfg.title = get_text(c.title).trim().to_string();
                     d.ok = true;
                     let _ = DestroyWindow(hwnd);
                 }
