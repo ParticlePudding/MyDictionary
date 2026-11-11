@@ -1,0 +1,24 @@
+# 指定したタグの Release と、そのタグを削除する(手動で実行する)。
+# Actions の画面で「delete-release」→「Run workflow」を選び、tag に v2.00 のようなタグ名を入れる。
+name: delete-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "削除する Release のタグ名(例: v2.00)。タグも一緒に削除する"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+        run: gh release delete "$TAG" --cleanup-tag --yes

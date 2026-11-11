@@ -519,6 +519,8 @@ GitHub Actions(`.github/workflows/release.yml`)が Windows 上でテストとビ
 `tag` を空にして実行すると、Release は作らず、ビルドした exe を Artifacts に残すだけです(Windows でのビルド確認に使えます)。
 同じタグの Release を作り直したいときは、`replace` にチェックを入れて実行します(古い Release とタグを削除してから作成します)。
 
+不要になった Release は、Actions の画面で「delete-release」→「Run workflow」を選び、タグ名を入れて実行すると、Release とタグの両方が削除されます(`.github/workflows/delete-release.yml`)。
+
 ### 計測
 ```
 MyDictionary.exe --bench 100000
