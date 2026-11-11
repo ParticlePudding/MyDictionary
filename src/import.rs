@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn insert_skips_duplicates() {
-        let dir = std::env::temp_dir().join(format!("fastdict-import-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("MyDictionary-import-{}", std::process::id()));
         let path = dir.join("d.db");
         let conn = core::open(&path).unwrap();
         core::migrate(&conn).unwrap();

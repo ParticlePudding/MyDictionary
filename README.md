@@ -16,7 +16,6 @@
 |---|---|
 | [取扱説明書](docs/manual.md) | 使い方(検索、登録、しおり、設定、取り込み・書き出し、共有フォルダでの注意) |
 | [仕様書](docs/spec.md) | 開発者向け(構成、データ形式、検索・並び順の仕様、安全な書き込みの手順、ビルドとテスト) |
-| [テストチェックシート](docs/test-checklist.md) | 確認項目と結果 |
 
 ## はじめかた
 
@@ -33,11 +32,16 @@ cargo build --release
 `target\release\MyDictionary.exe` ができます。
 
 ### サンプルの辞書を試す
-約300語の辞書と、長い文章の20語の辞書が追加されます。
+`sample` フォルダに、取り込める見本のデータがあります。
 
-```
-MyDictionary.exe --add-sample
-```
+| ファイル | 内容 |
+|---|---|
+| `sample/sample.tsv` | 約300語(IT・英語・四字熟語・ことわざ・ビジネス) |
+| `sample/sample2.tsv` | 長い文章の20語(複数の段落、箇条書き、語どうしのリンク) |
+
+1. アプリの「設定」を開き、「辞書」の一覧で取り込み先の辞書を選びます。
+   普段の辞書と分けたい場合は、先に「追加…」でサンプル用の辞書を作ってください。
+2. 「取り込む…」を押し、上のファイルを選びます。
 
 > **起動がブロックされるとき**: 実行ファイルには署名がありません。Windows の警告が出た場合は「詳細情報」→「実行」で起動できます。
 > Windows 11 の Smart App Control が有効な PC では、起動やビルドがブロックされることがあります。
@@ -49,10 +53,11 @@ MyDictionary.exe --add-sample
 src/       プログラム(Rust)
 assets/    アイコン
 sample/    サンプルデータ(TSV。取り込みの見本にもなります)
-docs/      取扱説明書・仕様書・テストチェックシート
+docs/      取扱説明書・仕様書など
 ```
 
-データは、既定では `%AppData%\fastdict\` に保存されます(辞書 `dictionary.db`、設定 `fastdict.ini`、しおり `bookmarks.tsv`)。
-フォルダ名と設定ファイル名の `fastdict` は開発時の名前で、これまでのデータを引き継ぐために変えていません。
+データは、既定では `%AppData%\MyDictionary\` に保存されます(辞書 `dictionary.db`、設定 `MyDictionary.ini`、しおり `bookmarks.tsv`)。
 
-現在の版は **2.00** です。
+## ライセンス
+
+[MIT License](LICENSE)

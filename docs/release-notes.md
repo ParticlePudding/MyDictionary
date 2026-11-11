@@ -3,7 +3,7 @@
 ## 使いはじめる
 1. 下の **MyDictionary.exe** をダウンロードして、好きな場所に置きます(インストールは要りません)。
 2. 起動すると、すぐに検索欄へ入力できます。
-3. サンプルの辞書を試すには、コマンドプロンプトなどで `MyDictionary.exe --add-sample` を実行します。
+3. サンプルの辞書を試すには、リポジトリの [sample フォルダ](https://github.com/ParticlePudding/MyDictionary/tree/master/sample) の TSV をダウンロードし、「設定」→「取り込む…」で取り込みます。
 
 使い方は [取扱説明書](https://github.com/ParticlePudding/MyDictionary/blob/master/docs/manual.md) を参照してください。
 
@@ -21,4 +21,7 @@
 ## 注意
 - 実行ファイルには署名がありません。初回の起動時に、Windows の警告(「Windows によって PC が保護されました」)が出ることがあります。「詳細情報」→「実行」で起動できます。
 - Windows 11 の Smart App Control が有効な PC では、起動がブロックされることがあります(くわしくは取扱説明書の「困ったとき」)。
-- データは `%AppData%\fastdict\` に保存されます(フォルダ名は開発時の名前のままです)。
+- データは `%AppData%\MyDictionary\` に保存されます。
+
+## ライセンス
+MIT License

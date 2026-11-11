@@ -27,18 +27,9 @@
 | 言語 | Rust(edition 2021) |
 | GUI | Win32 API を直接使用(`windows` クレート 0.58)。標準コントロール + 一部を自前で描画 |
 | 保存 | SQLite(`rusqlite` 0.32、`bundled` で静的リンク) |
-| 配布 | 実行ファイル1つ(`MyDictionary.exe`、約1.6MB)。依存は Windows 標準の DLL のみ |
+| 配布 | 実行ファイル1つ(`MyDictionary.exe`、約1.7MB)。依存は Windows 標準の DLL のみ |
+| ライセンス | MIT |
 | 版 | 2.00(Cargo のパッケージは `mydictionary` 2.0.0) |
-
-### 名前について
-アプリの名前と実行ファイル名は MyDictionary ですが、開発時の名前 `fastdict` が、次の場所に残っています。これまでのデータを引き継ぐためで、変える場合は移行の処理が必要です。
-
-| 場所 | 名前 |
-|---|---|
-| データのフォルダ | `%AppData%\fastdict\`、`%LocalAppData%\fastdict\` |
-| 設定ファイル | `fastdict.ini` |
-| ウィンドウクラス、ミューテックス | `FastDictMainWindow`、`FastDictEntry` など、`Local\FastDictSingleInstance` |
-| JSON の `format` | `"fastdict"` |
 
 ### 設計の方針
 - **起動を待たせない**: ウィンドウを先に出し、辞書の読み込みは別スレッドで行う。
@@ -55,10 +46,12 @@ Cargo.toml / Cargo.lock
 build.rs          リソース(app.rc)を実行ファイルに埋め込む(対象が Windows のときだけ)
 app.manifest      Common Controls v6、DPI 対応(PerMonitorV2)、長いパス
 app.rc            リソース定義: アイコン、マニフェスト、バージョン情報
-assets/app.ico    アイコン(256 / 48 / 32 / 16)
+assets/app.ico    アイコン(256 / 64 / 48 / 32 / 24 / 16)
+assets/app.png    アイコンの元画像(512 × 512)
+LICENSE           MIT ライセンス
 .github/workflows/release.yml   タグの push で Windows 向けにビルドし、Release を作る
 src/
-  main.rs         入口。起動時の指定(--bench / --add-sample)の振り分け
+  main.rs         入口。起動時の指定(--bench)の振り分け
   core.rs         語のデータ、DB の読み書き、検索、並べ替え、リンクの解析      ← 画面に依存しない
   config.rs       設定ファイル(INI)の解析と書き出し、ホットキーの解析          ← 画面に依存しない
   safe.rs         書き込みの安全手順(バックアップ・検査・ロールバック)          ← 画面に依存しない
@@ -70,8 +63,8 @@ src/
   dialogs.rs      モーダル画面(登録/編集、設定、辞書の選択)、取り込み・書き出し ← Windows のみ
   gui.rs          メイン画面、メッセージ処理、各操作                            ← Windows のみ
 sample/
-  sample.tsv      サンプル(300語)。実行ファイルに埋め込まれる
-  sample2.tsv     サンプル2(長文の20語)。実行ファイルに埋め込まれる
+  sample.tsv      サンプル(300語)。アプリの「取り込む…」で取り込める
+  sample2.tsv     サンプル2(長文の20語)
 docs/             文書
 ```
 
@@ -92,10 +85,10 @@ docs/             文書
 ### 3.1 保存場所
 | 種類 | 場所 |
 |---|---|
-| 設定 | 実行ファイルと同じフォルダの `fastdict.ini`(あれば)。無ければ `%AppData%\fastdict\fastdict.ini` |
+| 設定 | 実行ファイルと同じフォルダの `MyDictionary.ini`(あれば)。無ければ `%AppData%\MyDictionary\MyDictionary.ini` |
 | 辞書 | 設定で指定したパス。既定は、設定ファイルと同じフォルダの `dictionary.db` |
 | しおり | 設定ファイルと同じフォルダの `bookmarks.tsv` |
-| バックアップ | `%LocalAppData%\fastdict\backup\<辞書名>-<パスのハッシュ>\`(`%LocalAppData%` が無ければ `%AppData%\fastdict\backup\`) |
+| バックアップ | `%LocalAppData%\MyDictionary\backup\<辞書名>-<パスのハッシュ>\`(`%LocalAppData%` が無ければ `%AppData%\MyDictionary\backup\`) |
 
 ### 3.2 辞書(SQLite)
 1つの辞書は、1つの SQLite ファイルです。テーブルは `words` の1つだけです。
@@ -287,7 +280,7 @@ CREATE TABLE words (
 ### 7.1 JSON(`json_io.rs`)
 ```json
 {
-  "format": "fastdict",
+  "format": "MyDictionary",
   "version": 1,
   "entries": [
     {
@@ -344,11 +337,8 @@ CREATE TABLE words (
 拡張子が `.json`、または内容(BOM と空白を除く)が `[` か `{` で始まっていれば、JSON として読みます。
 
 ### 7.5 サンプル
-`sample/sample.tsv` と `sample/sample2.tsv` は、`include_str!` で実行ファイルに埋め込まれます。`--add-sample` は、設定ファイルと同じフォルダに `sample.db` と `sample2.db` を作り、設定に追加します(`core::create_sample`)。
-
-- すでにある辞書には、足りない語を追加する(重複の判定は 7.3 と同じ)。
-- 見出し語と意味が同じで、読みが空の語には、読みを補う。
-- 起動中のウィンドウがあれば、`WM_APP_RELOAD` を送って読み直させる。
+`sample/sample.tsv` と `sample/sample2.tsv` は、取り込める TSV の見本です(列名付き)。実行ファイルには含めていません。
+自動テストでは、この2つのファイルが正しく解析でき、取り込めること、文中の `[[語]]` のリンク先が実在することを確かめています。
 
 ---
 
@@ -431,11 +421,10 @@ DPI が変わったとき(`WM_DPICHANGED`)は、フォントとリストの行�
 | `WM_APP_LOADED` | 読み込みスレッドからの結果(`Box<Loaded>`)。世代番号(`gen`)が合わなければ捨てる |
 | `WM_APP_TRAY` | トレイのアイコンの操作 |
 | `WM_APP_SHOW` | 二重起動したときに、既存のウィンドウを表示させる |
-| `WM_APP_RELOAD` | `--add-sample` から、設定の読み直しを依頼する |
 | `WM_APP_LINK` | 本文のリンクがクリックされた(`Box<String>`) |
 
 ### 9.5 起動と終了
-- 二重起動は、名前付きミューテックス(`Local\FastDictSingleInstance`)で検出する。2つ目は、既存のウィンドウに `WM_APP_SHOW` を送って終了する。
+- 二重起動は、名前付きミューテックス(`Local\MyDictionarySingleInstance`)で検出する。2つ目は、既存のウィンドウに `WM_APP_SHOW` を送って終了する。
 - 閉じるボタンと Esc(入力が空のとき)は、`close_to_tray` が真ならウィンドウを隠し、偽なら終了する。
 - トレイのアイコンは、設定にかかわらず常に表示する。
 
@@ -512,6 +501,7 @@ cargo test
 
 GitHub Actions(`.github/workflows/release.yml`)が Windows 上でテストとビルドを行い、タグと Release を作って `MyDictionary.exe` を添付します。
 `tag` を空にして実行すると、Release は作らず、ビルドした exe を Artifacts に残すだけです(Windows でのビルド確認に使えます)。
+同じタグの Release を作り直したいときは、`replace` にチェックを入れて実行します(古い Release とタグを削除してから作成します)。
 
 ### 計測
 ```

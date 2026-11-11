@@ -13,6 +13,11 @@ on:
         description: "作成するタグ名(例: v2.00)。空なら Release は作らず、exe を Artifacts に残すだけ"
         required: false
         default: ""
+      replace:
+        description: "同じタグの Release がすでにあれば、作り直す(古い Release とタグを削除してから作成)"
+        type: boolean
+        required: false
+        default: false
   push:
     tags:
       - "v*"
@@ -45,7 +50,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag || github.ref_name }}
+          REPLACE: ${{ inputs.replace }}
         run: |
+          # 作り直す指定のときは、古い Release とタグを先に削除する
+          if [ "$REPLACE" = "true" ] && gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --cleanup-tag --yes
+            sleep 5
+          fi
           # タグが無ければ、このコミットに作られる
           gh release create "$TAG" target/release/MyDictionary.exe \
             --target "$GITHUB_SHA" \

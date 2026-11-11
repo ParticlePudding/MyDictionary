@@ -641,27 +641,6 @@ pub fn link_kind(link: &str) -> LinkKind {
     }
 }
 
-/// 同梱のサンプルデータ(インポートできる TSV と同じ形式)
-pub const SAMPLE_TSV: &str = include_str!("../sample/sample.tsv");
-/// 長い文章のサンプル(複数段落・箇条書き・語どうしのリンク)
-pub const SAMPLE2_TSV: &str = include_str!("../sample/sample2.tsv");
-
-/// サンプル辞書を作る。すでにある場合は、足りない語を追加し、読みが空の語に読みを補う
-/// (利用者が編集した内容は変えない)。戻り値は (追加した語数, 読みを補った語数)。
-pub fn create_sample(path: &Path, tsv: &str) -> rusqlite::Result<(usize, usize)> {
-    let mut conn = open(path)?;
-    let (rows, _) = crate::import::to_rows(crate::import::parse_table(tsv, '\t'));
-    let tx = conn.transaction()?;
-    migrate(&tx)?;
-    let mut updated = 0;
-    for r in rows.iter().filter(|r| !r.reading.is_empty()) {
-        updated += tx.execute("UPDATE words SET reading = ?1 WHERE word = ?2 AND meaning = ?3 AND reading = ''", params![r.reading, r.word, r.meaning])?;
-    }
-    let (added, _) = crate::import::insert_rows(&tx, &rows)?;
-    tx.commit()?;
-    Ok((added, updated))
-}
-
 /// 表示用: UNIX秒(UTC)を日本時間(UTC+9)の "yyyy/MM/dd HH:mm:ss" にする。
 pub fn format_jst(unix: i64) -> String {
     let t = unix + 9 * 3600;
@@ -684,6 +663,10 @@ pub fn format_jst(unix: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // サンプルデータ(sample/ フォルダ。アプリの「取り込む…」で取り込める TSV)
+    const SAMPLE_TSV: &str = include_str!("../sample/sample.tsv");
+    const SAMPLE2_TSV: &str = include_str!("../sample/sample2.tsv");
 
     fn sample() -> Vec<Entry> {
         vec![
@@ -975,7 +958,7 @@ mod tests {
 
     #[test]
     fn old_schema_without_link_column() {
-        let dir = std::env::temp_dir().join(format!("fastdict-old-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("MyDictionary-old-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("old.db");
         let _ = std::fs::remove_file(&path);
@@ -1020,25 +1003,13 @@ mod tests {
         words.dedup();
         assert_eq!(words.len(), 300); // 見出し語の重複なし
 
-        let dir = std::env::temp_dir().join(format!("fastdict-sample-{}", std::process::id()));
+        // 取り込みの手順で辞書に入れられる。取り込み直しても増えない
+        let dir = std::env::temp_dir().join(format!("MyDictionary-sample-{}", std::process::id()));
         let path = dir.join("sample.db");
-        assert_eq!(create_sample(&path, SAMPLE_TSV).unwrap(), (300, 0));
-        assert_eq!(create_sample(&path, SAMPLE_TSV).unwrap(), (0, 0)); // 2回目は何も変えない
-        // 読みの無い古いサンプル辞書は、読みだけ補う(語は増やさない)。利用者が付けた読みは変えない
-        {
-            let c = open(&path).unwrap();
-            c.execute("UPDATE words SET reading = ''", []).unwrap();
-            c.execute("UPDATE words SET reading = 'じぶんでつけた' WHERE word = '一期一会'", []).unwrap();
-            c.execute("DELETE FROM words WHERE word = 'API'", []).unwrap();
-        }
-        assert_eq!(create_sample(&path, SAMPLE_TSV).unwrap(), (1, 158));
-        {
-            let c = open(&path).unwrap();
-            let get = |w: &str| c.query_row("SELECT reading FROM words WHERE word = ?1", [w], |r| r.get::<_, String>(0)).unwrap();
-            assert_eq!(get("一期一会"), "じぶんでつけた");
-            assert_eq!(get("温故知新"), "おんこちしん");
-        }
         let c = open(&path).unwrap();
+        migrate(&c).unwrap();
+        assert_eq!(crate::import::insert_rows(&c, &rows).unwrap(), (300, 0));
+        assert_eq!(crate::import::insert_rows(&c, &rows).unwrap(), (0, 300));
         assert_eq!(load_all(&c).unwrap().len(), 300);
         drop(c);
         let _ = std::fs::remove_dir_all(dir);
@@ -1086,7 +1057,7 @@ mod tests {
 
     #[test]
     fn db_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("fastdict-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("MyDictionary-test-{}", std::process::id()));
         let path = dir.join("d.db");
         let conn = open(&path).unwrap();
         let a = insert(&conn, "b", "second", "t", "https://example.com/").unwrap();

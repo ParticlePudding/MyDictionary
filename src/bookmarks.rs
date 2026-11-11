@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn save_and_load() {
-        let dir = std::env::temp_dir().join(format!("fastdict-bm-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("MyDictionary-bm-{}", std::process::id()));
         let p = dir.join("bookmarks.tsv");
         let mut b = Bookmarks::default();
         b.toggle("/d/a.db", 7, "語", 1);

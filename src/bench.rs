@@ -44,7 +44,7 @@ fn ms(t: Instant) -> f64 {
 }
 
 pub fn run(n: usize) -> String {
-    let dir = std::env::temp_dir().join(format!("fastdict-bench-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("MyDictionary-bench-{}", std::process::id()));
     let path = dir.join("bench.db");
     let mut out = String::new();
     let mut line = |s: String| {
