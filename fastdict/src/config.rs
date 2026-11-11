@@ -5,7 +5,6 @@
 //! [general]
 //! hotkey = Ctrl+Alt+D
 //! close_to_tray = true
-//! timing_log = false
 //!
 //! [dictionary.main]
 //! name = メイン
@@ -43,7 +42,6 @@ pub struct Config {
     /// None ならホットキー無効
     pub hotkey: Option<Hotkey>,
     pub close_to_tray: bool,
-    pub timing_log: bool,
     pub dicts: Vec<DictConf>,
 }
 
@@ -52,7 +50,6 @@ impl Config {
         Config {
             hotkey: parse_hotkey("Ctrl+Alt+D"),
             close_to_tray: true,
-            timing_log: false,
             dicts: vec![DictConf { name: "メイン".into(), path: base.join("dictionary.db"), readonly: false }],
         }
     }
@@ -67,8 +64,6 @@ pub fn default_ini() -> String {
 hotkey = Ctrl+Alt+D\r\n\
 ; 閉じるボタンで終了せずトレイに隠す(false なら閉じると終了)\r\n\
 close_to_tray = true\r\n\
-; 起動時間の計測ログを timing.log に書く(true / false)\r\n\
-timing_log = false\r\n\
 \r\n\
 ; 辞書の定義。[dictionary.任意のID] を必要なだけ書きます。先頭が既定の登録先です。\r\n\
 ; path は相対パスなら、この設定ファイルのあるフォルダ基準。%APPDATA% などの環境変数も使えます。\r\n\
@@ -154,7 +149,6 @@ pub fn to_ini(cfg: &Config, base: &Path) -> String {
     s.push_str("; fastdict 設定ファイル(UTF-8)。設定ダイアログからも変更できます。\r\n\r\n[general]\r\n");
     s.push_str(&format!("hotkey = {}\r\n", cfg.hotkey.as_ref().map_or("none".to_string(), |h| h.text.clone())));
     s.push_str(&format!("close_to_tray = {}\r\n", cfg.close_to_tray));
-    s.push_str(&format!("timing_log = {}\r\n", cfg.timing_log));
     for (i, d) in cfg.dicts.iter().enumerate() {
         let path = match d.path.parent() {
             Some(p) if p == base => d.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
@@ -285,10 +279,7 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
                     Some(b) => cfg.close_to_tray = b,
                     None => warns.push(format!("設定: {}行目 close_to_tray は true / false", n + 1)),
                 },
-                "timing_log" => match parse_bool(v) {
-                    Some(b) => cfg.timing_log = b,
-                    None => warns.push(format!("設定: {}行目 timing_log は true / false", n + 1)),
-                },
+                "timing_log" => {} // 廃止した設定(古い設定ファイルに残っていても無視する)
                 _ => warns.push(format!("設定: {}行目 未知のキー {}", n + 1, k)),
             }
         } else {
@@ -336,7 +327,7 @@ mod tests {
         let (cfg, warns) = parse(&default_ini(), base, &env);
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(cfg.hotkey.as_ref().unwrap().text, "Ctrl+Alt+D");
-        assert!(cfg.close_to_tray && !cfg.timing_log);
+        assert!(cfg.close_to_tray);
         assert_eq!(cfg.dicts.len(), 1);
         assert_eq!(cfg.dicts[0].name, "メイン");
         assert_eq!(cfg.dicts[0].path, base.join("dictionary.db"));
@@ -351,7 +342,6 @@ mod tests {
 [wat]\nx\n";
         let (cfg, warns) = parse(text, Path::new("/base"), &env);
         assert_eq!(cfg.hotkey.unwrap().text, "Ctrl+Shift+F2");
-        assert!(cfg.timing_log);
         assert_eq!(cfg.dicts.len(), 2);
         assert_eq!(cfg.dicts[1].name, "b"); // name 省略時はID
         assert!(cfg.dicts[1].readonly);
@@ -367,7 +357,6 @@ mod tests {
         let cfg = Config {
             hotkey: parse_hotkey("Ctrl+Shift+F5"),
             close_to_tray: false,
-            timing_log: true,
             dicts: vec![
                 DictConf { name: "メイン".into(), path: base.join("dictionary.db"), readonly: false },
                 DictConf { name: "参照 用".into(), path: PathBuf::from("/other/dir/ref.db"), readonly: true },
@@ -376,7 +365,7 @@ mod tests {
         let (back, warns) = parse(&to_ini(&cfg, base), base, &env);
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(back.hotkey, cfg.hotkey);
-        assert!(!back.close_to_tray && back.timing_log);
+        assert!(!back.close_to_tray);
         assert_eq!(back.dicts, cfg.dicts);
         // ホットキー無し
         let none = Config { hotkey: None, ..cfg };

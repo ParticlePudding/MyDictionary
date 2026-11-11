@@ -22,6 +22,9 @@ pub const ACCENT_PRESSED: COLORREF = rgb(0, 80, 160);
 pub const ACCENT_SOFT: COLORREF = rgb(228, 240, 252);
 pub const DANGER: COLORREF = rgb(196, 43, 28);
 pub const DANGER_SOFT: COLORREF = rgb(253, 236, 234);
+/// 検索語の強調表示
+pub const MARK: COLORREF = rgb(214, 32, 32);
+pub const HAIRLINE: COLORREF = rgb(236, 238, 241);
 
 /// プログラムから入力欄を操作している間、通知(EN_CHANGE など)を無視するためのカウンタ
 pub static BUSY: AtomicU32 = AtomicU32::new(0);
@@ -243,6 +246,9 @@ pub unsafe fn place_field(edit: HWND, (x, y, w, h): (i32, i32, i32, i32), dpi: i
 pub unsafe fn paint_fields(hdc: HDC, fields: &[(RECT, HWND)], dpi: i32) {
     let focus = GetFocus();
     for (rc, h) in fields {
+        if !IsWindowVisible(*h).as_bool() {
+            continue; // 非表示の欄(詳細検索オフ時など)の枠は描かない
+        }
         let color = if *h == focus { ACCENT } else { BORDER };
         round_box(hdc, rc, WHITE, color, scale(8, dpi));
     }
@@ -253,4 +259,70 @@ pub unsafe fn invalidate_field(parent: HWND, fields: &[(RECT, HWND)], ctl: HWND)
     if let Some((rc, _)) = fields.iter().find(|f| f.1 == ctl) {
         let _ = InvalidateRect(parent, Some(rc), false);
     }
+}
+
+/// 1行のテキストを、`ranges`(UTF-16 単位)の部分だけ `mark` 色にして描く。
+/// 幅に収まらないときは末尾を「…」にする。
+pub unsafe fn draw_marked(hdc: HDC, text: &str, ranges: &[(usize, usize)], rc: &RECT, color: COLORREF, mark: COLORREF) {
+    let width = rc.right - rc.left;
+    if width <= 0 || text.is_empty() {
+        return;
+    }
+    let mut w16: Vec<u16> = text.encode_utf16().collect();
+    let mut dx = vec![0i32; w16.len()];
+    let mut fit = 0i32;
+    let mut size = SIZE::default();
+    let _ = GetTextExtentExPointW(hdc, PCWSTR(w16.as_ptr()), w16.len() as i32, width, Some(&mut fit), Some(dx.as_mut_ptr()), &mut size);
+    let mut ellipsis = false;
+    if (fit as usize) < w16.len() {
+        // 「…」の分を空けて、収まる文字数を求め直す
+        let dots: Vec<u16> = "…".encode_utf16().collect();
+        let mut ds = SIZE::default();
+        let _ = GetTextExtentPoint32W(hdc, &dots, &mut ds);
+        let mut n = fit as usize;
+        while n > 0 && dx[n - 1] > width - ds.cx {
+            n -= 1;
+        }
+        // サロゲートペアの途中で切らない
+        if n > 0 && (0xD800..0xDC00).contains(&w16[n - 1]) {
+            n -= 1;
+        }
+        w16.truncate(n);
+        ellipsis = true;
+    }
+    let n = w16.len();
+    SetBkMode(hdc, TRANSPARENT);
+    let x_at = |i: usize| rc.left + if i == 0 { 0 } else { dx[i - 1] };
+    let mut pos = 0usize;
+    let mut segs: Vec<(usize, usize, bool)> = Vec::new();
+    for &(a, b) in ranges {
+        let (a, b) = (a.min(n), b.min(n));
+        if a > pos {
+            segs.push((pos, a, false));
+        }
+        if b > a {
+            segs.push((a, b, true));
+        }
+        pos = pos.max(b);
+    }
+    if pos < n {
+        segs.push((pos, n, false));
+    }
+    for (a, b, marked) in segs {
+        SetTextColor(hdc, if marked { mark } else { color });
+        let _ = ExtTextOutW(hdc, x_at(a), rc.top, ETO_CLIPPED, Some(rc), PCWSTR(w16[a..b].as_ptr()), (b - a) as u32, None);
+    }
+    if ellipsis {
+        let dots: Vec<u16> = "…".encode_utf16().collect();
+        SetTextColor(hdc, color);
+        let _ = ExtTextOutW(hdc, x_at(n), rc.top, ETO_CLIPPED, Some(rc), PCWSTR(dots.as_ptr()), dots.len() as u32, None);
+    }
+}
+
+/// テキストの描画幅(現在選択中のフォント)
+pub unsafe fn text_width(hdc: HDC, text: &str) -> i32 {
+    let w: Vec<u16> = text.encode_utf16().collect();
+    let mut s = SIZE::default();
+    let _ = GetTextExtentPoint32W(hdc, &w, &mut s);
+    s.cx
 }

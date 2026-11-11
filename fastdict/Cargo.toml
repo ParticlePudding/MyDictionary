@@ -5,7 +5,7 @@ edition = "2021"
 description = "Fast personal dictionary (Win32, windows-rs, SQLite)"
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"
@@ -14,11 +14,10 @@ features = [
   "Win32_Graphics_Gdi",
   "Win32_System_LibraryLoader",
   "Win32_Security",
-  "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_UI_Controls",
   "Win32_UI_Controls_Dialogs",
-  "Win32_System_Registry",
+  "Win32_UI_Controls_RichEdit",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Shell",

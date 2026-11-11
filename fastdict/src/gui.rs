@@ -1,26 +1,26 @@
-//! Win32 GUI (windows-rs)。標準コントロール + オーナードローのフラットなボタン。
-//! - 上段に検索(全体 / 詳細 / 辞書の選択)、左に一覧、右に詳細カード
-//! - 登録・編集・設定はモーダルダイアログ
-//! - ウィンドウを先に表示し、DBの読み込みは別スレッドで行う
-//! - トレイ常駐 + グローバルホットキー(設定ダイアログ / 設定ファイルで変更可)
+//! Win32 GUI (windows-rs)。電子辞書風の2ペイン: 左に候補リスト、右に本文。
+//! - 起動直後から検索欄に入力でき、↑↓で候補を移動できる
+//! - 候補リストは仮想リスト + カスタム描画(見出し語と意味の抜粋、検索語を赤で強調)
+//! - 本文は RichEdit(見出し語を大きく、検索語を赤で強調、選択してコピー可)
+//! - 登録・編集・設定はモーダルダイアログ。書き込みは safe モジュール経由(バックアップ + 検査 + ロールバック)
+//! - DBの読み込みは別スレッド。他の人の変更はウィンドウを前面に出したときに検知して読み直す
 
 use crate::config::{self, Config};
 use crate::core::{self, Entry, Query};
 use crate::dialogs::{self, EntryDlg, SettingsDlg};
+use crate::safe::{self, WriteError};
 use crate::ui::{self, quiet, scale, Btn, Fonts};
 use crate::ui::{get_text, send, set_text, wide};
 use std::collections::HashSet;
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::SystemTime;
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
-use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, GetProcessTimes};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::Controls::RichEdit::*;
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -30,8 +30,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 const CLASS_NAME: PCWSTR = w!("FastDictMainWindow");
 const ID_EDIT: usize = 100; // 全体検索
 const ID_LIST: usize = 101;
-const ID_MEANING: usize = 102;
+const ID_RICH: usize = 102;
 const ID_STATUS: usize = 103;
+const ID_HINT: usize = 104;
 const ID_COMBO: usize = 110;
 const ID_ADV: usize = 111; // 詳細検索の切替
 const ID_QW: usize = 112; // カスタム検索: 見出し語
@@ -41,8 +42,6 @@ const ID_EDITBTN: usize = 115;
 const ID_NEW: usize = 116;
 const ID_SETTINGS: usize = 117;
 const ID_DEL: usize = 118;
-const ID_DTITLE: usize = 119;
-const ID_DMETA: usize = 120;
 const HOTKEY_ID: i32 = 1;
 const WM_APP_LOADED: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
@@ -65,49 +64,32 @@ const CB_SETCURSEL: u32 = 0x014E;
 const LVM_SETCOLUMNWIDTH_: u32 = 0x101E;
 const LVM_ENSUREVISIBLE_: u32 = 0x1013;
 const LVM_SETIMAGELIST_: u32 = 0x1003;
-
-// ---- 計測ログ -------------------------------------------------------------
-
-static START: OnceLock<Instant> = OnceLock::new();
-static TIMING: AtomicBool = AtomicBool::new(false);
-static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
-
-fn tlog(msg: &str) {
-    if !TIMING.load(Ordering::Relaxed) {
-        return;
-    }
-    let Some(p) = LOG_PATH.get() else { return };
-    let ms = START.get().map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0);
-    let age = unsafe { process_age_ms() }.map(|a| format!(" / プロセス開始から {a:6.0}ms")).unwrap_or_default();
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-        let _ = writeln!(f, "[main+{ms:7.1}ms{age}] {msg}");
-    }
-}
-
-unsafe fn process_age_ms() -> Option<f64> {
-    let (mut c, mut e, mut k, mut u) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
-    GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u).ok()?;
-    let now = GetSystemTimeAsFileTime();
-    let to = |f: FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64;
-    Some(to(now).saturating_sub(to(c)) as f64 / 10_000.0)
-}
+const LVM_GETITEMRECT_: u32 = 0x100E;
+const LVM_GETITEMSTATE_: u32 = 0x102C;
 
 // ---- 状態 -----------------------------------------------------------------
+
+type Stamp = Option<(SystemTime, u64)>;
 
 struct Dict {
     name: String,
     path: PathBuf,
     readonly: bool,
     error: Option<String>,
+    /// 読み込み時点のファイルの (更新時刻, サイズ)。他の人の変更検知に使う
+    stamp: Stamp,
+}
+
+struct LoadedDict {
+    error: Option<String>,
+    corrupt: bool,
+    stamp: Stamp,
 }
 
 struct Loaded {
     gen: u32,
     entries: Vec<Entry>,
-    errors: Vec<Option<String>>,
-    read_ms: f64,
-    sort_ms: f64,
+    dicts: Vec<LoadedDict>,
 }
 
 struct InitData {
@@ -126,24 +108,24 @@ struct State {
     qt: HWND,
     btn_new: HWND,
     btn_set: HWND,
-    // 一覧
+    // 左: 候補リスト
     list: HWND,
     imglist: HIMAGELIST,
-    // 詳細カード
-    d_title: HWND,
-    d_meta: HWND,
-    d_meaning: HWND,
+    // 右: 本文
+    rich: HWND,
+    rich_ok: bool,
     btn_edit: HWND,
     btn_del: HWND,
     status: HWND,
+    hint: HWND,
 
     fonts: Fonts,
     dpi: i32,
     fields: Vec<(RECT, HWND)>,
-    panel: RECT,
+    list_box: RECT,
+    pane: RECT,
     status_top: i32,
     white: HBRUSH,
-    panel_brush: HBRUSH,
 
     cfg: Config,
     cfg_path: PathBuf,
@@ -152,16 +134,31 @@ struct State {
     entries: Vec<Entry>,
     matches: Vec<u32>,
     last_query: Option<Query>,
+    /// 強調表示する語(見出し語用, 意味用, タグ用)
+    marks: (Vec<String>, Vec<String>, Vec<String>),
     loaded: bool,
+    loading: bool,
     gen: u32,
     advanced: bool,
     notice: Option<String>,
     cell: Vec<u16>,
+    /// 読み込み完了後に選択し直すレコード (辞書, id)
+    pending_select: Option<(usize, i64)>,
+    /// 破損時の復元を一度たずねた辞書(同じ質問を繰り返さない)
+    asked_restore: HashSet<PathBuf>,
 }
 
 fn app_dir() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     base.join("fastdict")
+}
+
+/// バックアップ置き場(必ずローカル。ローミングされない LocalAppData を使う)
+fn backup_root() -> PathBuf {
+    match std::env::var_os("LOCALAPPDATA") {
+        Some(p) => PathBuf::from(p).join("fastdict").join("backup"),
+        None => app_dir().join("backup"),
+    }
 }
 
 /// 設定ファイルの場所: exe と同じフォルダにあればそれ(ポータブル)、なければ %AppData%\fastdict
@@ -210,9 +207,7 @@ unsafe fn state<'a>(hwnd: HWND) -> Option<&'a mut State> {
 
 pub fn run() {
     unsafe {
-        let _ = START.set(Instant::now());
-        let args: Vec<String> = std::env::args().collect();
-        let background = args.iter().any(|a| a == "--background");
+        let background = std::env::args().any(|a| a == "--background");
 
         // 二重起動: 既存ウィンドウを呼び出して終了
         let _mutex = CreateMutexW(None, true, w!("Local\\FastDictSingleInstance"));
@@ -224,14 +219,6 @@ pub fn run() {
         }
 
         let init = load_config();
-        if init.cfg.timing_log || args.iter().any(|a| a == "--timing") {
-            let p = init.cfg_path.with_file_name("timing.log");
-            let _ = std::fs::write(&p, "");
-            let _ = LOG_PATH.set(p);
-            TIMING.store(true, Ordering::Relaxed);
-        }
-        tlog("設定読み込み完了");
-
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_LISTVIEW_CLASSES | ICC_HOTKEY_CLASS,
@@ -268,12 +255,10 @@ pub fn run() {
             Some(init_ptr as *const c_void),
         )
         .unwrap();
-        tlog("ウィンドウ作成完了");
 
-        // ウィンドウを先に出す。読み込みは裏で。
+        // ウィンドウを先に出す(すぐ入力できる)。読み込みは裏で。
         if !background {
             show_window(hwnd);
-            tlog("ウィンドウ表示");
         }
         add_tray_icon(hwnd);
         if let Some(st) = state(hwnd) {
@@ -281,7 +266,7 @@ pub fn run() {
                 st.warns.push(w);
             }
             set_tray_tip(hwnd, st);
-            start_load(hwnd, st);
+            start_load(hwnd, st, false);
         }
 
         let mut msg = MSG::default();
@@ -302,12 +287,19 @@ pub fn run() {
                     let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(c | BN_CLICKED_ << 16), LPARAM(0));
                     continue;
                 }
-                if ctrl && vk == 'F' as u16 {
-                    if let Some(st) = state(hwnd) {
+                if let Some(st) = state(hwnd) {
+                    if ctrl && vk == 'F' as u16 {
                         let _ = SetFocus(st.edit);
                         send(st.edit, EM_SETSEL, 0, -1);
+                        continue;
                     }
-                    continue;
+                    // 検索欄にいるまま ↑↓ / PageUp / PageDown で候補を移動(電子辞書と同じ操作感)
+                    let f = GetFocus();
+                    let in_search = f == st.edit || f == st.qw || f == st.qm || f == st.qt;
+                    if in_search && [VK_UP.0, VK_DOWN.0, VK_PRIOR.0, VK_NEXT.0].contains(&vk) {
+                        SendMessageW(st.list, WM_KEYDOWN, msg.wParam, msg.lParam);
+                        continue;
+                    }
                 }
             }
             if !IsDialogMessageW(hwnd, &msg).as_bool() {
@@ -391,32 +383,35 @@ unsafe fn remove_tray_icon(hwnd: HWND) {
 
 // ---- 読み込み -------------------------------------------------------------
 
-/// 設定の辞書一覧から状態を作り直し、別スレッドで全辞書を読み込む
-unsafe fn start_load(hwnd: HWND, st: &mut State) {
+/// 別スレッドで全辞書を読み込む。
+/// `keep` が true なら、読み込みが終わるまで今の内容を表示したままにする(他の人の変更の取り込み用)。
+unsafe fn start_load(hwnd: HWND, st: &mut State, keep: bool) {
     st.gen += 1;
-    st.loaded = false;
-    st.entries.clear();
-    st.matches.clear();
-    st.last_query = None;
-    st.dicts = st
-        .cfg
-        .dicts
-        .iter()
-        .map(|d| Dict { name: d.name.clone(), path: d.path.clone(), readonly: d.readonly, error: None })
-        .collect();
-    fill_combo(st);
-    layout(hwnd, st); // 辞書が複数のときだけ「辞書」列を出す
-    send(st.list, LVM_SETITEMCOUNT, 0, 0);
-    update_detail(st);
-    update_status(st);
+    st.loading = true;
+    if !keep {
+        st.loaded = false;
+        st.entries.clear();
+        st.matches.clear();
+        st.last_query = None;
+        st.dicts = st
+            .cfg
+            .dicts
+            .iter()
+            .map(|d| Dict { name: d.name.clone(), path: d.path.clone(), readonly: d.readonly, error: None, stamp: None })
+            .collect();
+        fill_combo(st);
+        send(st.list, LVM_SETITEMCOUNT, 0, 0);
+        update_detail(st);
+        update_status(st);
+    }
 
     let specs: Vec<(PathBuf, bool)> = st.dicts.iter().map(|d| (d.path.clone(), d.readonly)).collect();
     let (h, gen) = (hwnd.0 as usize, st.gen);
     std::thread::spawn(move || {
-        let t = Instant::now();
         let mut entries: Vec<Entry> = Vec::new();
-        let mut errors = Vec::new();
+        let mut dicts = Vec::new();
         for (i, (path, ro)) in specs.iter().enumerate() {
+            let stamp = safe::file_stamp(path); // 読む前に取る(読んでいる間の変更を見逃さない)
             let r = if *ro { core::open_ro(path) } else { core::open(path) }.and_then(|c| core::load_all(&c));
             match r {
                 Ok(mut v) => {
@@ -424,21 +419,39 @@ unsafe fn start_load(hwnd: HWND, st: &mut State) {
                         e.dict = i;
                     }
                     entries.append(&mut v);
-                    errors.push(None);
+                    // 新規作成された場合は作成後の状態を記録する
+                    let stamp = stamp.or_else(|| safe::file_stamp(path));
+                    dicts.push(LoadedDict { error: None, corrupt: false, stamp });
                 }
-                Err(e) => errors.push(Some(e.to_string())),
+                Err(e) => dicts.push(LoadedDict { corrupt: safe::is_corrupt(&e), error: Some(e.to_string()), stamp }),
             }
         }
-        let read_ms = t.elapsed().as_secs_f64() * 1000.0;
-        let t = Instant::now();
         core::sort_entries(&mut entries);
-        let sort_ms = t.elapsed().as_secs_f64() * 1000.0;
-        let boxed = Box::into_raw(Box::new(Loaded { gen, entries, errors, read_ms, sort_ms }));
+        let boxed = Box::into_raw(Box::new(Loaded { gen, entries, dicts }));
         let hwnd = HWND(h as *mut c_void);
         if PostMessageW(hwnd, WM_APP_LOADED, WPARAM(0), LPARAM(boxed as isize)).is_err() {
             drop(Box::from_raw(boxed));
         }
     });
+}
+
+/// 他の人(または別のPC)がファイルを変更していたら読み直す
+unsafe fn reload_if_changed(hwnd: HWND, st: &mut State) {
+    if !st.loaded || st.loading {
+        return;
+    }
+    if st.dicts.iter().any(|d| safe::file_stamp(&d.path) != d.stamp) {
+        remember_selection(st);
+        start_load(hwnd, st, true);
+    }
+}
+
+unsafe fn remember_selection(st: &mut State) {
+    let sel = selected_entries(st);
+    if sel.len() == 1 && st.pending_select.is_none() {
+        let e = &st.entries[sel[0]];
+        st.pending_select = Some((e.dict, e.id));
+    }
 }
 
 unsafe fn fill_combo(st: &State) {
@@ -459,7 +472,7 @@ unsafe fn fill_combo(st: &State) {
 
 // ---- コントロール作成・レイアウト --------------------------------------------
 
-unsafe fn create_child(parent: HWND, class: PCWSTR, ex: u32, style: u32, id: usize) -> HWND {
+unsafe fn create_child(parent: HWND, class: PCWSTR, ex: u32, style: u32, id: usize) -> Option<HWND> {
     let hinst = GetModuleHandleW(None).unwrap();
     CreateWindowExW(
         WINDOW_EX_STYLE(ex),
@@ -475,18 +488,18 @@ unsafe fn create_child(parent: HWND, class: PCWSTR, ex: u32, style: u32, id: usi
         hinst,
         None,
     )
-    .unwrap()
+    .ok()
 }
 
 unsafe fn owner_button(parent: HWND, id: usize, text: &str) -> HWND {
-    let b = create_child(parent, w!("BUTTON"), 0, WS_TABSTOP.0 | 0x0B /* BS_OWNERDRAW */, id);
+    let b = create_child(parent, w!("BUTTON"), 0, WS_TABSTOP.0 | 0x0B /* BS_OWNERDRAW */, id).unwrap();
     set_text(b, text);
     b
 }
 
 unsafe fn make_imglist(list: HWND, dpi: i32) -> HIMAGELIST {
-    // 行の高さを広げるために、高さだけ指定した空のイメージリストを割り当てる
-    let il = ImageList_Create(1, scale(34, dpi), IMAGELIST_CREATION_FLAGS(0x20 /* ILC_COLOR32 */), 1, 1);
+    // 行の高さ(2行表示)を確保するため、高さだけ指定した空のイメージリストを割り当てる
+    let il = ImageList_Create(1, scale(58, dpi), IMAGELIST_CREATION_FLAGS(0x20 /* ILC_COLOR32 */), 1, 1);
     send(list, LVM_SETIMAGELIST_, 1 /* LVSIL_SMALL */, il.0 as isize);
     il
 }
@@ -499,8 +512,8 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
     let edit = ui::field(hwnd, ID_EDIT, (0, 0, 10, 10), dpi, false, &mut fields, fonts.search);
     let cue = wide("検索 — 見出し語・意味・タグ(スペース区切りで AND)");
     send(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
-    let combo = create_child(hwnd, w!("COMBOBOX"), 0, WS_TABSTOP.0 | WS_VSCROLL.0 | 3 /* CBS_DROPDOWNLIST */, ID_COMBO);
-    let adv = owner_button(hwnd, ID_ADV, "詳細");
+    let combo = create_child(hwnd, w!("COMBOBOX"), 0, WS_TABSTOP.0 | WS_VSCROLL.0 | 3 /* CBS_DROPDOWNLIST */, ID_COMBO).unwrap();
+    let adv = owner_button(hwnd, ID_ADV, "絞り込み");
     let btn_new = owner_button(hwnd, ID_NEW, "＋ 新規登録");
     let btn_set = owner_button(hwnd, ID_SETTINGS, "設定");
     let mut adv_edit = |id: usize, cue: &str| {
@@ -510,38 +523,40 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         let _ = ShowWindow(h, SW_HIDE);
         h
     };
-    let qw = adv_edit(ID_QW, "見出し語");
-    let qm = adv_edit(ID_QM, "意味");
-    let qt = adv_edit(ID_QT, "タグ(複数はスペース区切りで AND)");
+    let qw = adv_edit(ID_QW, "見出し語で絞り込み");
+    let qm = adv_edit(ID_QM, "意味で絞り込み");
+    let qt = adv_edit(ID_QT, "タグで絞り込み(複数はスペース区切りで AND)");
 
+    // 候補リスト: 1列・見出し無し・行は自前で描画
     let list = create_child(
         hwnd,
         w!("SysListView32"),
         0,
-        WS_TABSTOP.0 | LVS_REPORT as u32 | LVS_OWNERDATA as u32 | LVS_SHOWSELALWAYS as u32,
+        WS_TABSTOP.0 | LVS_REPORT as u32 | LVS_OWNERDATA as u32 | LVS_SHOWSELALWAYS as u32 | LVS_NOCOLUMNHEADER as u32,
         ID_LIST,
-    );
-    send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP) as isize);
-    let _ = SetWindowTheme(list, w!("Explorer"), PCWSTR::null());
-    for (i, title) in ["見出し語", "意味", "タグ", "辞書"].iter().enumerate() {
-        let mut t = wide(title);
-        let col = LVCOLUMNW {
-            mask: LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
-            cx: 100,
-            pszText: PWSTR(t.as_mut_ptr()),
-            iSubItem: i as i32,
-            ..Default::default()
-        };
-        send(list, LVM_INSERTCOLUMNW, i, &col as *const _ as isize);
-    }
+    )
+    .unwrap();
+    send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize);
+    let mut t = wide("見出し語");
+    let col = LVCOLUMNW { mask: LVCF_TEXT | LVCF_WIDTH, cx: 100, pszText: PWSTR(t.as_mut_ptr()), ..Default::default() };
+    send(list, LVM_INSERTCOLUMNW, 0, &col as *const _ as isize);
     let imglist = make_imglist(list, dpi);
 
-    let d_title = create_child(hwnd, w!("STATIC"), 0, 0x4000 /* SS_ENDELLIPSIS */ | 0x80 /* SS_NOPREFIX */, ID_DTITLE);
-    let d_meta = create_child(hwnd, w!("STATIC"), 0, 0x80, ID_DMETA);
-    let d_meaning = create_child(hwnd, w!("EDIT"), 0, WS_VSCROLL.0 | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32, ID_MEANING);
+    // 本文: RichEdit(書式付き)。使えない環境では通常の複数行エディットで代用
+    let _ = LoadLibraryW(w!("Msftedit.dll"));
+    let rich_style = WS_VSCROLL.0 | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32;
+    let (rich, rich_ok) = match create_child(hwnd, w!("RICHEDIT50W"), 0, rich_style, ID_RICH) {
+        Some(h) => {
+            send(h, EM_SETBKGNDCOLOR, 0, ui::WHITE.0 as isize);
+            (h, true)
+        }
+        None => (create_child(hwnd, w!("EDIT"), 0, rich_style, ID_RICH).unwrap(), false),
+    };
     let btn_edit = owner_button(hwnd, ID_EDITBTN, "編集");
     let btn_del = owner_button(hwnd, ID_DEL, "削除");
-    let status = create_child(hwnd, w!("STATIC"), 0, 0x0000000C | 0x80 /* SS_LEFTNOWORDWRAP | SS_NOPREFIX */, ID_STATUS);
+    let status = create_child(hwnd, w!("STATIC"), 0, 0x0000000C | 0x80 /* SS_LEFTNOWORDWRAP | SS_NOPREFIX */, ID_STATUS).unwrap();
+    let hint = create_child(hwnd, w!("STATIC"), 0, 0x2 | 0x80 /* SS_RIGHT | SS_NOPREFIX */, ID_HINT).unwrap();
+    set_text(hint, "↑↓ 候補を移動    Ctrl+N 新規    F2 編集    Del 削除    Esc 消去/閉じる");
 
     let st = State {
         edit,
@@ -554,19 +569,19 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         btn_set,
         list,
         imglist,
-        d_title,
-        d_meta,
-        d_meaning,
+        rich,
+        rich_ok,
         btn_edit,
         btn_del,
         status,
+        hint,
         fonts,
         dpi,
         fields,
-        panel: RECT::default(),
+        list_box: RECT::default(),
+        pane: RECT::default(),
         status_top: 0,
         white: CreateSolidBrush(ui::WHITE),
-        panel_brush: CreateSolidBrush(ui::PANEL),
         warns: init.warns,
         cfg: init.cfg,
         cfg_path: init.cfg_path,
@@ -574,11 +589,15 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         entries: Vec::new(),
         matches: Vec::new(),
         last_query: None,
+        marks: (Vec::new(), Vec::new(), Vec::new()),
         loaded: false,
+        loading: false,
         gen: 0,
         advanced: false,
         notice: None,
         cell: Vec::new(),
+        pending_select: None,
+        asked_restore: HashSet::new(),
     };
     apply_fonts(&st);
     let _ = SetFocus(edit);
@@ -594,10 +613,9 @@ unsafe fn apply_fonts(st: &State) {
         (st.qm, f.base),
         (st.qt, f.base),
         (st.list, f.base),
-        (st.d_title, f.title),
-        (st.d_meta, f.small),
-        (st.d_meaning, f.body),
+        (st.rich, f.body),
         (st.status, f.small),
+        (st.hint, f.small),
     ] {
         send(h, WM_SETFONT, font.0 as usize, 1);
     }
@@ -608,16 +626,16 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
     let _ = GetClientRect(hwnd, &mut rc);
     let dpi = st.dpi;
     let s = |v: i32| scale(v, dpi);
-    let (m, gap, box_h) = (s(16), s(8), s(40));
+    let (m, gap, box_h) = (s(16), s(8), s(42));
     let w = rc.right - 2 * m;
 
-    // --- 上段: 検索欄 | 辞書 | 詳細 | ＋新規登録 | 設定 ---
-    let (combo_w, adv_w, new_w, set_w) = (s(190), s(70), s(128), s(64));
+    // --- 上段: 検索欄 | 辞書 | 絞り込み | ＋新規登録 | 設定 ---
+    let (combo_w, adv_w, new_w, set_w) = (s(180), s(92), s(128), s(64));
     let search_w = (w - combo_w - adv_w - new_w - set_w - 4 * gap).max(s(120));
     let y = s(14);
     ui::place_field(st.edit, (m, y, search_w, box_h), dpi, false, &mut st.fields);
     let mut x = m + search_w + gap;
-    let _ = MoveWindow(st.combo, x, y + (box_h - s(32)) / 2, combo_w, s(300), true);
+    let _ = MoveWindow(st.combo, x, y + (box_h - s(30)) / 2, combo_w, s(300), true);
     x += combo_w + gap;
     let _ = MoveWindow(st.adv, x, y, adv_w, box_h, true);
     x += adv_w + gap;
@@ -626,7 +644,7 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
     let _ = MoveWindow(st.btn_set, x, y, set_w, box_h, true);
     let mut top = y + box_h + s(12);
 
-    // --- 詳細検索(列ごと) ---
+    // --- 絞り込み(列ごと) ---
     let adv_cmd = if st.advanced { SW_SHOW } else { SW_HIDE };
     for h in [st.qw, st.qm, st.qt] {
         let _ = ShowWindow(h, adv_cmd);
@@ -640,42 +658,34 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
         top += fh + s(12);
     }
 
-    // --- 下端のステータスバー ---
+    // --- 下端: ステータス(左)とキー操作の案内(右) ---
     let status_h = s(30);
     st.status_top = rc.bottom - status_h;
-    let _ = MoveWindow(st.status, m, st.status_top + s(5), w, s(20), true);
+    let hint_w = (w * 55 / 100).min(s(520));
+    let _ = MoveWindow(st.status, m, st.status_top + s(6), w - hint_w - gap, s(20), true);
+    let _ = MoveWindow(st.hint, m + w - hint_w, st.status_top + s(6), hint_w, s(20), true);
     let bottom = st.status_top - s(12);
+    let h = (bottom - top).max(s(80));
 
-    // --- 左: 一覧 / 右: 詳細カード ---
-    let list_w = (w * 56 / 100).max(s(320));
-    let list_h = (bottom - top).max(s(80));
-    let _ = MoveWindow(st.list, m, top, list_w, list_h, true);
-    // 列幅(辞書が複数のときだけ「辞書」列を出す)
-    let inner = list_w - s(22);
-    let multi = st.dicts.len() > 1;
-    let widths: [i32; 4] = if multi {
-        [inner * 28 / 100, inner * 40 / 100, inner * 18 / 100, inner * 14 / 100]
-    } else {
-        [inner * 30 / 100, inner * 50 / 100, inner * 20 / 100, 0]
-    };
-    for (i, wd) in widths.iter().enumerate() {
-        send(st.list, LVM_SETCOLUMNWIDTH_, i, *wd as isize);
-    }
+    // --- 左: 候補リスト(枠の内側に置く) ---
+    let list_w = (w * 36 / 100).clamp(s(280), s(440));
+    st.list_box = RECT { left: m, top, right: m + list_w, bottom: top + h };
+    let inset = s(2);
+    let _ = MoveWindow(st.list, m + inset, top + inset, list_w - 2 * inset, h - 2 * inset, true);
+    send(st.list, LVM_SETCOLUMNWIDTH_, 0, -2); // LVSCW_AUTOSIZE_USEHEADER: 幅いっぱい
 
+    // --- 右: 本文 ---
     let px = m + list_w + s(12);
-    st.panel = RECT { left: px, top, right: rc.right - m, bottom: top + list_h };
-    let pad = s(22);
-    let (ix, iw) = (px + pad, (st.panel.right - st.panel.left) - 2 * pad);
-    let btn_h = s(36);
-    let _ = MoveWindow(st.d_title, ix, top + s(18), iw, s(34), true);
-    let _ = MoveWindow(st.d_meta, ix, top + s(58), iw, s(40), true);
-    let meaning_top = top + s(108);
-    let btn_y = top + list_h - pad - btn_h;
-    let _ = MoveWindow(st.d_meaning, ix, meaning_top, iw, (btn_y - s(12) - meaning_top).max(s(30)), true);
-    let (bw, bgap) = (s(112), s(10));
+    st.pane = RECT { left: px, top, right: rc.right - m, bottom: top + h };
+    let pad = s(26);
+    let (ix, iw) = (px + pad, (st.pane.right - st.pane.left) - 2 * pad);
+    let (btn_h, bw, bgap) = (s(34), s(104), s(10));
+    let btn_y = top + h - s(16) - btn_h;
+    let _ = MoveWindow(st.rich, ix, top + s(20), iw + pad - s(6), (btn_y - s(12) - (top + s(20))).max(s(30)), true);
     let _ = MoveWindow(st.btn_del, ix + iw - bw, btn_y, bw, btn_h, true);
     let _ = MoveWindow(st.btn_edit, ix + iw - 2 * bw - bgap, btn_y, bw, btn_h, true);
-    let _ = InvalidateRect(hwnd, None, false);
+    // 絞り込み欄の出し入れで残像が出ないよう、背景ごと描き直す
+    let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
 
 unsafe fn paint(hwnd: HWND, st: &State) {
@@ -684,12 +694,58 @@ unsafe fn paint(hwnd: HWND, st: &State) {
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
     ui::fill(hdc, &rc, ui::WHITE);
-    // ステータスバー上の区切り線
     ui::fill(hdc, &RECT { left: 0, top: st.status_top, right: rc.right, bottom: st.status_top + 1 }, ui::BORDER);
-    // 詳細カード
-    ui::round_box(hdc, &st.panel, ui::PANEL, ui::BORDER, scale(12, st.dpi));
+    let r = scale(12, st.dpi);
+    ui::round_box(hdc, &st.list_box, ui::WHITE, ui::BORDER, r);
+    ui::round_box(hdc, &st.pane, ui::WHITE, ui::BORDER, r);
     ui::paint_fields(hdc, &st.fields, st.dpi);
     let _ = EndPaint(hwnd, &ps);
+}
+
+// ---- 候補リストの行描画 -------------------------------------------------------
+
+unsafe fn draw_row(st: &State, hdc: HDC, row: usize) {
+    let mut rc = RECT::default(); // left = LVIR_BOUNDS(0)
+    send(st.list, LVM_GETITEMRECT_, row, &mut rc as *mut _ as isize);
+    let Some(&idx) = st.matches.get(row) else { return };
+    let e = &st.entries[idx as usize];
+    let s = |v: i32| scale(v, st.dpi);
+    let selected = send(st.list, LVM_GETITEMSTATE_, row, LVIS_SELECTED.0 as isize).0 as u32 & LVIS_SELECTED.0 != 0;
+
+    ui::fill(hdc, &rc, if selected { ui::ACCENT_SOFT } else { ui::WHITE });
+    if selected {
+        ui::fill(hdc, &RECT { left: rc.left, top: rc.top + s(6), right: rc.left + s(4), bottom: rc.bottom - s(6) }, ui::ACCENT);
+    }
+    ui::fill(hdc, &RECT { left: rc.left + s(14), top: rc.bottom - 1, right: rc.right, bottom: rc.bottom }, ui::HAIRLINE);
+
+    let (x0, x1) = (rc.left + s(16), rc.right - s(12));
+    let (y1, y2) = (rc.top + s(9), rc.top + s(33));
+    let old = SelectObject(hdc, st.fonts.small);
+
+    // 1行目の右: タグ / 2行目の右: 辞書名(複数辞書のとき)
+    let tags: String = if e.tags.is_empty() { String::new() } else { e.tags.split(' ').map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ") };
+    let tags_w = if tags.is_empty() { 0 } else { ui::text_width(hdc, &tags).min((x1 - x0) * 45 / 100) };
+    if tags_w > 0 {
+        let r = RECT { left: x1 - tags_w, top: y1 + s(3), right: x1, bottom: y2 };
+        ui::draw_marked(hdc, &tags, &core::mark_ranges(&tags, &st.marks.2), &r, ui::MUTED, ui::MARK);
+    }
+    let dict = if st.dicts.len() > 1 { st.dicts.get(e.dict).map_or("", |d| d.name.as_str()) } else { "" };
+    let dict_w = if dict.is_empty() { 0 } else { ui::text_width(hdc, dict).min((x1 - x0) * 40 / 100) };
+    if dict_w > 0 {
+        let r = RECT { left: x1 - dict_w, top: y2, right: x1, bottom: rc.bottom };
+        ui::draw_marked(hdc, dict, &[], &r, ui::MUTED, ui::MARK);
+    }
+
+    // 2行目: 意味の抜粋
+    let snippet: String = e.meaning.chars().take(200).map(|c| if c == '\r' || c == '\n' { ' ' } else { c }).collect();
+    let r2 = RECT { left: x0, top: y2, right: x1 - dict_w - if dict_w > 0 { s(10) } else { 0 }, bottom: rc.bottom };
+    ui::draw_marked(hdc, &snippet, &core::mark_ranges(&snippet, &st.marks.1), &r2, ui::MUTED, ui::MARK);
+
+    // 1行目: 見出し語
+    SelectObject(hdc, st.fonts.heading);
+    let r1 = RECT { left: x0, top: y1, right: x1 - tags_w - if tags_w > 0 { s(10) } else { 0 }, bottom: y2 };
+    ui::draw_marked(hdc, &e.word, &core::mark_ranges(&e.word, &st.marks.0), &r1, ui::TEXT, ui::MARK);
+    SelectObject(hdc, old);
 }
 
 // ---- 表示更新 -------------------------------------------------------------
@@ -744,18 +800,19 @@ unsafe fn select_row(st: &State, row: Option<usize>) {
     });
 }
 
-/// 指定のレコードを選択して見える位置へ
+/// 指定のレコードを選択して見える位置へ(見つからなければ何もしない)
 unsafe fn select_entry(st: &mut State, dict: usize, id: i64) {
     let row = st.matches.iter().position(|&i| {
         let e = &st.entries[i as usize];
         e.dict == dict && e.id == id
     });
-    select_row(st, row);
-    update_detail(st);
+    if row.is_some() {
+        select_row(st, row);
+        update_detail(st);
+    }
 }
 
 unsafe fn refresh(st: &mut State) {
-    let t = Instant::now();
     st.notice = None;
     let q = build_query(st);
     // 文字を足しただけなら、前回のヒットの中だけを調べる
@@ -767,25 +824,17 @@ unsafe fn refresh(st: &mut State) {
     } else {
         core::filter(&st.entries, &q)
     };
+    st.marks = q.mark_terms();
     st.last_query = Some(q);
-    let filter_ms = t.elapsed().as_secs_f64() * 1000.0;
 
     quiet(|| {
         send(st.list, LVM_SETITEMCOUNT, st.matches.len(), 0);
+        send(st.list, LVM_SETCOLUMNWIDTH_, 0, -2); // スクロールバーの有無に合わせて幅を取り直す
     });
     select_row(st, if st.matches.is_empty() { None } else { Some(0) });
     let _ = InvalidateRect(st.list, None, true);
     update_detail(st);
     update_status(st);
-    if TIMING.load(Ordering::Relaxed) {
-        tlog(&format!(
-            "検索 {} 件ヒット: 絞り込み {:.2}ms{} / 反映込み {:.2}ms",
-            st.matches.len(),
-            filter_ms,
-            if narrowed { "(前回結果内)" } else { "" },
-            t.elapsed().as_secs_f64() * 1000.0
-        ));
-    }
 }
 
 unsafe fn update_status(st: &State) {
@@ -796,9 +845,10 @@ unsafe fn update_status(st: &State) {
         .collect();
     let text = if !st.loaded {
         "読み込み中…".to_string()
+    } else if st.matches.len() == st.entries.len() {
+        format!("全 {} 件", st.entries.len())
     } else {
-        let last = core::last_update(&st.entries).map(core::format_jst).unwrap_or_else(|| "-".into());
-        format!("{} 件 / 全 {} 件   ·   最終更新 {}", st.matches.len(), st.entries.len(), last)
+        format!("{} 件 / 全 {} 件", st.matches.len(), st.entries.len())
     };
     let mut parts: Vec<String> = Vec::new();
     if let Some(n) = &st.notice {
@@ -824,38 +874,117 @@ fn writable(d: &Dict) -> Result<(), String> {
     Ok(())
 }
 
-/// 詳細カード: 0件 / 1件(内容) / 複数(件数)
+fn len16(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+unsafe fn rich_format(rich: HWND, range: (usize, usize), pt: Option<i32>, bold: bool, color: COLORREF) {
+    if range.1 <= range.0 {
+        return;
+    }
+    let cr = CHARRANGE { cpMin: range.0 as i32, cpMax: range.1 as i32 };
+    send(rich, EM_EXSETSEL, 0, &cr as *const _ as isize);
+    let mut cf = CHARFORMAT2W::default();
+    cf.Base.cbSize = std::mem::size_of::<CHARFORMAT2W>() as u32;
+    cf.Base.dwMask = CFM_COLOR | CFM_BOLD;
+    cf.Base.dwEffects = if bold { CFE_BOLD } else { CFE_EFFECTS(0) };
+    cf.Base.crTextColor = color;
+    if let Some(pt) = pt {
+        cf.Base.dwMask |= CFM_SIZE | CFM_FACE;
+        cf.Base.yHeight = pt * 20;
+        let mut face = [0u16; 32];
+        for (i, c) in "Yu Gothic UI".encode_utf16().enumerate() {
+            face[i] = c;
+        }
+        cf.Base.szFaceName = face;
+    }
+    send(rich, EM_SETCHARFORMAT, SCF_SELECTION as usize, &cf as *const _ as isize);
+}
+
+/// 本文を描く: 見出し語(大)/ 補足(小・灰)/ 本文。`*_marks` は各部分の中での強調範囲(UTF-16)
+unsafe fn render(st: &State, title: &str, meta: &str, body: &str, title_marks: &[(usize, usize)], meta_marks: &[(usize, usize)], body_marks: &[(usize, usize)]) {
+    let body = body.replace("\r\n", "\n");
+    let mut text = String::from(title);
+    let mut meta_start = 0;
+    if !meta.is_empty() {
+        text.push('\n');
+        meta_start = len16(&text);
+        text.push_str(meta);
+    }
+    let mut body_start = 0;
+    if !body.is_empty() {
+        text.push_str("\n\n");
+        body_start = len16(&text);
+        text.push_str(&body);
+    }
+    if !st.rich_ok {
+        set_text(st.rich, &text.replace('\n', "\r\n"));
+        return;
+    }
+    // RichEdit 内部では改行は1文字として数えるので、上の位置計算('\n' = 1)がそのまま使える
+    send(st.rich, WM_SETREDRAW, 0, 0);
+    set_text(st.rich, &text.replace('\n', "\r\n"));
+    let (t_len, m_len, b_len) = (len16(title), len16(meta), len16(&body));
+    rich_format(st.rich, (0, t_len), Some(20), true, ui::TEXT);
+    if m_len > 0 {
+        rich_format(st.rich, (meta_start, meta_start + m_len), Some(9), false, ui::MUTED);
+        // 見出し語と本文の間の空行は小さく
+        rich_format(st.rich, (meta_start + m_len, meta_start + m_len + 2), Some(6), false, ui::MUTED);
+    }
+    if b_len > 0 {
+        rich_format(st.rich, (body_start, body_start + b_len), Some(12), false, ui::TEXT);
+    }
+    for &(a, b) in title_marks {
+        rich_format(st.rich, (a, b), None, true, ui::MARK);
+    }
+    for &(a, b) in meta_marks {
+        rich_format(st.rich, (meta_start + a, meta_start + b), None, false, ui::MARK);
+    }
+    for &(a, b) in body_marks {
+        rich_format(st.rich, (body_start + a, body_start + b), None, true, ui::MARK);
+    }
+    let cr = CHARRANGE { cpMin: 0, cpMax: 0 };
+    send(st.rich, EM_EXSETSEL, 0, &cr as *const _ as isize);
+    send(st.rich, WM_VSCROLL, 6 /* SB_TOP */, 0);
+    send(st.rich, WM_SETREDRAW, 1, 0);
+    let _ = InvalidateRect(st.rich, None, true);
+}
+
+/// 本文欄: 0件(案内)/ 1件(内容)/ 複数(件数)
 unsafe fn update_detail(st: &State) {
     let sel = selected_entries(st);
-    let (title, meta, meaning): (String, String, String) = match sel.len() {
+    match sel.len() {
         0 => {
-            if !st.loaded {
-                ("読み込み中…".into(), String::new(), String::new())
+            let (t, m) = if !st.loaded {
+                ("読み込み中…", "")
             } else if st.entries.is_empty() {
-                ("まだ単語がありません".into(), "右上の「＋ 新規登録」(Ctrl+N)から最初の単語を追加できます。".into(), String::new())
+                ("まだ単語がありません", "右上の「＋ 新規登録」(Ctrl+N)から最初の単語を追加できます。")
             } else if st.matches.is_empty() {
-                ("見つかりません".into(), "検索語を変えるか、「＋ 新規登録」で追加できます。".into(), String::new())
+                ("見つかりません", "検索語を変えるか、「＋ 新規登録」(Ctrl+N)でこの語を追加できます。")
             } else {
-                (String::new(), String::new(), String::new())
-            }
+                ("", "")
+            };
+            render(st, t, m, "", &[], &[], &[]);
         }
         1 => {
             let e = &st.entries[sel[0]];
+            let tags = if e.tags.is_empty() { String::new() } else { e.tags.split(' ').map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ") };
             let mut parts: Vec<String> = Vec::new();
-            if !e.tags.is_empty() {
-                parts.push(e.tags.split(' ').map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "));
+            if !tags.is_empty() {
+                parts.push(tags.clone());
             }
             if st.dicts.len() > 1 {
                 parts.push(st.dicts.get(e.dict).map_or("?".into(), |d| d.name.clone()));
             }
             parts.push(format!("更新 {}", core::format_jst(e.updated_at)));
-            (e.word.clone(), parts.join("    ·    "), e.meaning.replace("\r\n", "\n").replace('\n', "\r\n"))
+            let meta = parts.join("    ·    ");
+            let body = e.meaning.replace("\r\n", "\n");
+            // タグは meta の先頭にあるので、強調位置はそのまま使える
+            let meta_marks = if tags.is_empty() { Vec::new() } else { core::mark_ranges(&tags, &st.marks.2) };
+            render(st, &e.word, &meta, &body, &core::mark_ranges(&e.word, &st.marks.0), &meta_marks, &core::mark_ranges(&body, &st.marks.1));
         }
-        n => (format!("{n} 件を選択中"), "Delete キーまたは「削除」でまとめて削除できます。".into(), String::new()),
-    };
-    set_text(st.d_title, &title);
-    set_text(st.d_meta, &meta);
-    set_text(st.d_meaning, &meaning);
+        n => render(st, &format!("{n} 件を選択中"), "Delete キーまたは「削除」でまとめて削除できます。", "", &[], &[], &[]),
+    }
     let can_edit = sel.len() == 1 && writable(&st.dicts[st.entries[sel[0]].dict]).is_ok();
     let can_del = !sel.is_empty() && sel.iter().all(|&i| writable(&st.dicts[st.entries[i].dict]).is_ok());
     let _ = EnableWindow(st.btn_edit, can_edit);
@@ -870,6 +999,78 @@ unsafe fn update_detail(st: &State) {
 unsafe fn message_box(hwnd: HWND, text: &str, caption: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
     let (t, c) = (wide(text), wide(caption));
     MessageBoxW(hwnd, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), style)
+}
+
+/// 安全な手順(バックアップ → 書き込み → 検査 → 必要ならロールバック)で書き込む。
+/// 戻り値の bool は「書き込み前に他の人の変更があった(= メモリの内容が古い)」かどうか。
+unsafe fn guarded<T>(st: &State, d: usize, f: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>) -> (Result<T, WriteError>, bool) {
+    let path = &st.dicts[d].path;
+    let stale = safe::file_stamp(path) != st.dicts[d].stamp;
+    let old = SetCursor(LoadCursorW(None, IDC_WAIT).unwrap());
+    let r = safe::write(path, &backup_root(), f);
+    SetCursor(old);
+    (r, stale)
+}
+
+/// 壊れた辞書を、ローカルのバックアップから復元するか利用者にたずねる
+unsafe fn offer_restore(hwnd: HWND, st: &mut State, d: usize) {
+    let path = st.dicts[d].path.clone();
+    let name = st.dicts[d].name.clone();
+    match safe::latest_backup(&path, &backup_root()) {
+        Some((bk, ts)) => {
+            let text = format!(
+                "辞書「{name}」のファイルが壊れています。\n\nこのPCに保存してあるバックアップ({} 時点)から復元しますか?\n\n・復元すると、その時点より後の変更(他の人の分を含む)は失われます。\n・ほかの人が使用中の場合は、いったん閉じてもらってから実行してください。",
+                core::format_jst(ts)
+            );
+            if message_box(hwnd, &text, "辞書の復元", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES {
+                match safe::restore(&path, &bk) {
+                    Ok(()) => {
+                        start_load(hwnd, st, false);
+                        notice(st, &format!("辞書「{name}」をバックアップから復元しました"));
+                    }
+                    Err(e) => {
+                        message_box(hwnd, &format!("復元に失敗しました: {e}"), "エラー", MB_OK | MB_ICONERROR);
+                    }
+                }
+            }
+        }
+        None => {
+            message_box(
+                hwnd,
+                &format!("辞書「{name}」のファイルが壊れています。\nこのPCには復元に使えるバックアップがありません。\n(バックアップは、このPCから書き込んだときに作られます)"),
+                "辞書の破損",
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+}
+
+unsafe fn report_write_error(hwnd: HWND, st: &mut State, d: usize, e: WriteError) {
+    match e {
+        WriteError::CorruptBefore => offer_restore(hwnd, st, d),
+        WriteError::Conflict | WriteError::RolledBack => {
+            message_box(hwnd, &e.to_string(), "保存できませんでした", MB_OK | MB_ICONWARNING);
+            remember_selection(st);
+            start_load(hwnd, st, true);
+        }
+        other => {
+            message_box(hwnd, &other.to_string(), "保存できませんでした", MB_OK | MB_ICONERROR);
+        }
+    }
+}
+
+/// 書き込み成功後: メモリの内容が古ければ読み直し、そうでなければ変更検知用の印だけ更新する
+unsafe fn after_write(hwnd: HWND, st: &mut State, d: usize, stale: bool, select: Option<(usize, i64)>) {
+    if stale {
+        st.pending_select = select;
+        start_load(hwnd, st, true);
+    } else {
+        st.dicts[d].stamp = safe::file_stamp(&st.dicts[d].path);
+        refresh(st);
+        if let Some((dd, id)) = select {
+            select_entry(st, dd, id);
+        }
+    }
 }
 
 unsafe fn do_new(hwnd: HWND, st: &mut State) {
@@ -902,13 +1103,13 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
         return;
     }
     let d = targets[dlg.choice];
-    match core::open(&st.dicts[d].path).and_then(|c| core::insert(&c, &dlg.word, &dlg.meaning, &dlg.tags)) {
+    let (r, stale) = guarded(st, d, |c| core::insert(c, &dlg.word, &dlg.meaning, &dlg.tags));
+    match r {
         Ok(entry) => {
             let id = entry.id;
             st.entries.push(entry.with_dict(d));
             core::sort_entries(&mut st.entries);
-            refresh(st);
-            select_entry(st, d, id);
+            after_write(hwnd, st, d, stale, Some((d, id)));
             let msg = if st.dicts.len() > 1 {
                 format!("「{}」を「{}」に登録しました", dlg.word, st.dicts[d].name)
             } else {
@@ -916,9 +1117,7 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
             };
             notice(st, &msg);
         }
-        Err(e) => {
-            message_box(hwnd, &format!("登録に失敗しました: {e}"), "エラー", MB_OK | MB_ICONERROR);
-        }
+        Err(e) => report_write_error(hwnd, st, d, e),
     }
 }
 
@@ -946,19 +1145,18 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
     if !dialogs::entry_dialog(hwnd, &mut dlg) {
         return;
     }
-    match core::open(&st.dicts[e.dict].path).and_then(|c| core::update(&c, e.id, &dlg.word, &dlg.meaning, &dlg.tags)) {
+    // 読み込んだ時点の更新時刻と一致するときだけ更新する(他の人の変更を上書きしない)
+    let (r, stale) = guarded(st, e.dict, |c| core::update(c, e.id, e.updated_at, &dlg.word, &dlg.meaning, &dlg.tags));
+    match r {
         Ok(ts) => {
             if let Some(x) = st.entries.iter_mut().find(|x| x.dict == e.dict && x.id == e.id) {
                 *x = Entry::new(e.id, dlg.word.clone(), dlg.meaning.clone(), dlg.tags.clone(), ts).with_dict(e.dict);
             }
             core::sort_entries(&mut st.entries);
-            refresh(st);
-            select_entry(st, e.dict, e.id);
+            after_write(hwnd, st, e.dict, stale, Some((e.dict, e.id)));
             notice(st, &format!("「{}」を更新しました", dlg.word));
         }
-        Err(err) => {
-            message_box(hwnd, &format!("更新に失敗しました: {err}"), "エラー", MB_OK | MB_ICONERROR);
-        }
+        Err(err) => report_write_error(hwnd, st, e.dict, err),
     }
 }
 
@@ -997,36 +1195,43 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
         by_dict[st.entries[i].dict].push(st.entries[i].id);
     }
     let mut removed: HashSet<(usize, i64)> = HashSet::new();
-    let mut errors: Vec<String> = Vec::new();
+    let mut any_stale = false;
+    let mut failed: Option<(usize, WriteError)> = None;
     for (d, ids) in by_dict.iter().enumerate() {
         if ids.is_empty() {
             continue;
         }
-        match core::open(&st.dicts[d].path).and_then(|mut c| core::delete_many(&mut c, ids)) {
-            Ok(_) => removed.extend(ids.iter().map(|&id| (d, id))),
-            Err(e) => errors.push(format!("辞書「{}」: {}", st.dicts[d].name, e)),
+        let (r, stale) = guarded(st, d, |c| core::delete_ids(c, ids));
+        match r {
+            Ok(_) => {
+                removed.extend(ids.iter().map(|&id| (d, id)));
+                any_stale |= stale;
+                st.dicts[d].stamp = safe::file_stamp(&st.dicts[d].path);
+            }
+            Err(e) => {
+                failed = Some((d, e));
+                break;
+            }
         }
     }
     st.entries.retain(|e| !removed.contains(&(e.dict, e.id)));
-    refresh(st);
-    if errors.is_empty() {
-        notice(st, &format!("{} 件を削除しました", removed.len()));
+    if any_stale {
+        start_load(hwnd, st, true);
     } else {
-        message_box(hwnd, &format!("一部の削除に失敗しました:\n{}", errors.join("\n")), "エラー", MB_OK | MB_ICONERROR);
+        refresh(st);
+    }
+    match failed {
+        None => notice(st, &format!("{} 件を削除しました", removed.len())),
+        Some((d, e)) => report_write_error(hwnd, st, d, e),
     }
 }
 
 unsafe fn do_settings(hwnd: HWND, st: &mut State) {
-    let mut dlg = SettingsDlg { cfg: st.cfg.clone(), autostart: dialogs::autostart_enabled(), ok: false };
+    let mut dlg = SettingsDlg { cfg: st.cfg.clone(), ok: false };
     if !dialogs::settings_dialog(hwnd, &mut dlg) {
         return;
     }
     let mut problems: Vec<String> = Vec::new();
-    if dlg.autostart != dialogs::autostart_enabled() {
-        if let Err(e) = dialogs::set_autostart(dlg.autostart) {
-            problems.push(format!("自動起動の設定に失敗しました: {e}"));
-        }
-    }
     let dicts_changed = dlg.cfg.dicts != st.cfg.dicts;
     let base = st.cfg_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
     if let Err(e) = std::fs::write(&st.cfg_path, config::to_ini(&dlg.cfg, &base)) {
@@ -1040,7 +1245,7 @@ unsafe fn do_settings(hwnd: HWND, st: &mut State) {
     set_tray_tip(hwnd, st);
     if dicts_changed {
         st.warns = problems.clone();
-        start_load(hwnd, st);
+        start_load(hwnd, st, false);
     } else {
         refresh(st);
     }
@@ -1062,8 +1267,7 @@ unsafe fn reload_config(hwnd: HWND, st: &mut State) {
         st.warns.push(w);
     }
     set_tray_tip(hwnd, st);
-    start_load(hwnd, st);
-    tlog("設定を再読み込み");
+    start_load(hwnd, st, false);
 }
 
 unsafe fn open_config(hwnd: HWND, st: &State) {
@@ -1082,8 +1286,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(st) as isize);
             if let Some(st) = state(hwnd) {
                 update_status(st);
-                update_detail(st);
                 layout(hwnd, st);
+                update_detail(st);
             }
             LRESULT(0)
         }
@@ -1099,7 +1303,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_GETMINMAXINFO => {
             let mmi = &mut *(lparam.0 as *mut MINMAXINFO);
             let dpi = state(hwnd).map_or(96, |s| s.dpi);
-            mmi.ptMinTrackSize.x = scale(860, dpi);
+            mmi.ptMinTrackSize.x = scale(900, dpi);
             mmi.ptMinTrackSize.y = scale(520, dpi);
             LRESULT(0)
         }
@@ -1109,9 +1313,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        WM_ACTIVATE => {
+            // 前面に出たとき、他の人がファイルを変更していたら読み直す
+            if wparam.0 & 0xFFFF != 0 {
+                if let Some(st) = state(hwnd) {
+                    reload_if_changed(hwnd, st);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_DPICHANGED => {
             let rc = &*(lparam.0 as *const RECT);
-            let _ = SetWindowPos(hwnd, None, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
             if let Some(st) = state(hwnd) {
                 st.dpi = (wparam.0 & 0xFFFF) as i32;
                 st.fonts.destroy();
@@ -1120,7 +1332,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 send(st.list, LVM_SETIMAGELIST_, 1, 0);
                 let _ = ImageList_Destroy(st.imglist);
                 st.imglist = make_imglist(st.list, st.dpi);
+            }
+            let _ = SetWindowPos(hwnd, None, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            if let Some(st) = state(hwnd) {
                 layout(hwnd, st);
+                update_detail(st);
             }
             LRESULT(0)
         }
@@ -1129,9 +1345,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let id = GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize;
             match state(hwnd) {
                 Some(st) => match id {
-                    ID_DTITLE | ID_MEANING => ui::ctl_color(hdc, ui::TEXT, ui::PANEL, st.panel_brush),
-                    ID_DMETA => ui::ctl_color(hdc, ui::MUTED, ui::PANEL, st.panel_brush),
-                    ID_STATUS => ui::ctl_color(hdc, ui::MUTED, ui::WHITE, st.white),
+                    ID_STATUS | ID_HINT => ui::ctl_color(hdc, ui::MUTED, ui::WHITE, st.white),
                     _ => ui::ctl_color(hdc, ui::TEXT, ui::WHITE, st.white),
                 },
                 None => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -1140,15 +1354,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_DRAWITEM => {
             let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
             if let Some(st) = state(hwnd) {
-                let id = dis.CtlID as usize;
-                let (kind, bg) = match id {
-                    ID_NEW => (Btn::Primary, ui::WHITE),
-                    ID_ADV => (Btn::Toggle(st.advanced), ui::WHITE),
-                    ID_DEL => (Btn::Danger, ui::PANEL),
-                    ID_EDITBTN => (Btn::Secondary, ui::PANEL),
-                    _ => (Btn::Secondary, ui::WHITE),
+                let kind = match dis.CtlID as usize {
+                    ID_NEW => Btn::Primary,
+                    ID_ADV => Btn::Toggle(st.advanced),
+                    ID_DEL => Btn::Danger,
+                    _ => Btn::Secondary,
                 };
-                ui::draw_button(dis, kind, st.fonts.base, bg, st.dpi);
+                ui::draw_button(dis, kind, st.fonts.base, ui::WHITE, st.dpi);
             }
             LRESULT(1)
         }
@@ -1156,25 +1368,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let loaded = Box::from_raw(lparam.0 as *mut Loaded);
             if let Some(st) = state(hwnd) {
                 if loaded.gen != st.gen {
-                    return LRESULT(0); // 古い読み込み結果(設定の再読み込み前)は捨てる
+                    return LRESULT(0); // 古い読み込み結果は捨てる
                 }
-                tlog(&format!(
-                    "読み込み完了: {} 件 (読み込み+小文字化 {:.1}ms / 並べ替え {:.1}ms)",
-                    loaded.entries.len(),
-                    loaded.read_ms,
-                    loaded.sort_ms
-                ));
-                for (i, e) in loaded.errors.iter().enumerate() {
+                let loaded = *loaded;
+                let mut corrupt: Vec<usize> = Vec::new();
+                for (i, ld) in loaded.dicts.into_iter().enumerate() {
                     if let Some(d) = st.dicts.get_mut(i) {
-                        d.error = e.clone();
+                        d.error = ld.error;
+                        d.stamp = ld.stamp;
+                        if ld.corrupt && !d.readonly {
+                            corrupt.push(i);
+                        }
                     }
                 }
                 st.entries = loaded.entries;
                 st.loaded = true;
+                st.loading = false;
+                st.last_query = None;
                 refresh(st); // 読み込み中に入力された語句をここで反映
+                if let Some((d, id)) = st.pending_select.take() {
+                    select_entry(st, d, id);
+                }
                 if !st.warns.is_empty() {
                     let w = st.warns.join(" / ");
+                    st.warns.clear();
                     notice(st, &w);
+                }
+                // 壊れている辞書は、ローカルのバックアップから復元するかたずねる(辞書ごとに1回だけ)
+                for i in corrupt {
+                    if st.asked_restore.insert(st.dicts[i].path.clone()) {
+                        offer_restore(hwnd, st, i);
+                        break;
+                    }
                 }
             }
             LRESULT(0)
@@ -1205,7 +1430,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     }
                     layout(hwnd, st);
-                    let _ = InvalidateRect(st.adv, None, false);
                     if st.loaded {
                         refresh(st);
                     }
@@ -1226,6 +1450,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             if st.loaded {
                                 refresh(st);
                             }
+                            let _ = SetFocus(st.edit);
                         } else {
                             let _ = ShowWindow(hwnd, SW_HIDE);
                         }
@@ -1236,47 +1461,48 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_NOTIFY => {
             let hdr = &*(lparam.0 as *const NMHDR);
-            if hdr.idFrom == ID_LIST {
-                if let Some(st) = state(hwnd) {
-                    if hdr.code == LVN_GETDISPINFOW {
-                        let di = &mut *(lparam.0 as *mut NMLVDISPINFOW);
-                        if di.item.mask.0 & LVIF_TEXT.0 != 0 {
-                            let text = st
-                                .matches
-                                .get(di.item.iItem as usize)
-                                .map(|&i| {
-                                    let e = &st.entries[i as usize];
-                                    match di.item.iSubItem {
-                                        0 => e.word.clone(),
-                                        1 => e.meaning.replace(['\r', '\n'], " "),
-                                        2 => e.tags.clone(),
-                                        _ => st.dicts.get(e.dict).map(|d| d.name.clone()).unwrap_or_default(),
-                                    }
-                                })
-                                .unwrap_or_default();
-                            st.cell = wide(&text);
-                            di.item.pszText = PWSTR(st.cell.as_mut_ptr());
-                        }
-                    } else if !ui::is_busy() {
-                        if hdr.code == LVN_KEYDOWN {
-                            let kd = &*(lparam.0 as *const NMLVKEYDOWN);
-                            if kd.wVKey == VK_DELETE.0 {
-                                do_delete(hwnd, st);
-                            } else if kd.wVKey == VK_RETURN.0 {
-                                do_edit(hwnd, st);
-                            }
-                        } else if hdr.code == LVN_ITEMCHANGED {
-                            let nm = &*(lparam.0 as *const NMLISTVIEW);
-                            if (nm.uOldState ^ nm.uNewState) & LVIS_SELECTED.0 != 0 {
-                                update_detail(st);
-                            }
-                        } else if hdr.code == LVN_ODSTATECHANGED {
-                            // 仮想リストでは、範囲選択(Shift+クリック / Ctrl+A)はこの通知で届く
-                            update_detail(st);
-                        } else if hdr.code == NM_DBLCLK {
-                            do_edit(hwnd, st);
-                        }
+            if hdr.idFrom != ID_LIST {
+                return LRESULT(0);
+            }
+            let Some(st) = state(hwnd) else { return LRESULT(0) };
+            if hdr.code == NM_CUSTOMDRAW {
+                let cd = &*(lparam.0 as *const NMLVCUSTOMDRAW);
+                return match cd.nmcd.dwDrawStage.0 {
+                    0x1 => LRESULT(0x20),     // CDDS_PREPAINT → CDRF_NOTIFYITEMDRAW
+                    0x10001 => {
+                        // CDDS_ITEMPREPAINT: 行を自前で描く → CDRF_SKIPDEFAULT
+                        draw_row(st, cd.nmcd.hdc, cd.nmcd.dwItemSpec);
+                        LRESULT(0x4)
                     }
+                    _ => LRESULT(0),
+                };
+            }
+            if hdr.code == LVN_GETDISPINFOW {
+                // 描画は自前だが、読み上げ等のために見出し語を返しておく
+                let di = &mut *(lparam.0 as *mut NMLVDISPINFOW);
+                if di.item.mask.0 & LVIF_TEXT.0 != 0 {
+                    let text = st.matches.get(di.item.iItem as usize).map(|&i| st.entries[i as usize].word.clone()).unwrap_or_default();
+                    st.cell = wide(&text);
+                    di.item.pszText = PWSTR(st.cell.as_mut_ptr());
+                }
+            } else if !ui::is_busy() {
+                if hdr.code == LVN_KEYDOWN {
+                    let kd = &*(lparam.0 as *const NMLVKEYDOWN);
+                    if kd.wVKey == VK_DELETE.0 {
+                        do_delete(hwnd, st);
+                    } else if kd.wVKey == VK_RETURN.0 {
+                        do_edit(hwnd, st);
+                    }
+                } else if hdr.code == LVN_ITEMCHANGED {
+                    let nm = &*(lparam.0 as *const NMLISTVIEW);
+                    if (nm.uOldState ^ nm.uNewState) & LVIS_SELECTED.0 != 0 {
+                        update_detail(st);
+                    }
+                } else if hdr.code == LVN_ODSTATECHANGED {
+                    // 仮想リストでは、範囲選択(Shift+クリック / Ctrl+A)はこの通知で届く
+                    update_detail(st);
+                } else if hdr.code == NM_DBLCLK {
+                    do_edit(hwnd, st);
                 }
             }
             LRESULT(0)
@@ -1355,7 +1581,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let st = Box::from_raw(p);
                 st.fonts.destroy();
                 let _ = DeleteObject(st.white);
-                let _ = DeleteObject(st.panel_brush);
             }
             PostQuitMessage(0);
             LRESULT(0)
