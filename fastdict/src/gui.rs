@@ -9,7 +9,7 @@ use crate::config::{self, Config};
 use crate::core::{self, Entry, Query};
 use crate::dialogs::{self, EntryDlg, SettingsDlg};
 use crate::safe::{self, WriteError};
-use crate::ui::{self, quiet, scale, Btn, Fonts};
+use crate::ui::{self, quiet, scale, Btn, Fonts, BTN_W, CTL_H};
 use crate::ui::{get_text, send, set_text, wide};
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -42,10 +42,12 @@ const ID_EDITBTN: usize = 115;
 const ID_NEW: usize = 116;
 const ID_SETTINGS: usize = 117;
 const ID_DEL: usize = 118;
+const ID_OPENLINK: usize = 119;
 const HOTKEY_ID: i32 = 1;
 const WM_APP_LOADED: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW: u32 = WM_APP + 3;
+const WM_APP_RELOAD: u32 = WM_APP + 4;
 const MENU_OPEN: usize = 1;
 const MENU_SETTINGS: usize = 2;
 const MENU_OPEN_CFG: usize = 3;
@@ -61,6 +63,7 @@ const CB_ADDSTRING: u32 = 0x0143;
 const CB_RESETCONTENT: u32 = 0x014B;
 const CB_GETCURSEL: u32 = 0x0147;
 const CB_SETCURSEL: u32 = 0x014E;
+const CB_SETITEMHEIGHT: u32 = 0x0153;
 const LVM_SETCOLUMNWIDTH_: u32 = 0x101E;
 const LVM_ENSUREVISIBLE_: u32 = 0x1013;
 const LVM_SETIMAGELIST_: u32 = 0x1003;
@@ -114,6 +117,7 @@ struct State {
     // 右: 本文
     rich: HWND,
     rich_ok: bool,
+    btn_link: HWND,
     btn_edit: HWND,
     btn_del: HWND,
     status: HWND,
@@ -278,6 +282,8 @@ pub fn run() {
                     Some(ID_NEW)
                 } else if ctrl && vk == VK_OEM_COMMA.0 {
                     Some(ID_SETTINGS)
+                } else if ctrl && vk == 'O' as u16 {
+                    Some(ID_OPENLINK)
                 } else if vk == VK_F2.0 {
                     Some(ID_EDITBTN)
                 } else {
@@ -318,6 +324,41 @@ pub fn show_report(report: &str) {
         let _ = std::fs::write(&p, report);
         let text = format!("{report}\r\n(保存先: {})", p.display());
         let (t, c) = (wide(&text), wide("fastdict ベンチマーク"));
+        MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+/// `--add-sample`: サンプル辞書(約300語)を作り、設定に「サンプル」として追加する。
+/// 普段の辞書とは別ファイルなので、不要になったら設定で外すだけでよい。
+pub fn add_sample() {
+    unsafe {
+        let init = load_config();
+        let mut cfg = init.cfg;
+        let base = init.cfg_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
+        let path = base.join("sample.db");
+        let text = match core::create_sample(&path) {
+            Ok(n) => {
+                let mut msg = if n > 0 {
+                    format!("サンプル辞書を作成しました({n} 語)。")
+                } else {
+                    "サンプル辞書はすでにあります(語は追加していません)。".to_string()
+                };
+                if !cfg.dicts.iter().any(|d| d.path == path) {
+                    cfg.dicts.push(config::DictConf { name: "サンプル".into(), path: path.clone(), readonly: false });
+                    match std::fs::write(&init.cfg_path, config::to_ini(&cfg, &base)) {
+                        Ok(()) => msg.push_str("\n設定に辞書「サンプル」を追加しました。"),
+                        Err(e) => msg.push_str(&format!("\n設定ファイルを更新できませんでした: {e}")),
+                    }
+                }
+                // 起動中なら、すぐ反映させる
+                if let Ok(existing) = FindWindowW(CLASS_NAME, PCWSTR::null()) {
+                    let _ = PostMessageW(existing, WM_APP_RELOAD, WPARAM(0), LPARAM(0));
+                }
+                format!("{msg}\n\n場所: {}\n不要になったら、設定の「辞書」から外してください(ファイルは残ります)。", path.display())
+            }
+            Err(e) => format!("サンプル辞書を作成できませんでした: {e}"),
+        };
+        let (t, c) = (wide(&text), wide("fastdict サンプルデータ"));
         MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONINFORMATION);
     }
 }
@@ -509,7 +550,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
     let fonts = Fonts::new(dpi);
     let mut fields: Vec<(RECT, HWND)> = Vec::new();
 
-    let edit = ui::field(hwnd, ID_EDIT, (0, 0, 10, 10), dpi, false, &mut fields, fonts.search);
+    let edit = ui::field(hwnd, ID_EDIT, (0, 0, 10, 10), dpi, false, &mut fields, fonts.base);
     let cue = wide("検索 — 見出し語・意味・タグ(スペース区切りで AND)");
     send(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
     let combo = create_child(hwnd, w!("COMBOBOX"), 0, WS_TABSTOP.0 | WS_VSCROLL.0 | 3 /* CBS_DROPDOWNLIST */, ID_COMBO).unwrap();
@@ -548,15 +589,19 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
     let (rich, rich_ok) = match create_child(hwnd, w!("RICHEDIT50W"), 0, rich_style, ID_RICH) {
         Some(h) => {
             send(h, EM_SETBKGNDCOLOR, 0, ui::WHITE.0 as isize);
+            // 本文中の URL を自動でリンクにし、クリックを EN_LINK で受け取る
+            send(h, EM_AUTOURLDETECT, 1, 0);
+            send(h, EM_SETEVENTMASK, 0, ENM_LINK as isize);
             (h, true)
         }
         None => (create_child(hwnd, w!("EDIT"), 0, rich_style, ID_RICH).unwrap(), false),
     };
+    let btn_link = owner_button(hwnd, ID_OPENLINK, "参照先を開く");
     let btn_edit = owner_button(hwnd, ID_EDITBTN, "編集");
     let btn_del = owner_button(hwnd, ID_DEL, "削除");
     let status = create_child(hwnd, w!("STATIC"), 0, 0x0000000C | 0x80 /* SS_LEFTNOWORDWRAP | SS_NOPREFIX */, ID_STATUS).unwrap();
     let hint = create_child(hwnd, w!("STATIC"), 0, 0x2 | 0x80 /* SS_RIGHT | SS_NOPREFIX */, ID_HINT).unwrap();
-    set_text(hint, "↑↓ 候補を移動    Ctrl+N 新規    F2 編集    Del 削除    Esc 消去/閉じる");
+    set_text(hint, "↑↓ 候補    Ctrl+N 新規    F2 編集    Del 削除    Ctrl+O 参照先    Esc 消去/閉じる");
 
     let st = State {
         edit,
@@ -571,6 +616,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         imglist,
         rich,
         rich_ok,
+        btn_link,
         btn_edit,
         btn_del,
         status,
@@ -607,18 +653,20 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
 unsafe fn apply_fonts(st: &State) {
     let f = &st.fonts;
     for (h, font) in [
-        (st.edit, f.search),
+        (st.edit, f.base),
         (st.combo, f.base),
         (st.qw, f.base),
         (st.qm, f.base),
         (st.qt, f.base),
         (st.list, f.base),
-        (st.rich, f.body),
+        (st.rich, f.base),
         (st.status, f.small),
         (st.hint, f.small),
     ] {
         send(h, WM_SETFONT, font.0 as usize, 1);
     }
+    // ドロップダウンの高さを、ほかの入力欄・ボタン(CTL_H)にそろえる
+    send(st.combo, CB_SETITEMHEIGHT, usize::MAX, (scale(CTL_H, st.dpi) - 6) as isize);
 }
 
 unsafe fn layout(hwnd: HWND, st: &mut State) {
@@ -626,16 +674,16 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
     let _ = GetClientRect(hwnd, &mut rc);
     let dpi = st.dpi;
     let s = |v: i32| scale(v, dpi);
-    let (m, gap, box_h) = (s(16), s(8), s(42));
+    let (m, gap, box_h) = (s(16), s(8), s(CTL_H));
     let w = rc.right - 2 * m;
 
     // --- 上段: 検索欄 | 辞書 | 絞り込み | ＋新規登録 | 設定 ---
-    let (combo_w, adv_w, new_w, set_w) = (s(180), s(92), s(128), s(64));
+    let (combo_w, adv_w, new_w, set_w) = (s(180), s(BTN_W), s(BTN_W), s(BTN_W));
     let search_w = (w - combo_w - adv_w - new_w - set_w - 4 * gap).max(s(120));
     let y = s(14);
     ui::place_field(st.edit, (m, y, search_w, box_h), dpi, false, &mut st.fields);
     let mut x = m + search_w + gap;
-    let _ = MoveWindow(st.combo, x, y + (box_h - s(30)) / 2, combo_w, s(300), true);
+    let _ = MoveWindow(st.combo, x, y, combo_w, s(300), true);
     x += combo_w + gap;
     let _ = MoveWindow(st.adv, x, y, adv_w, box_h, true);
     x += adv_w + gap;
@@ -650,7 +698,7 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
         let _ = ShowWindow(h, adv_cmd);
     }
     if st.advanced {
-        let fh = s(36);
+        let fh = s(CTL_H);
         let cw = (w - 2 * gap) / 3;
         ui::place_field(st.qw, (m, top, cw, fh), dpi, false, &mut st.fields);
         ui::place_field(st.qm, (m + cw + gap, top, cw, fh), dpi, false, &mut st.fields);
@@ -661,7 +709,7 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
     // --- 下端: ステータス(左)とキー操作の案内(右) ---
     let status_h = s(30);
     st.status_top = rc.bottom - status_h;
-    let hint_w = (w * 55 / 100).min(s(520));
+    let hint_w = (w * 62 / 100).min(s(600));
     let _ = MoveWindow(st.status, m, st.status_top + s(6), w - hint_w - gap, s(20), true);
     let _ = MoveWindow(st.hint, m + w - hint_w, st.status_top + s(6), hint_w, s(20), true);
     let bottom = st.status_top - s(12);
@@ -679,11 +727,12 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
     st.pane = RECT { left: px, top, right: rc.right - m, bottom: top + h };
     let pad = s(26);
     let (ix, iw) = (px + pad, (st.pane.right - st.pane.left) - 2 * pad);
-    let (btn_h, bw, bgap) = (s(34), s(104), s(10));
+    let (btn_h, bw, bgap) = (s(CTL_H), s(BTN_W), s(10));
     let btn_y = top + h - s(16) - btn_h;
     let _ = MoveWindow(st.rich, ix, top + s(20), iw + pad - s(6), (btn_y - s(12) - (top + s(20))).max(s(30)), true);
     let _ = MoveWindow(st.btn_del, ix + iw - bw, btn_y, bw, btn_h, true);
     let _ = MoveWindow(st.btn_edit, ix + iw - 2 * bw - bgap, btn_y, bw, btn_h, true);
+    let _ = MoveWindow(st.btn_link, ix, btn_y, bw, btn_h, true);
     // 絞り込み欄の出し入れで残像が出ないよう、背景ごと描き直す
     let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
 }
@@ -901,8 +950,28 @@ unsafe fn rich_format(rich: HWND, range: (usize, usize), pt: Option<i32>, bold: 
     send(rich, EM_SETCHARFORMAT, SCF_SELECTION as usize, &cf as *const _ as isize);
 }
 
+/// 範囲をリンク(クリックで EN_LINK が届く)にする
+unsafe fn rich_link(rich: HWND, range: (usize, usize)) {
+    let cr = CHARRANGE { cpMin: range.0 as i32, cpMax: range.1 as i32 };
+    send(rich, EM_EXSETSEL, 0, &cr as *const _ as isize);
+    let mut cf = CHARFORMAT2W::default();
+    cf.Base.cbSize = std::mem::size_of::<CHARFORMAT2W>() as u32;
+    cf.Base.dwMask = CFM_LINK;
+    cf.Base.dwEffects = CFE_LINK;
+    send(rich, EM_SETCHARFORMAT, SCF_SELECTION as usize, &cf as *const _ as isize);
+}
+
 /// 本文を描く: 見出し語(大)/ 補足(小・灰)/ 本文。`*_marks` は各部分の中での強調範囲(UTF-16)
-unsafe fn render(st: &State, title: &str, meta: &str, body: &str, title_marks: &[(usize, usize)], meta_marks: &[(usize, usize)], body_marks: &[(usize, usize)]) {
+unsafe fn render(
+    st: &State,
+    title: &str,
+    meta: &str,
+    link: &str,
+    body: &str,
+    title_marks: &[(usize, usize)],
+    meta_marks: &[(usize, usize)],
+    body_marks: &[(usize, usize)],
+) {
     let body = body.replace("\r\n", "\n");
     let mut text = String::from(title);
     let mut meta_start = 0;
@@ -910,6 +979,15 @@ unsafe fn render(st: &State, title: &str, meta: &str, body: &str, title_marks: &
         text.push('\n');
         meta_start = len16(&text);
         text.push_str(meta);
+    }
+    // 参照先: 「参照先  <リンク>」の1行。リンク部分だけをクリックできるようにする
+    const LINK_LABEL: &str = "参照先  ";
+    let mut link_start = 0;
+    if !link.is_empty() {
+        text.push('\n');
+        link_start = len16(&text) + len16(LINK_LABEL);
+        text.push_str(LINK_LABEL);
+        text.push_str(link);
     }
     let mut body_start = 0;
     if !body.is_empty() {
@@ -928,8 +1006,16 @@ unsafe fn render(st: &State, title: &str, meta: &str, body: &str, title_marks: &
     rich_format(st.rich, (0, t_len), Some(20), true, ui::TEXT);
     if m_len > 0 {
         rich_format(st.rich, (meta_start, meta_start + m_len), Some(9), false, ui::MUTED);
-        // 見出し語と本文の間の空行は小さく
-        rich_format(st.rich, (meta_start + m_len, meta_start + m_len + 2), Some(6), false, ui::MUTED);
+    }
+    let l_len = len16(link);
+    if l_len > 0 {
+        rich_format(st.rich, (link_start - len16(LINK_LABEL), link_start), Some(9), false, ui::MUTED);
+        rich_format(st.rich, (link_start, link_start + l_len), Some(9), false, ui::ACCENT);
+        rich_link(st.rich, (link_start, link_start + l_len));
+    }
+    if b_len > 0 {
+        // 見出し部分と本文の間の空行は小さく
+        rich_format(st.rich, (body_start - 2, body_start), Some(6), false, ui::MUTED);
     }
     if b_len > 0 {
         rich_format(st.rich, (body_start, body_start + b_len), Some(12), false, ui::TEXT);
@@ -964,7 +1050,7 @@ unsafe fn update_detail(st: &State) {
             } else {
                 ("", "")
             };
-            render(st, t, m, "", &[], &[], &[]);
+            render(st, t, m, "", "", &[], &[], &[]);
         }
         1 => {
             let e = &st.entries[sel[0]];
@@ -981,17 +1067,63 @@ unsafe fn update_detail(st: &State) {
             let body = e.meaning.replace("\r\n", "\n");
             // タグは meta の先頭にあるので、強調位置はそのまま使える
             let meta_marks = if tags.is_empty() { Vec::new() } else { core::mark_ranges(&tags, &st.marks.2) };
-            render(st, &e.word, &meta, &body, &core::mark_ranges(&e.word, &st.marks.0), &meta_marks, &core::mark_ranges(&body, &st.marks.1));
+            render(st, &e.word, &meta, &e.link, &body, &core::mark_ranges(&e.word, &st.marks.0), &meta_marks, &core::mark_ranges(&body, &st.marks.1));
         }
-        n => render(st, &format!("{n} 件を選択中"), "Delete キーまたは「削除」でまとめて削除できます。", "", &[], &[], &[]),
+        n => render(st, &format!("{n} 件を選択中"), "Delete キーまたは「削除」でまとめて削除できます。", "", "", &[], &[], &[]),
     }
     let can_edit = sel.len() == 1 && writable(&st.dicts[st.entries[sel[0]].dict]).is_ok();
     let can_del = !sel.is_empty() && sel.iter().all(|&i| writable(&st.dicts[st.entries[i].dict]).is_ok());
+    let has_link = sel.len() == 1 && !st.entries[sel[0]].link.is_empty();
+    let _ = EnableWindow(st.btn_link, has_link);
+    let _ = InvalidateRect(st.btn_link, None, false);
     let _ = EnableWindow(st.btn_edit, can_edit);
     let _ = EnableWindow(st.btn_del, can_del);
     set_text(st.btn_del, &if sel.len() > 1 { format!("{} 件を削除", sel.len()) } else { "削除".to_string() });
     let _ = InvalidateRect(st.btn_edit, None, false);
     let _ = InvalidateRect(st.btn_del, None, false);
+}
+
+// ---- 参照先を開く -----------------------------------------------------------
+
+/// 参照先を開く。Web ページはそのまま、ファイル等は確認してから開く。
+/// 共有の辞書には他の人が登録したリンクも入るため、実行ファイルには強い警告を出す。
+unsafe fn open_link(hwnd: HWND, st: &mut State, link: &str) {
+    let link = link.trim().trim_matches('"').to_string();
+    if link.is_empty() {
+        return;
+    }
+    match core::link_kind(&link) {
+        core::LinkKind::Web => {}
+        core::LinkKind::Other => {
+            let text = format!("次の参照先を開きますか?\n\n{link}");
+            if message_box(hwnd, &text, "参照先を開く", MB_YESNO | MB_ICONQUESTION) != IDYES {
+                return;
+            }
+        }
+        core::LinkKind::Executable => {
+            let text = format!(
+                "この参照先は、プログラムとして実行される可能性のあるファイルです。\n\n{link}\n\n登録した人と内容を信頼できる場合だけ開いてください。開きますか?"
+            );
+            if message_box(hwnd, &text, "参照先を開く(注意)", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES {
+                return;
+            }
+        }
+    }
+    let w = wide(&link);
+    let r = ShellExecuteW(hwnd, w!("open"), PCWSTR(w.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+    if r.0 as isize <= 32 {
+        notice(st, &format!("参照先を開けませんでした: {link}"));
+    }
+}
+
+unsafe fn do_open_link(hwnd: HWND, st: &mut State) {
+    let sel = selected_entries(st);
+    if sel.len() != 1 || st.entries[sel[0]].link.is_empty() {
+        notice(st, "この語には参照先が登録されていません(「編集」から追加できます)");
+        return;
+    }
+    let link = st.entries[sel[0]].link.clone();
+    open_link(hwnd, st, &link);
 }
 
 // ---- 操作: 新規登録 / 編集 / 削除 / 設定 -----------------------------------------
@@ -1094,6 +1226,7 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
         word,
         tags: String::new(),
         meaning: String::new(),
+        link: String::new(),
         choices: targets.iter().map(|&i| st.dicts[i].name.clone()).collect(),
         choice,
         show_choice: targets.len() > 1,
@@ -1103,7 +1236,7 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
         return;
     }
     let d = targets[dlg.choice];
-    let (r, stale) = guarded(st, d, |c| core::insert(c, &dlg.word, &dlg.meaning, &dlg.tags));
+    let (r, stale) = guarded(st, d, |c| core::insert(c, &dlg.word, &dlg.meaning, &dlg.tags, &dlg.link));
     match r {
         Ok(entry) => {
             let id = entry.id;
@@ -1137,6 +1270,7 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
         word: e.word.clone(),
         tags: e.tags.clone(),
         meaning: e.meaning.clone(),
+        link: e.link.clone(),
         choices: Vec::new(),
         choice: 0,
         show_choice: false,
@@ -1146,11 +1280,11 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
         return;
     }
     // 読み込んだ時点の更新時刻と一致するときだけ更新する(他の人の変更を上書きしない)
-    let (r, stale) = guarded(st, e.dict, |c| core::update(c, e.id, e.updated_at, &dlg.word, &dlg.meaning, &dlg.tags));
+    let (r, stale) = guarded(st, e.dict, |c| core::update(c, e.id, e.updated_at, &dlg.word, &dlg.meaning, &dlg.tags, &dlg.link));
     match r {
         Ok(ts) => {
             if let Some(x) = st.entries.iter_mut().find(|x| x.dict == e.dict && x.id == e.id) {
-                *x = Entry::new(e.id, dlg.word.clone(), dlg.meaning.clone(), dlg.tags.clone(), ts).with_dict(e.dict);
+                *x = Entry::new(e.id, dlg.word.clone(), dlg.meaning.clone(), dlg.tags.clone(), ts).with_dict(e.dict).with_link(dlg.link.clone());
             }
             core::sort_entries(&mut st.entries);
             after_write(hwnd, st, e.dict, stale, Some((e.dict, e.id)));
@@ -1437,6 +1571,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 (ID_NEW, BN_CLICKED_) => do_new(hwnd, st),
                 (ID_EDITBTN, BN_CLICKED_) => do_edit(hwnd, st),
+                (ID_OPENLINK, BN_CLICKED_) => do_open_link(hwnd, st),
                 (ID_DEL, BN_CLICKED_) => do_delete(hwnd, st),
                 (ID_SETTINGS, BN_CLICKED_) => do_settings(hwnd, st),
                 _ => {
@@ -1461,10 +1596,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_NOTIFY => {
             let hdr = &*(lparam.0 as *const NMHDR);
+            let Some(st) = state(hwnd) else { return LRESULT(0) };
+            if hdr.idFrom == ID_RICH {
+                // 本文中のリンクのクリック
+                if hdr.code == EN_LINK {
+                    let en = &*(lparam.0 as *const ENLINK);
+                    if en.msg == WM_LBUTTONUP {
+                        let (a, b) = (en.chrg.cpMin, en.chrg.cpMax);
+                        if b > a && b - a < 2048 {
+                            let mut buf = vec![0u16; (b - a) as usize + 1];
+                            let mut tr = TEXTRANGEW { chrg: CHARRANGE { cpMin: a, cpMax: b }, lpstrText: PWSTR(buf.as_mut_ptr()) };
+                            let n = send(st.rich, EM_GETTEXTRANGE, 0, &mut tr as *mut _ as isize).0.max(0) as usize;
+                            let link = String::from_utf16_lossy(&buf[..n.min(buf.len() - 1)]);
+                            open_link(hwnd, st, &link);
+                        }
+                    }
+                }
+                return LRESULT(0);
+            }
             if hdr.idFrom != ID_LIST {
                 return LRESULT(0);
             }
-            let Some(st) = state(hwnd) else { return LRESULT(0) };
             if hdr.code == NM_CUSTOMDRAW {
                 let cd = &*(lparam.0 as *const NMLVCUSTOMDRAW);
                 return match cd.nmcd.dwDrawStage.0 {
@@ -1504,6 +1656,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 } else if hdr.code == NM_DBLCLK {
                     do_edit(hwnd, st);
                 }
+            }
+            LRESULT(0)
+        }
+        WM_APP_RELOAD => {
+            // 別プロセス(--add-sample)が設定を書き換えたので読み直す
+            if let Some(st) = state(hwnd) {
+                reload_config(hwnd, st);
             }
             LRESULT(0)
         }

@@ -87,30 +87,28 @@ pub unsafe fn font(face: &str, pt: i32, dpi: i32, bold: bool) -> HFONT {
     )
 }
 
+/// 画面全体で共通の寸法(96dpi 基準)。ボタンと1行入力欄は、どの画面でもこの大きさにそろえる。
+pub const CTL_H: i32 = 36;
+pub const BTN_W: i32 = 108;
+
+/// 画面全体で共通のフォント。操作部品(ボタン・入力欄・一覧)はすべて `base`。
 pub struct Fonts {
+    /// 操作部品の標準(10pt)
     pub base: HFONT,
+    /// 補足(9pt): ラベル、候補リストの2行目、ステータス
     pub small: HFONT,
-    pub search: HFONT,
-    pub title: HFONT,
-    pub body: HFONT,
+    /// 見出し(10pt 太字): 候補リストの見出し語、設定の区分名
     pub heading: HFONT,
 }
 
 impl Fonts {
     pub unsafe fn new(dpi: i32) -> Fonts {
         let face = "Yu Gothic UI";
-        Fonts {
-            base: font(face, 10, dpi, false),
-            small: font(face, 9, dpi, false),
-            search: font(face, 12, dpi, false),
-            title: font(face, 18, dpi, true),
-            body: font(face, 11, dpi, false),
-            heading: font(face, 11, dpi, true),
-        }
+        Fonts { base: font(face, 10, dpi, false), small: font(face, 9, dpi, false), heading: font(face, 10, dpi, true) }
     }
 
     pub unsafe fn destroy(&self) {
-        for f in [self.base, self.small, self.search, self.title, self.body, self.heading] {
+        for f in [self.base, self.small, self.heading] {
             let _ = DeleteObject(f);
         }
     }
