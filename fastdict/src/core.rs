@@ -222,10 +222,14 @@ pub fn delete_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<usize> {
 
 /// 見出し語順に並べる
 pub fn sort_entries(entries: &mut [Entry]) {
-    // 並べ替えに使う文字列: 読みがあれば読み、無ければ見出し語。
+    // 並べ替えに使う文字列:
+    // - 見出し語が英数字で始まる語は、読みがあっても見出し語そのもの(アルファベット順を優先)
+    // - それ以外(日本語)は、読みがあれば読み、無ければ見出し語
     // カタカナはひらがなと同じ扱いにして、読みの無いカタカナ語も五十音の中に並べる。
+    // 読みの無い漢字の語は、文字コードの関係でかなの後ろに並ぶ。
     fn key(e: &Entry) -> impl Iterator<Item = char> + '_ {
-        let k = if e.reading_norm.is_empty() { &e.word_lc } else { &e.reading_norm };
+        let ascii_head = e.word_lc.starts_with(|c: char| c.is_ascii_alphanumeric());
+        let k = if ascii_head || e.reading_norm.is_empty() { &e.word_lc } else { &e.reading_norm };
         k.chars().map(|c| if ('\u{30A1}'..='\u{30F6}').contains(&c) { char::from_u32(c as u32 - 0x60).unwrap_or(c) } else { c })
     }
     entries.sort_unstable_by(|a, b| key(a).cmp(key(b)).then_with(|| a.word_lc.cmp(&b.word_lc)).then(a.dict.cmp(&b.dict)).then(a.id.cmp(&b.id)));
@@ -640,19 +644,20 @@ pub fn link_kind(link: &str) -> LinkKind {
 /// 同梱のサンプルデータ(インポートできる TSV と同じ形式)
 pub const SAMPLE_TSV: &str = include_str!("../sample/sample.tsv");
 
-/// サンプル辞書を作る(すでに語が入っていれば何もしない)。追加した件数を返す
-pub fn create_sample(path: &Path) -> rusqlite::Result<usize> {
+/// サンプル辞書を作る。すでにある場合は、足りない語を追加し、読みが空の語に読みを補う
+/// (利用者が編集した内容は変えない)。戻り値は (追加した語数, 読みを補った語数)。
+pub fn create_sample(path: &Path) -> rusqlite::Result<(usize, usize)> {
     let mut conn = open(path)?;
-    migrate(&conn)?;
-    let existing: i64 = conn.query_row("SELECT COUNT(*) FROM words", [], |r| r.get(0))?;
-    if existing > 0 {
-        return Ok(0);
-    }
     let (rows, _) = crate::import::to_rows(crate::import::parse_table(SAMPLE_TSV, '\t'));
     let tx = conn.transaction()?;
+    migrate(&tx)?;
+    let mut updated = 0;
+    for r in rows.iter().filter(|r| !r.reading.is_empty()) {
+        updated += tx.execute("UPDATE words SET reading = ?1 WHERE word = ?2 AND meaning = ?3 AND reading = ''", params![r.reading, r.word, r.meaning])?;
+    }
     let (added, _) = crate::import::insert_rows(&tx, &rows)?;
     tx.commit()?;
-    Ok(added)
+    Ok((added, updated))
 }
 
 /// 表示用: UNIX秒(UTC)を日本時間(UTC+9)の "yyyy/MM/dd HH:mm:ss" にする。
@@ -835,7 +840,7 @@ mod tests {
         ];
         // 見出し語順は、読みがあれば読みの順(かなの種類は区別しない)
         sort_entries(&mut e);
-        assert_eq!(e.iter().map(|x| x.id).collect::<Vec<_>>(), vec![4, 3, 2, 5, 1]); // apple, いちご, いちごいちえ, えすきゅー, りんご
+        assert_eq!(e.iter().map(|x| x.id).collect::<Vec<_>>(), vec![4, 5, 3, 2, 1]); // apple, SQL(英字は読みより見出し語), いちご, いちごいちえ, りんご
         let ids = |v: Vec<u32>| v.into_iter().map(|i| e[i as usize].id).collect::<Vec<_>>();
         // 読みで引ける。ひらがなでもカタカナでも同じ
         assert_eq!(ids(filter(&e, &q("りんご"))), vec![1, 4]); // 読みの完全一致が先、意味に含む apple が後
@@ -849,7 +854,7 @@ mod tests {
         assert!(filter(&e, &Query { meaning: "いちごいちえ".into(), ..Default::default() }).is_empty());
         assert_eq!(to_hiragana("リンゴ ヴァ ABC 漢字"), "りんご ゔぁ ABC 漢字");
 
-        // 並び全体: 数字 → 英字 → かな(読み、または読みの無いかな・カタカナ語)→ 読みの無い漢字
+        // 並び全体: 数字 → 英字(読みがあっても見出し語で並べる)→ かな(読み、または読みの無いかな・カタカナ語)→ 読みの無い漢字
         let mut v = vec![
             mk(1, "辞書", "", ""),
             mk(2, "アジェンダ", "", ""),
@@ -862,7 +867,7 @@ mod tests {
         ];
         sort_entries(&mut v);
         let words: Vec<&str> = v.iter().map(|x| x.word.as_str()).collect();
-        assert_eq!(words, vec!["5W1H", "Apple", "zebra", "アジェンダ", "いろは", "API", "稟議", "辞書"]);
+        assert_eq!(words, vec!["5W1H", "API", "Apple", "zebra", "アジェンダ", "いろは", "稟議", "辞書"]);
     }
 
     #[test]
@@ -1015,8 +1020,22 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("fastdict-sample-{}", std::process::id()));
         let path = dir.join("sample.db");
-        assert_eq!(create_sample(&path).unwrap(), 300);
-        assert_eq!(create_sample(&path).unwrap(), 0); // 2回目は追加しない
+        assert_eq!(create_sample(&path).unwrap(), (300, 0));
+        assert_eq!(create_sample(&path).unwrap(), (0, 0)); // 2回目は何も変えない
+        // 読みの無い古いサンプル辞書は、読みだけ補う(語は増やさない)。利用者が付けた読みは変えない
+        {
+            let c = open(&path).unwrap();
+            c.execute("UPDATE words SET reading = ''", []).unwrap();
+            c.execute("UPDATE words SET reading = 'じぶんでつけた' WHERE word = '一期一会'", []).unwrap();
+            c.execute("DELETE FROM words WHERE word = 'API'", []).unwrap();
+        }
+        assert_eq!(create_sample(&path).unwrap(), (1, 158));
+        {
+            let c = open(&path).unwrap();
+            let get = |w: &str| c.query_row("SELECT reading FROM words WHERE word = ?1", [w], |r| r.get::<_, String>(0)).unwrap();
+            assert_eq!(get("一期一会"), "じぶんでつけた");
+            assert_eq!(get("温故知新"), "おんこちしん");
+        }
         let c = open(&path).unwrap();
         assert_eq!(load_all(&c).unwrap().len(), 300);
         drop(c);

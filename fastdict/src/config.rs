@@ -4,7 +4,7 @@
 //! ```ini
 //! [general]
 //! hotkey = Ctrl+Alt+D
-//! close_to_tray = true
+//! close_to_tray = false
 //!
 //! [dictionary.main]
 //! name = メイン
@@ -82,7 +82,7 @@ impl Config {
     pub fn default_for(base: &Path) -> Config {
         Config {
             hotkey: parse_hotkey("Ctrl+Alt+D"),
-            close_to_tray: true,
+            close_to_tray: false,
             sort: Sort::Word,
             dicts: vec![DictConf { name: "メイン".into(), path: base.join("dictionary.db"), readonly: false }],
         }
@@ -96,8 +96,8 @@ pub fn default_ini() -> String {
 [general]\r\n\
 ; 呼び出しホットキー。修飾キー(Ctrl / Alt / Shift / Win)を1つ以上 + キー(A-Z, 0-9, F1-F24, Space)。none で無効。\r\n\
 hotkey = Ctrl+Alt+D\r\n\
-; 閉じるボタンで終了せずトレイに隠す(false なら閉じると終了)\r\n\
-close_to_tray = true\r\n\
+; 閉じるボタン / Esc で終了せず、トレイに隠して常駐する(既定は false = 閉じると終了)\r\n\
+close_to_tray = false\r\n\
 \r\n\
 ; 辞書の定義。[dictionary.任意のID] を必要なだけ書きます。先頭が既定の登録先です。\r\n\
 ; path は相対パスなら、この設定ファイルのあるフォルダ基準。%APPDATA% などの環境変数も使えます。\r\n\
@@ -366,7 +366,7 @@ mod tests {
         let (cfg, warns) = parse(&default_ini(), base, &env);
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(cfg.hotkey.as_ref().unwrap().text, "Ctrl+Alt+D");
-        assert!(cfg.close_to_tray);
+        assert!(!cfg.close_to_tray); // 既定では、閉じるボタンで終了する
         assert_eq!(cfg.dicts.len(), 1);
         assert_eq!(cfg.dicts[0].name, "メイン");
         assert_eq!(cfg.dicts[0].path, base.join("dictionary.db"));
@@ -395,7 +395,7 @@ mod tests {
         let base = Path::new("/base");
         let cfg = Config {
             hotkey: parse_hotkey("Ctrl+Shift+F5"),
-            close_to_tray: false,
+            close_to_tray: true,
             sort: Sort::UpdatedDesc,
             dicts: vec![
                 DictConf { name: "メイン".into(), path: base.join("dictionary.db"), readonly: false },
@@ -405,7 +405,7 @@ mod tests {
         let (back, warns) = parse(&to_ini(&cfg, base), base, &env);
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(back.hotkey, cfg.hotkey);
-        assert!(!back.close_to_tray);
+        assert!(back.close_to_tray);
         assert_eq!(back.sort, Sort::UpdatedDesc);
         assert_eq!(back.dicts, cfg.dicts);
         // ホットキー無し

@@ -48,7 +48,6 @@ const ID_OPENLINK: usize = 119;
 const ID_SORT: usize = 121; // 並び順
 const ID_BMVIEW: usize = 122; // しおりだけ表示
 const ID_BM: usize = 123; // しおりを付ける/外す
-const ID_BACK: usize = 124; // リンクで移動する前に戻る
 const HOTKEY_ID: i32 = 1;
 const WM_APP_LOADED: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
@@ -181,8 +180,6 @@ struct State {
     sort: Sort,
     /// しおり表示に入る前の並び順
     prev_sort: Sort,
-    /// リンクで別の語へ移動する前の (検索語, 選択していた語)。Alt+← で戻る
-    history: Vec<(String, Option<(usize, i64)>)>,
 }
 
 fn app_dir() -> PathBuf {
@@ -343,11 +340,6 @@ pub fn run() {
                     }
                 }
             }
-            // Alt+←: リンクで移動する前の語に戻る
-            if msg.message == WM_SYSKEYDOWN && msg.wParam.0 == VK_LEFT.0 as usize && GetActiveWindow() == hwnd {
-                let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_BACK | BN_CLICKED_ << 16), LPARAM(0));
-                continue;
-            }
             if ui::select_all_if_edit(&msg) {
                 continue;
             }
@@ -380,11 +372,12 @@ pub fn add_sample() {
         let base = init.cfg_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
         let path = base.join("sample.db");
         let text = match core::create_sample(&path) {
-            Ok(n) => {
-                let mut msg = if n > 0 {
-                    format!("サンプル辞書を作成しました({n} 語)。")
-                } else {
-                    "サンプル辞書はすでにあります(語は追加していません)。".to_string()
+            Ok((added, updated)) => {
+                let mut msg = match (added, updated) {
+                    (0, 0) => "サンプル辞書は最新です(変更はありません)。".to_string(),
+                    (a, 0) => format!("サンプル辞書に {a} 語を追加しました。"),
+                    (0, u) => format!("サンプル辞書の {u} 語に、読みを追加しました。"),
+                    (a, u) => format!("サンプル辞書に {a} 語を追加し、{u} 語に読みを追加しました。"),
                 };
                 if !cfg.dicts.iter().any(|d| d.path == path) {
                     cfg.dicts.push(config::DictConf { name: "サンプル".into(), path: path.clone(), readonly: false });
@@ -486,7 +479,6 @@ unsafe fn start_load(hwnd: HWND, st: &mut State, keep: bool) {
         st.dict_mask = vec![true; st.dicts.len()];
         update_dict_button(st);
         rebuild_bm_map(st);
-        st.history.clear();
         send(st.list, LVM_SETITEMCOUNT, 0, 0);
         update_detail(st);
         update_status(st);
@@ -649,6 +641,8 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
             // RichEdit の URL 自動検出は、URL の形をしていない表示名のリンク属性を消してしまうので使わない
             send(h, EM_AUTOURLDETECT, 0, 0);
             send(h, EM_SETEVENTMASK, 0, 0x0002_0000 /* ENM_MOUSEEVENTS */);
+            // リンクの上ではマウスカーソルを指のマークにする
+            let _ = SetWindowSubclass(h, Some(rich_subclass), 1, hwnd.0 as usize);
             (h, true)
         }
         None => (create_child(hwnd, w!("EDIT"), 0, rich_style, ID_RICH).unwrap(), false),
@@ -658,7 +652,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
     let btn_del = owner_button(hwnd, ID_DEL, "削除");
     let status = create_child(hwnd, w!("STATIC"), 0, 0x0000000C | 0x80 /* SS_LEFTNOWORDWRAP | SS_NOPREFIX */, ID_STATUS).unwrap();
     let hint = create_child(hwnd, w!("STATIC"), 0, 0x2 | 0x80 /* SS_RIGHT | SS_NOPREFIX */, ID_HINT).unwrap();
-    set_text(hint, "↑↓ 候補    Ctrl+N 新規    F2 編集    Ctrl+D しおり    Alt+← 戻る    Esc 消去/閉じる");
+    set_text(hint, "↑↓ 候補    Ctrl+N 新規    F2 編集    Ctrl+D しおり    Esc 閉じる");
 
     let bm_path = init.cfg_path.with_file_name("bookmarks.tsv");
     let sort = init.cfg.sort;
@@ -714,7 +708,6 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         bm_view: false,
         sort,
         prev_sort: sort,
-        history: Vec::new(),
     };
     apply_fonts(&st);
     update_sort_button(&st);
@@ -1009,6 +1002,14 @@ unsafe fn update_status(st: &State) {
         .collect();
     let text = if !st.loaded {
         "読み込み中…".to_string()
+    } else if st.bm_view {
+        // しおり表示中は、しおりの件数を基準にする
+        let total = st.entries.iter().filter(|e| st.bm_map.contains_key(&(e.dict, e.id))).count();
+        if st.matches.len() == total {
+            format!("しおり {total} 件")
+        } else {
+            format!("{} 件 / しおり {} 件", st.matches.len(), total)
+        }
     } else if st.matches.len() == st.entries.len() {
         format!("全 {} 件", st.entries.len())
     } else {
@@ -1283,14 +1284,8 @@ unsafe fn open_link(hwnd: HWND, st: &mut State, link: &str) {
     }
 }
 
-/// リンクから別の語へ移動する。検索欄をその語にして、完全一致する語を選ぶ。Alt+← で戻れる
+/// リンクから別の語へ移動する。検索欄をその語にして、完全一致する語を選ぶ
 unsafe fn jump_to_word(st: &mut State, word: &str) {
-    let sel = selected_entries(st);
-    let current = if sel.len() == 1 { Some((st.entries[sel[0]].dict, st.entries[sel[0]].id)) } else { None };
-    st.history.push((get_text(st.edit), current));
-    if st.history.len() > 50 {
-        st.history.remove(0);
-    }
     if st.bm_view {
         set_bm_view(st, false);
     }
@@ -1305,21 +1300,9 @@ unsafe fn jump_to_word(st: &mut State, word: &str) {
         Some(r) => {
             select_row(st, Some(r));
             update_detail(st);
-            notice(st, &format!("「{word}」へ移動しました(Alt+← で戻る)"));
+            notice(st, &format!("「{word}」へ移動しました"));
         }
-        None => notice(st, &format!("「{word}」は登録されていません(Ctrl+N で登録できます。Alt+← で戻る)")),
-    }
-}
-
-unsafe fn go_back(st: &mut State) {
-    let Some((text, sel)) = st.history.pop() else {
-        notice(st, "戻る先がありません");
-        return;
-    };
-    set_text(st.edit, &text);
-    refresh(st);
-    if let Some((d, id)) = sel {
-        select_entry(st, d, id);
+        None => notice(st, &format!("「{word}」は登録されていません(Ctrl+N で登録できます)")),
     }
 }
 
@@ -1477,7 +1460,7 @@ unsafe fn list_menu(hwnd: HWND, st: &mut State) {
     let _ = AppendMenuW(menu, gray(single), CM_BOOKMARK, if marked { w!("しおりを外す\tCtrl+D") } else { w!("しおりを付ける\tCtrl+D") });
     let _ = AppendMenuW(menu, gray(single && editable), CM_EDIT, w!("編集…\tF2"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(menu, gray(editable), CM_DELETE, w!("削除…\tDel"));
+    let _ = AppendMenuW(menu, gray(editable), CM_DELETE, w!("削除\tDel"));
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
@@ -1518,6 +1501,22 @@ unsafe fn link_at(st: &State, x: i32, y: i32) -> Option<String> {
         }
     }
     None
+}
+
+/// 本文欄のサブクラス: リンクの上にあるときだけ、カーソルを指のマークにする
+unsafe extern "system" fn rich_subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, parent: usize) -> LRESULT {
+    if msg == WM_SETCURSOR && (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
+        if let Some(st) = state(HWND(parent as *mut c_void)) {
+            let mut pt = POINT::default();
+            let _ = GetCursorPos(&mut pt);
+            let _ = ScreenToClient(hwnd, &mut pt);
+            if link_at(st, pt.x, pt.y).is_some() {
+                SetCursor(LoadCursorW(None, IDC_HAND).unwrap());
+                return LRESULT(1);
+            }
+        }
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
 }
 
 /// 本文欄の右クリックメニュー(コピー / すべて選択 / リンク)
@@ -2046,7 +2045,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 (ID_DEL, BN_CLICKED_) => do_delete(hwnd, st),
                 (ID_SETTINGS, BN_CLICKED_) => do_settings(hwnd, st),
                 (ID_BM, BN_CLICKED_) => toggle_bookmark(st),
-                (ID_BACK, BN_CLICKED_) => go_back(st),
                 (ID_SORT, BN_CLICKED_) => sort_menu(hwnd, st),
                 (ID_BMVIEW, BN_CLICKED_) => {
                     let on = !st.bm_view;
@@ -2064,7 +2062,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 _ => {
                     if id == IDCANCEL.0 as usize {
-                        // Esc: 入力があれば消す。なければウィンドウを隠す
+                        // Esc: 入力があれば消す。なければ閉じるボタンと同じ動作(設定に応じて終了 / トレイに隠す)
                         let has_input = !get_text(st.edit).is_empty() || (st.advanced && [st.qw, st.qm, st.qt].iter().any(|&h| !get_text(h).is_empty()));
                         if has_input {
                             for h in [st.edit, st.qw, st.qm, st.qt] {
@@ -2075,7 +2073,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             }
                             let _ = SetFocus(st.edit);
                         } else {
-                            let _ = ShowWindow(hwnd, SW_HIDE);
+                            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
                         }
                     }
                 }
@@ -2189,7 +2187,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 WM_RBUTTONUP => {
                     if let Ok(menu) = CreatePopupMenu() {
                         let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN, w!("辞書を開く"));
-                        let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("設定…"));
+                        let _ = AppendMenuW(menu, MF_STRING, MENU_SETTINGS, w!("設定"));
                         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
                         let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN_CFG, w!("設定ファイルを開く"));
                         let _ = AppendMenuW(menu, MF_STRING, MENU_RELOAD, w!("設定ファイルを再読み込み"));
@@ -2231,7 +2229,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_CLOSE => {
             // 設定 close_to_tray が true なら隠すだけ(終了はトレイメニュー)
-            let hide = state(hwnd).map_or(true, |st| st.cfg.close_to_tray);
+            let hide = state(hwnd).map_or(false, |st| st.cfg.close_to_tray);
             if hide {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             } else {
