@@ -51,7 +51,7 @@ unsafe fn register_classes() {
                 hCursor: LoadCursorW(None, IDC_ARROW).unwrap(),
                 hbrBackground: CreateSolidBrush(WHITE),
                 lpszClassName: name,
-                hIcon: LoadIconW(None, IDI_APPLICATION).unwrap(),
+                hIcon: ui::app_icon(),
                 ..Default::default()
             };
             RegisterClassExW(&wc);
@@ -689,6 +689,8 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             // ここから下は、画面全体(全般・辞書の両方)の保存/キャンセル。区切り線で分ける
             let footer_line = s(y);
             y += 16;
+            // 左下に、アプリの名前と版
+            label(hwnd, &format!("{} {}", ui::APP_NAME, ui::APP_VERSION), (s(m), s(y + 9), s(220), s(20)), fonts.small, S_MUTED);
             button(hwnd, "保存", ID_OK, (s(m + fw - 2 * BTN_W - 10), s(y), s(BTN_W), s(CTL_H)), true);
             button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
 

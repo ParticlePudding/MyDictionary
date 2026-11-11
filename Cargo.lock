@@ -69,16 +69,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
-name = "fastdict"
-version = "0.1.0"
-dependencies = [
- "embed-resource",
- "rusqlite",
- "serde_json",
- "windows",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -146,6 +136,16 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "mydictionary"
+version = "2.0.0"
+dependencies = [
+ "embed-resource",
+ "rusqlite",
+ "serde_json",
+ "windows",
+]
 
 [[package]]
 name = "once_cell"

@@ -1,4 +1,4 @@
-# MyDictionary(fastdict)
+# MyDictionary
 
 すぐ開いて、すぐ引ける、個人・小さなチーム向けの辞書アプリです(Windows 用)。
 自分で登録した語を、見出し語・読み・意味・タグから、入力したそばから絞り込めます。
@@ -20,29 +20,39 @@
 
 ## はじめかた
 
+### ダウンロードして使う
+[Releases](https://github.com/ParticlePudding/MyDictionary/releases) から `MyDictionary.exe` をダウンロードし、好きな場所に置いて起動します。インストールは要りません。
+
+### 自分でビルドする
 Rust(MSVC 版)を入れた Windows で、次を実行します。
 
 ```
 cargo build --release
 ```
 
-`target\release\fastdict.exe` ができます。好きな場所に置いて起動してください。
+`target\release\MyDictionary.exe` ができます。
 
-サンプルの辞書(約300語と、長い文章の20語)を試すには、次を実行します。
+### サンプルの辞書を試す
+約300語の辞書と、長い文章の20語の辞書が追加されます。
 
 ```
-fastdict.exe --add-sample
+MyDictionary.exe --add-sample
 ```
 
-> **Smart App Control について**: Windows 11 の Smart App Control が有効な PC では、署名のない自作の実行ファイルがブロックされ、ビルドや起動ができないことがあります。
+> **起動がブロックされるとき**: 実行ファイルには署名がありません。Windows の警告が出た場合は「詳細情報」→「実行」で起動できます。
+> Windows 11 の Smart App Control が有効な PC では、起動やビルドがブロックされることがあります。
 > くわしくは [取扱説明書](docs/manual.md#起動できないとき) を参照してください。
 
 ## 構成
 
 ```
 src/       プログラム(Rust)
+assets/    アイコン
 sample/    サンプルデータ(TSV。取り込みの見本にもなります)
 docs/      取扱説明書・仕様書・テストチェックシート
 ```
 
 データは、既定では `%AppData%\fastdict\` に保存されます(辞書 `dictionary.db`、設定 `fastdict.ini`、しおり `bookmarks.tsv`)。
+フォルダ名と設定ファイル名の `fastdict` は開発時の名前で、これまでのデータを引き継ぐために変えていません。
+
+現在の版は **2.00** です。

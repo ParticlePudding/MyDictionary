@@ -1,8 +1,13 @@
 [package]
-name = "fastdict"
-version = "0.1.0"
+name = "mydictionary"
+version = "2.0.0"
 edition = "2021"
-description = "Fast personal dictionary (Win32, windows-rs, SQLite)"
+description = "MyDictionary - fast personal dictionary (Win32, windows-rs, SQLite)"
+
+# 実行ファイル名は MyDictionary.exe
+[[bin]]
+name = "MyDictionary"
+path = "src/main.rs"
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }

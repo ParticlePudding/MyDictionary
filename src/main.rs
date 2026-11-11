@@ -1,4 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
+// 実行ファイル名(= クレート名)を MyDictionary にしているため
+#![allow(non_snake_case)]
 
 mod bench;
 mod bookmarks;
@@ -34,12 +36,12 @@ fn main() {
         #[cfg(not(windows))]
         match args.get(i + 1) {
             Some(p) => println!("{:?}", core::create_sample(std::path::Path::new(p), core::SAMPLE_TSV)),
-            None => eprintln!("usage: fastdict --add-sample <path>"),
+            None => eprintln!("usage: MyDictionary --add-sample <path>"),
         }
         return;
     }
     #[cfg(windows)]
     gui::run();
     #[cfg(not(windows))]
-    eprintln!("fastdict は Windows 専用です(テストは `cargo test`、計測は `--bench` で実行できます)。");
+    eprintln!("MyDictionary は Windows 専用です(テストは `cargo test`、計測は `--bench` で実行できます)。");
 }
