@@ -5,6 +5,7 @@ using System.ComponentModel;
 using System.Data;
 using System.Data.SQLite;
 using System.Drawing;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
@@ -21,6 +22,15 @@ namespace MyDictionary
         public Form1()
         {
             InitializeComponent();
+        }
+
+        private void UpdateLastUpdateLabel()
+        {
+            if (connection == null) return;
+            var last = QueryDB.GetLastUpdate(connection);
+            toolStripStatusLabel1.Text = last.HasValue
+                ? $"最終更新日時: {last.Value:yyyy/MM/dd HH:mm:ss}"
+                : "最終更新日時: なし";
         }
 
         private void ShowCenteredMessage(string message, string title = "")
@@ -50,46 +60,23 @@ namespace MyDictionary
 
         private void Form1_Load(object sender, EventArgs e)
         {   
-            // フォームがロードされたときの処理
-            // データベース接続の初期化
-            string dbPath = "test_dictionary.db";
-            string connectionString = $"Data Source={dbPath};Version=3;";
-            connection = new SQLiteConnection(connectionString);
-            connection.Open();
-
-            // データベースのテーブルを作成
-            if (connection == null)
-            {
-                MessageBox.Show("データベースに接続できません。");
-                return;
-            }
-            QueryDB.CreateTable(connection);
-
-
+            // 設定・DBは %AppData%\MyDictionary に保存する(単一ファイル配布のため)
             try
             {
-                // データベースの最終更新日時を取得
-                string query = "SELECT MAX(lastupdate) FROM dictionary";
-                using (var command = new SQLiteCommand(query, connection))
-                {
-                    var result = command.ExecuteScalar();
-                    if (result != null && result != DBNull.Value)
-                    {
-                        DateTime lastUpdate = Convert.ToDateTime(result);
-                        TimeZoneInfo jstZone = TimeZoneInfo.FindSystemTimeZoneById("Asia/Tokyo");
-                        DateTime jstTime = TimeZoneInfo.ConvertTimeFromUtc(lastUpdate, jstZone);
-                        toolStripStatusLabel1.Text = $"最終更新日時: {jstTime:yyyy/MM/dd HH:mm:ss}";
-                    }
-                    else
-                    {
-                        toolStripStatusLabel1.Text = "最終更新日時: 不明";
-                        MessageBox.Show("データベースの最終更新日時を取得できませんでした。");
-                    }
-                }
+                string dir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MyDictionary");
+                Directory.CreateDirectory(dir);
+                string dbPath = Path.Combine(dir, "dictionary.db");
+                connection = new SQLiteConnection($"Data Source={dbPath};Version=3;");
+                connection.Open();
+                QueryDB.CreateTable(connection);
+                UpdateLastUpdateLabel();
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Error: {ex.Message}");
+                connection?.Dispose();
+                connection = null;
+                MessageBox.Show($"データベースに接続できません。\n{ex.Message}");
             }
 
             // データグリッドビューの初期化
@@ -174,9 +161,7 @@ namespace MyDictionary
             string inputSearchMeaning = txtSearchMeaning.Text;
             string inputSearchTag = txtSearchTag.Text;
 
-            DataTable tableResult = new DataTable("Table");
-
-            tableResult = QueryDB.DisplayData(connection, inputSearchWord, inputSearchMeaning, inputSearchTag, tableResult);
+            DataTable tableResult = QueryDB.DisplayData(connection, inputSearchWord, inputSearchMeaning, inputSearchTag);
             dataGridView1.DataSource = tableResult;
 
             SetDataGridView_Layout(dataGridView1);
@@ -198,26 +183,12 @@ namespace MyDictionary
         /// <summary>
         /// Enterキー入力したとき、検索ボタンを押したときの処理を実行する
         /// </summary>
-        private void txtSearchMeaning_KeyDown(object sender, KeyEventArgs e)
-        {
-            if (e.KeyCode == Keys.Enter)
-            {
-                e.SuppressKeyPress = true; // エンターキーの音を消す
-                btnSearch_Click(sender, e); // 検索ボタンのクリックイベントを呼び出す
-            }
-        }
+        private void txtSearchMeaning_KeyDown(object sender, KeyEventArgs e) => txtSearchWord_KeyDown(sender, e);
 
         /// <summary>
         /// Enterキー入力したとき、検索ボタンを押したときの処理を実行する
         /// </summary>
-        private void txtSearchTag_KeyDown(object sender, KeyEventArgs e)
-        {
-            if (e.KeyCode == Keys.Enter)
-            {
-                e.SuppressKeyPress = true; // エンターキーの音を消す
-                btnSearch_Click(sender, e); // 検索ボタンのクリックイベントを呼び出す
-            }
-        }
+        private void txtSearchTag_KeyDown(object sender, KeyEventArgs e) => txtSearchWord_KeyDown(sender, e);
 
         /// <summary>
         /// DBを新しく作成する
@@ -244,25 +215,25 @@ namespace MyDictionary
                 return;
             }
 
-            string inputWord = txtWord.Text;
-            string inputMeaning = txtMeaning.Text;
-            string inputTag1 = txtTag1.Text;
-            string inputTag2 = txtTag2.Text;
-            string inputTag3 = txtTag3.Text;
+            string inputWord = txtWord.Text.Trim();
+            string inputMeaning = txtMeaning.Text.Trim();
+            string inputTag1 = txtTag1.Text.Trim();
+            string inputTag2 = txtTag2.Text.Trim();
+            string inputTag3 = txtTag3.Text.Trim();
 
             // 入力チェック
-            if (string.IsNullOrEmpty(inputWord) || string.IsNullOrEmpty(inputMeaning))
+            if (string.IsNullOrWhiteSpace(inputWord) || string.IsNullOrWhiteSpace(inputMeaning))
             {
                 string errorMessage = "";
-                if (string.IsNullOrEmpty(inputWord) && string.IsNullOrEmpty(inputMeaning))
+                if (string.IsNullOrWhiteSpace(inputWord) && string.IsNullOrWhiteSpace(inputMeaning))
                 {
                     errorMessage = "語句と意味を入力してください。";
                 }
-                else if (string.IsNullOrEmpty(inputWord))
+                else if (string.IsNullOrWhiteSpace(inputWord))
                 {
                     errorMessage = "語句を入力してください。";
                 }
-                else if (string.IsNullOrEmpty(inputMeaning))
+                else if (string.IsNullOrWhiteSpace(inputMeaning))
                 {
                     errorMessage = "意味を入力してください。";
                 }
@@ -272,8 +243,13 @@ namespace MyDictionary
 
             QueryDB.InsertRecord(connection, inputWord, inputMeaning, inputTag1, inputTag2, inputTag3);
 
+            txtWord.Clear();
+            txtMeaning.Clear();
+            txtTag1.Clear();
+            txtTag2.Clear();
+            txtTag3.Clear();
+            UpdateLastUpdateLabel();
             ShowCenteredMessage("登録が完了しました。", "");
-            return;
         }
 
         /// <summary>
@@ -339,25 +315,34 @@ namespace MyDictionary
                 ShowCenteredMessage("データベースに接続されていません。", "エラー");
                 return;
             }
-            if (dataGridView1.SelectedCells.Count > 0)
+            // 選択されているセルが属する行(重複なし)だけを対象にする
+            var rows = dataGridView1.SelectedCells
+                .Cast<DataGridViewCell>()
+                .Select(c => c.RowIndex)
+                .Where(i => i >= 0 && !dataGridView1.Rows[i].IsNewRow)
+                .Distinct()
+                .OrderByDescending(i => i)
+                .ToList();
+            if (rows.Count == 0) return;
+
+            var confirm = MessageBox.Show(this, $"{rows.Count} 件のレコードを削除します。よろしいですか?", "削除の確認",
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+            if (confirm != DialogResult.Yes) return;
+
+            using (var tx = connection.BeginTransaction())
             {
-
-                int startRowIndex = dataGridView1.SelectedCells[dataGridView1.SelectedCells.Count - 1].RowIndex;
-                int endRowIndex = dataGridView1.SelectedCells[0].RowIndex;
-
-                if (startRowIndex < endRowIndex)
-                {
-                    int tmp = startRowIndex;
-                    startRowIndex = endRowIndex;
-                    endRowIndex = tmp;
-                }
-                for (int i = startRowIndex; i >= endRowIndex; i--)
+                foreach (int i in rows)
                 {
                     selectedRecordId = Convert.ToInt32(dataGridView1.Rows[i].Cells["ID"].Value);
                     QueryDB.DeleteRecord(connection, selectedRecordId);
-                    dataGridView1.Rows.RemoveAt(i);
                 }
+                tx.Commit();
             }
+            foreach (int i in rows)
+            {
+                dataGridView1.Rows.RemoveAt(i);
+            }
+            UpdateLastUpdateLabel();
         }
     }
 }
