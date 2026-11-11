@@ -7,6 +7,9 @@
 
 使い方は [取扱説明書](https://github.com/ParticlePudding/MyDictionary/blob/master/docs/manual.md) を参照してください。
 
+## 2.01 の内容
+- リンクの上にマウスを置くと、画面の左下に開く先を表示するようにしました(クリックする前に、どこへ飛ぶかを確かめられます)。
+
 ## 2.00 の内容
 旧版(.NET / WinForms)から、Rust + Win32 で作り直しました。
 
