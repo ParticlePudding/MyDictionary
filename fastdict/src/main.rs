@@ -2,7 +2,11 @@
 
 mod bench;
 mod config;
+#[cfg(windows)]
+mod dialogs;
 mod core;
+#[cfg(windows)]
+mod ui;
 #[cfg(windows)]
 mod gui;
 
