@@ -7,6 +7,7 @@ mod config;
 mod dialogs;
 mod core;
 mod import;
+mod json_io;
 mod safe;
 #[cfg(windows)]
 mod ui;

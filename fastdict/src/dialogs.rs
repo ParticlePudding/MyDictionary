@@ -1,7 +1,7 @@
 //! モーダルダイアログ: 登録/編集、設定。
 
 use crate::config::{self, Config, DictConf, Hotkey};
-use crate::{import, safe};
+use crate::{core, import, json_io, safe};
 use crate::ui::{self, *};
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -185,6 +185,8 @@ fn white_brush() -> HBRUSH {
 pub struct EntryDlg {
     pub title: String,
     pub word: String,
+    /// 読み(任意)
+    pub reading: String,
     pub tags: String,
     pub meaning: String,
     /// 参照先(URL またはファイル/フォルダのパス)
@@ -203,12 +205,14 @@ const E_COMBO: usize = 304;
 const E_ERR: usize = 305;
 const E_HINT: usize = 306;
 const E_LINK: usize = 307;
+const E_READING: usize = 308;
 
 struct EntryCtl {
     data: *mut EntryDlg,
     fonts: Fonts,
     dpi: i32,
     word: HWND,
+    reading: HWND,
     tags: HWND,
     meaning: HWND,
     link: HWND,
@@ -219,7 +223,7 @@ struct EntryCtl {
 
 fn entry_height(show_choice: bool) -> i32 {
     // 20 + [見出し語] + [タグ] + [辞書] + [意味] + エラー + ボタン
-    20 + 66 + 66 + (22 + 150 + 12) + (22 + 76 + 12) + if show_choice { 62 } else { 0 } + 24 + 36 + 20
+    20 + 66 + 66 + 66 + (22 + 150 + 12) + (22 + 76 + 12) + if show_choice { 62 } else { 0 } + 24 + 36 + 20
 }
 
 /// 登録・編集ダイアログを表示する。保存されたら true(結果は `data` に入る)
@@ -247,6 +251,9 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
 
             label(hwnd, "見出し語", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
             let word = ui::field(hwnd, E_WORD, (s(m), s(y + 22), s(fw), s(CTL_H)), dpi, false, &mut fields, fonts.base);
+            y += 66;
+            label(hwnd, "読み(任意。ひらがな・カタカナなど。読みでも検索でき、見出し語順の並びにも使われます)", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
+            let reading = ui::field(hwnd, E_READING, (s(m), s(y + 22), s(fw), s(CTL_H)), dpi, false, &mut fields, fonts.base);
             y += 66;
             label(hwnd, "タグ(スペースまたはカンマ区切り・任意)", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
             let tags = ui::field(hwnd, E_TAGS, (s(m), s(y + 22), s(fw), s(CTL_H)), dpi, false, &mut fields, fonts.base);
@@ -294,12 +301,13 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
 
             set_text(word, &d.word);
+            set_text(reading, &d.reading);
             set_text(link, &d.link.replace("\r\n", "\n").replace('\n', "\r\n"));
             set_text(tags, &d.tags);
             set_text(meaning, &d.meaning.replace("\r\n", "\n").replace('\n', "\r\n"));
             let _ = SetWindowTextW(hwnd, PCWSTR(wide(&d.title).as_ptr()));
 
-            let c = Box::new(EntryCtl { data, fonts, dpi, word, tags, meaning, link, combo, err, fields });
+            let c = Box::new(EntryCtl { data, fonts, dpi, word, reading, tags, meaning, link, combo, err, fields });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(c) as isize);
             let _ = SetFocus(word);
             send(word, EM_SETSEL, 0, -1);
@@ -338,7 +346,7 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             }
             let c = &mut *ctl;
             match (id, code) {
-                (E_WORD | E_TAGS | E_MEANING | E_LINK, EN_SETFOCUS_ | EN_KILLFOCUS_) => {
+                (E_WORD | E_READING | E_TAGS | E_MEANING | E_LINK, EN_SETFOCUS_ | EN_KILLFOCUS_) => {
                     ui::invalidate_field(hwnd, &c.fields, HWND(lparam.0 as *mut c_void));
                 }
                 (E_WORD | E_TAGS | E_MEANING, EN_CHANGE_) => {
@@ -358,8 +366,9 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         let _ = SetFocus(c.meaning);
                     } else {
                         d.word = word;
+                        d.reading = get_text(c.reading).trim().to_string();
                         d.meaning = meaning;
-                        d.tags = crate::core::normalize_tags(&get_text(c.tags));
+                        d.tags = core::normalize_tags(&get_text(c.tags));
                         d.link = get_text(c.link).replace("\r\n", "\n").lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
                         if d.show_choice {
                             let sel = send(c.combo, CB_GETCURSEL, 0, 0).0;
@@ -419,6 +428,7 @@ const S_PATH: usize = 421;
 const S_BROWSE: usize = 422;
 const S_RO: usize = 423;
 const S_IMPORT: usize = 424;
+const S_EXPORT: usize = 425;
 const S_ERR: usize = 430;
 const S_MUTED: usize = 431;
 
@@ -664,7 +674,8 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             button(hwnd, "参照…", S_BROWSE, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
             y += 46;
             let ro = checkbox(hwnd, "参照のみ(登録・編集・削除をしない)", S_RO, (s(m + 70), s(y + 5), s(fw - 70 - 2 * BTN_W - 24), s(26)), fonts.base, false);
-            button(hwnd, "CSV / TSV を取り込む…", S_IMPORT, (s(m + fw - 2 * BTN_W - 12), s(y), s(2 * BTN_W + 12), s(CTL_H)), true);
+            button(hwnd, "取り込む…", S_IMPORT, (s(m + fw - 2 * BTN_W - 12), s(y), s(BTN_W), s(CTL_H)), true);
+            button(hwnd, "書き出す…", S_EXPORT, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
             y += 46;
 
             let err = label(hwnd, "", (s(m), s(y), s(fw), s(22)), fonts.small, S_ERR);
@@ -817,6 +828,16 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         }
                     }
                 }
+                (S_EXPORT, _) => {
+                    if let Some(r) = c.sel {
+                        let dict = d.cfg.dicts[r].clone();
+                        if dict.path.as_os_str().is_empty() {
+                            set_text(c.err, "先に辞書のパスを指定してください");
+                        } else {
+                            export_dict(hwnd, &dict);
+                        }
+                    }
+                }
                 (S_BROWSE, _) => {
                     if let Some(r) = c.sel {
                         if let Some(p) = pick_db_path(hwnd, &d.cfg.dicts[r].path.to_string_lossy()) {
@@ -891,14 +912,14 @@ unsafe fn msg_box(owner: HWND, text: &str, caption: &str, style: MESSAGEBOX_STYL
 
 unsafe fn pick_import_file(owner: HWND) -> Option<String> {
     let mut buf = [0u16; 1024];
-    let filter: Vec<u16> = "CSV / TSV (*.csv;*.tsv;*.txt)\0*.csv;*.tsv;*.tab;*.txt\0すべてのファイル\0*.*\0\0".encode_utf16().collect();
+    let filter: Vec<u16> = "JSON / CSV / TSV (*.json;*.csv;*.tsv;*.txt)\0*.json;*.csv;*.tsv;*.tab;*.txt\0すべてのファイル\0*.*\0\0".encode_utf16().collect();
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner,
         lpstrFilter: PCWSTR(filter.as_ptr()),
         lpstrFile: PWSTR(buf.as_mut_ptr()),
         nMaxFile: buf.len() as u32,
-        lpstrTitle: w!("取り込む CSV / TSV ファイルを選択"),
+        lpstrTitle: w!("取り込むファイルを選択(JSON / CSV / TSV)"),
         Flags: OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY,
         ..Default::default()
     };
@@ -939,12 +960,24 @@ unsafe fn import_into(owner: HWND, dict: &DictConf, backup_root: &std::path::Pat
         msg_box(owner, "文字コードを判別できません。UTF-8 または Shift_JIS で保存したファイルを指定してください。", "インポート", MB_OK | MB_ICONERROR);
         return false;
     };
-    let delim = import::sniff_delim(&text, &file);
-    let (rows, skipped) = import::to_rows(import::parse_table(&text, delim));
+    // 拡張子が .json、または中身が [ か { で始まっていれば JSON として読む
+    let head = text.trim_start_matches('\u{feff}').trim_start();
+    let is_json = file.to_lowercase().ends_with(".json") || head.starts_with('[') || head.starts_with('{');
+    let (rows, skipped) = if is_json {
+        match json_io::parse(&text) {
+            Ok(r) => r,
+            Err(e) => {
+                msg_box(owner, &format!("取り込めません。\n\n{e}"), "インポート", MB_OK | MB_ICONERROR);
+                return false;
+            }
+        }
+    } else {
+        import::to_rows(import::parse_table(&text, import::sniff_delim(&text, &file)))
+    };
     if rows.is_empty() {
         msg_box(
             owner,
-            "取り込める行がありません。\n\n1行目に「見出し語, 意味, タグ, 参照先」の列名を書くか、列名なしでこの順に並べてください(タグと参照先は省略できます)。",
+            "取り込める語がありません。\n\nCSV / TSV: 1行目に「見出し語, 意味, タグ, 参照先, 読み」の列名を書くか、列名なしでこの順に並べてください(見出し語と意味以外は省略できます)。\nJSON: 「書き出す…」で出力される形式、または word と meaning を持つオブジェクトの配列。",
             "インポート",
             MB_OK | MB_ICONWARNING,
         );
@@ -1141,5 +1174,59 @@ unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// ============================================================================
+// JSON へのエクスポート
+// ============================================================================
+
+unsafe fn pick_export_file(owner: HWND, default_name: &str) -> Option<String> {
+    let mut buf = [0u16; 1024];
+    for (i, ch) in default_name.encode_utf16().take(200).enumerate() {
+        buf[i] = ch;
+    }
+    let filter: Vec<u16> = "JSON (*.json)\0*.json\0すべてのファイル\0*.*\0\0".encode_utf16().collect();
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrDefExt: w!("json"),
+        lpstrTitle: w!("書き出し先を指定"),
+        Flags: OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT,
+        ..Default::default()
+    };
+    if GetSaveFileNameW(&mut ofn).as_bool() {
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        Some(String::from_utf16_lossy(&buf[..len]))
+    } else {
+        None
+    }
+}
+
+/// 辞書の全語を JSON ファイルに書き出す(辞書ファイルの現在の内容を読む)
+unsafe fn export_dict(owner: HWND, dict: &DictConf) {
+    // ファイル名に使えない文字は置き換える
+    let safe_name: String = dict.name.chars().map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c }).collect();
+    let Some(file) = pick_export_file(owner, &format!("{safe_name}.json")) else { return };
+    let old = SetCursor(LoadCursorW(None, IDC_WAIT).unwrap());
+    let loaded = core::open_ro(&dict.path).and_then(|c| core::load_all(&c));
+    let result = match loaded {
+        Ok(mut entries) => {
+            core::sort_entries(&mut entries);
+            std::fs::write(&file, json_io::export(&entries)).map(|_| entries.len()).map_err(|e| e.to_string())
+        }
+        Err(e) => Err(format!("辞書を読み込めません: {e}")),
+    };
+    SetCursor(old);
+    match result {
+        Ok(n) => {
+            msg_box(owner, &format!("辞書「{}」の {n} 語を書き出しました。\n\n{file}\n\nこのファイルは「取り込む…」でそのまま取り込めます。", dict.name), "エクスポート", MB_OK | MB_ICONINFORMATION);
+        }
+        Err(e) => {
+            msg_box(owner, &format!("書き出せませんでした。\n\n{e}"), "エクスポート", MB_OK | MB_ICONERROR);
+        }
     }
 }

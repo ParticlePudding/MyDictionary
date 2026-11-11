@@ -10,6 +10,8 @@ pub struct Entry {
     pub dict: usize,
     pub id: i64,
     pub word: String,
+    /// 読み(ひらがな・カタカナ・ローマ字など)。無ければ空
+    pub reading: String,
     pub meaning: String,
     /// スペース区切りのタグ
     pub tags: String,
@@ -19,6 +21,8 @@ pub struct Entry {
     pub link: String,
     // 検索用の小文字化済み文字列
     word_lc: String,
+    /// 読みを小文字化し、カタカナをひらがなにそろえたもの
+    reading_norm: String,
     meaning_lc: String,
     tags_lc: String,
 }
@@ -28,7 +32,7 @@ impl Entry {
         let (word_lc, meaning_lc) = (word.to_lowercase(), meaning.to_lowercase());
         // タグは「#a #b」の形で持つ。「#a」で検索するとタグの先頭に一致し、「a」ならタグの途中にも一致する
         let tags_lc = hash_tags(&tags.to_lowercase());
-        Entry { dict: 0, id, word, meaning, tags, updated_at, link: String::new(), word_lc, meaning_lc, tags_lc }
+        Entry { dict: 0, id, word, reading: String::new(), meaning, tags, updated_at, link: String::new(), word_lc, reading_norm: String::new(), meaning_lc, tags_lc }
     }
 
     pub fn with_dict(mut self, dict: usize) -> Self {
@@ -40,6 +44,17 @@ impl Entry {
         self.link = link;
         self
     }
+
+    pub fn with_reading(mut self, reading: String) -> Self {
+        self.reading_norm = to_hiragana(&reading.to_lowercase());
+        self.reading = reading;
+        self
+    }
+}
+
+/// カタカナをひらがなにそろえる(読みの検索で、かなの種類を区別しないため)。文字数は変わらない
+pub fn to_hiragana(s: &str) -> String {
+    s.chars().map(|c| if ('\u{30A1}'..='\u{30F6}').contains(&c) { char::from_u32(c as u32 - 0x60).unwrap_or(c) } else { c }).collect()
 }
 
 /// 表示・検索用に、各タグの頭に # を付ける("a b" → "#a #b")
@@ -75,22 +90,25 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
             meaning    TEXT NOT NULL,
             tags       TEXT NOT NULL DEFAULT '',
             updated_at INTEGER NOT NULL,
-            link       TEXT NOT NULL DEFAULT ''
+            link       TEXT NOT NULL DEFAULT '',
+            reading    TEXT NOT NULL DEFAULT ''
          );",
     )?;
     Ok(conn)
 }
 
-/// words テーブルに参照先(link)列があるか。古い版で作った辞書には無い。
-pub fn has_link(conn: &Connection) -> rusqlite::Result<bool> {
-    conn.prepare("SELECT 1 FROM pragma_table_info('words') WHERE name = 'link'")?.exists([])
+/// words テーブルにその列があるか。古い版で作った辞書には、後から増えた列(link, reading)が無い。
+pub fn has_column(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    conn.prepare("SELECT 1 FROM pragma_table_info('words') WHERE name = ?1")?.exists([name])
 }
 
-/// 古い版で作った辞書に、参照先(link)列を追加する。書き込みの直前に呼ぶ。
+/// 古い版で作った辞書に、後から増えた列を追加する。書き込みの直前に呼ぶ。
 /// 列を足すだけなので、古い版のアプリからも引き続き読み書きできる。
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
-    if !has_link(conn)? {
-        conn.execute_batch("ALTER TABLE words ADD COLUMN link TEXT NOT NULL DEFAULT ''")?;
+    for col in ["link", "reading"] {
+        if !has_column(conn, col)? {
+            conn.execute_batch(&format!("ALTER TABLE words ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"))?;
+        }
     }
     Ok(())
 }
@@ -105,18 +123,21 @@ pub fn open_ro(path: &Path) -> rusqlite::Result<Connection> {
 /// 全件を読み込む。並べ替えは呼び出し側(sort_entries)で行う。
 /// 件数が多いときは、検索用の小文字化を複数スレッドで行う。
 pub fn load_all(conn: &Connection) -> rusqlite::Result<Vec<Entry>> {
-    type Raw = (i64, String, String, String, i64, String);
-    // 参照専用で開いた古い辞書には link 列が無いことがある(その場合は空として読む)
-    let sql = if has_link(conn)? {
-        "SELECT id, word, meaning, tags, updated_at, link FROM words"
-    } else {
-        "SELECT id, word, meaning, tags, updated_at, '' FROM words"
+    type Raw = (i64, String, String, String, i64, String, String);
+    // 参照専用で開いた古い辞書には link / reading 列が無いことがある(その場合は空として読む)
+    let col = |name: &str| -> rusqlite::Result<&'static str> {
+        Ok(match (name, has_column(conn, name)?) {
+            ("link", true) => "link",
+            ("reading", true) => "reading",
+            _ => "''",
+        })
     };
-    let mut stmt = conn.prepare(sql)?;
+    let sql = format!("SELECT id, word, meaning, tags, updated_at, {}, {} FROM words", col("link")?, col("reading")?);
+    let mut stmt = conn.prepare(&sql)?;
     let raw: Vec<Raw> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let build = |(id, w, m, t, u, l): Raw| Entry::new(id, w, m, t, u).with_link(l);
+    let build = |(id, w, m, t, u, l, rd): Raw| Entry::new(id, w, m, t, u).with_link(l).with_reading(rd);
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(4);
     if raw.len() < 20_000 || threads < 2 {
         return Ok(raw.into_iter().map(build).collect());
@@ -135,7 +156,7 @@ pub fn load_all(conn: &Connection) -> rusqlite::Result<Vec<Entry>> {
     std::thread::scope(|sc| {
         let handles: Vec<_> = parts
             .into_iter()
-            .map(|p| sc.spawn(move || p.into_iter().map(|r| Entry::new(r.0, r.1, r.2, r.3, r.4).with_link(r.5)).collect::<Vec<_>>()))
+            .map(|p| sc.spawn(move || p.into_iter().map(build).collect::<Vec<_>>()))
             .collect();
         for h in handles {
             out.extend(h.join().expect("load thread"));
@@ -148,24 +169,41 @@ pub fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-pub fn insert(conn: &Connection, word: &str, meaning: &str, tags: &str, link: &str) -> rusqlite::Result<Entry> {
-    let ts = now_unix();
+/// 登録・更新する内容
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Fields {
+    pub word: String,
+    pub reading: String,
+    pub meaning: String,
+    pub tags: String,
+    pub link: String,
+}
+
+/// 登録する。`ts` を渡すと更新日時をその値にする(インポートで元の日時を保つため)
+pub fn insert_entry(conn: &Connection, f: &Fields, ts: Option<i64>) -> rusqlite::Result<Entry> {
+    let ts = ts.unwrap_or_else(now_unix);
     conn.execute(
-        "INSERT INTO words (word, meaning, tags, updated_at, link) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![word, meaning, tags, ts, link],
+        "INSERT INTO words (word, meaning, tags, updated_at, link, reading) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![f.word, f.meaning, f.tags, ts, f.link, f.reading],
     )?;
-    Ok(Entry::new(conn.last_insert_rowid(), word.into(), meaning.into(), tags.into(), ts).with_link(link.into()))
+    Ok(Entry::new(conn.last_insert_rowid(), f.word.clone(), f.meaning.clone(), f.tags.clone(), ts).with_link(f.link.clone()).with_reading(f.reading.clone()))
+}
+
+/// 読み無しで登録する(簡易版)
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn insert(conn: &Connection, word: &str, meaning: &str, tags: &str, link: &str) -> rusqlite::Result<Entry> {
+    insert_entry(conn, &Fields { word: word.into(), meaning: meaning.into(), tags: tags.into(), link: link.into(), ..Default::default() }, None)
 }
 
 /// 既存レコードを更新し、新しい更新時刻(UNIX秒)を返す。
 /// `expected_ts`(読み込んだ時点の更新時刻)と一致しない場合は、他の人が先に変更/削除したとみなして
 /// `QueryReturnedNoRows` を返す(上書きしない)。
-pub fn update(conn: &Connection, id: i64, expected_ts: i64, word: &str, meaning: &str, tags: &str, link: &str) -> rusqlite::Result<i64> {
+pub fn update(conn: &Connection, id: i64, expected_ts: i64, f: &Fields) -> rusqlite::Result<i64> {
     // 同じ秒のうちに再編集しても更新時刻が必ず変わるようにする
     let ts = now_unix().max(expected_ts + 1);
     let n = conn.execute(
-        "UPDATE words SET word = ?1, meaning = ?2, tags = ?3, updated_at = ?4, link = ?7 WHERE id = ?5 AND updated_at = ?6",
-        params![word, meaning, tags, ts, id, expected_ts, link],
+        "UPDATE words SET word = ?1, meaning = ?2, tags = ?3, updated_at = ?4, link = ?7, reading = ?8 WHERE id = ?5 AND updated_at = ?6",
+        params![f.word, f.meaning, f.tags, ts, id, expected_ts, f.link, f.reading],
     )?;
     if n == 0 {
         return Err(rusqlite::Error::QueryReturnedNoRows);
@@ -182,9 +220,13 @@ pub fn delete_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<usize> {
     Ok(n)
 }
 
-/// 見出し語(大文字小文字無視)→ id 順に並べる(load_all と同じ順序)
+/// 見出し語順に並べる
 pub fn sort_entries(entries: &mut [Entry]) {
-    entries.sort_unstable_by(|a, b| a.word_lc.cmp(&b.word_lc).then(a.dict.cmp(&b.dict)).then(a.id.cmp(&b.id)));
+    // 読みがあれば読みの順(五十音順)。無ければ見出し語そのもの
+    fn key(e: &Entry) -> (&str, &str) {
+        (if e.reading_norm.is_empty() { &e.word_lc } else { &e.reading_norm }, &e.word_lc)
+    }
+    entries.sort_unstable_by(|a, b| key(a).cmp(&key(b)).then(a.dict.cmp(&b.dict)).then(a.id.cmp(&b.id)));
 }
 
 fn split_tags(input: &str) -> impl Iterator<Item = &str> {
@@ -325,8 +367,15 @@ pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Ve
     }
 
     // 順位付けの基準: 見出し語欄があればその先頭の語、なければ全体検索の先頭の語
+    // 読みとの照合用: 検索語のカタカナをひらがなにそろえたもの(all_t / word_t と同じ並び)
+    let (all_h, word_h) = (to_hiragana(&all_l), to_hiragana(&word_l));
+    let all_r: Vec<Term> = all_h.split_whitespace().filter(|t| is_term(t)).map(Term::new).collect();
+    let word_r: Vec<Term> = word_h.split_whitespace().filter(|t| is_term(t)).map(Term::new).collect();
     let first: Option<&Term> = word_t.first().or(all_t.first());
+    let first_r: Option<&Term> = word_r.first().or(all_r.first());
     let key: String = if !word_t.is_empty() { word_l.split_whitespace().collect::<Vec<_>>().join(" ") } else { all_l.split_whitespace().collect::<Vec<_>>().join(" ") };
+
+    let key_h = to_hiragana(&key);
 
     let mut hits: Vec<(u8, u32)> = Vec::new();
     let all_idx: Vec<u32>;
@@ -342,32 +391,34 @@ pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Ve
         if !dict_ok(e) {
             continue;
         }
-        let ok = all_t.iter().all(|t| t.matches_any(e))
-            && word_t.iter().all(|t| t.matches_whole(&e.word_lc))
+        // 全体検索と見出し語欄は、読みにも当てる
+        let ok = all_t.iter().zip(&all_r).all(|(t, r)| t.matches_any(e) || r.matches_whole(&e.reading_norm))
+            && word_t.iter().zip(&word_r).all(|(t, r)| t.matches_whole(&e.word_lc) || r.matches_whole(&e.reading_norm))
             && meaning_t.iter().all(|t| t.matches_within(&e.meaning_lc))
             && tag_t.iter().all(|t| t.matches_tags(&e.tags_lc));
         if ok {
-            // 見出し語の完全一致 > 前方一致(ワイルドカードは見出し語への一致) > 見出し語に含む > その他
-            let rank = match first {
-                None => 3,
-                Some(Term::Plain(f)) => {
-                    if e.word_lc == key {
+            // 見出し語/読みの完全一致 > 前方一致(ワイルドカードは一致) > 含む > その他
+            let rank = match (first, first_r) {
+                (Some(Term::Plain(f)), Some(Term::Plain(fr))) => {
+                    let rd = &e.reading_norm;
+                    if e.word_lc == key || (!rd.is_empty() && *rd == key_h) {
                         0
-                    } else if e.word_lc.starts_with(f) {
+                    } else if e.word_lc.starts_with(f) || rd.starts_with(fr) {
                         1
-                    } else if e.word_lc.contains(f) {
+                    } else if e.word_lc.contains(f) || rd.contains(fr) {
                         2
                     } else {
                         3
                     }
                 }
-                Some(g) => {
-                    if g.matches_whole(&e.word_lc) {
+                (Some(g), Some(gr)) => {
+                    if g.matches_whole(&e.word_lc) || gr.matches_whole(&e.reading_norm) {
                         1
                     } else {
                         3
                     }
                 }
+                _ => 3,
             };
             hits.push((rank, i));
         }
@@ -771,6 +822,33 @@ mod tests {
     }
 
     #[test]
+    fn reading_search_and_order() {
+        let mk = |id, w: &str, r: &str, m: &str| Entry::new(id, w.into(), m.into(), "".into(), 0).with_reading(r.into());
+        let mut e = vec![
+            mk(1, "林檎", "リンゴ", "果物"),
+            mk(2, "一期一会", "いちごいちえ", "一生に一度の出会い"),
+            mk(3, "苺", "いちご", "赤い果物"),
+            mk(4, "apple", "", "りんごのこと"),
+            mk(5, "SQL", "エスキューエル", "問い合わせ言語"),
+        ];
+        // 見出し語順は、読みがあれば読みの順(かなの種類は区別しない)
+        sort_entries(&mut e);
+        assert_eq!(e.iter().map(|x| x.id).collect::<Vec<_>>(), vec![4, 3, 2, 5, 1]); // apple, いちご, いちごいちえ, えすきゅー, りんご
+        let ids = |v: Vec<u32>| v.into_iter().map(|i| e[i as usize].id).collect::<Vec<_>>();
+        // 読みで引ける。ひらがなでもカタカナでも同じ
+        assert_eq!(ids(filter(&e, &q("りんご"))), vec![1, 4]); // 読みの完全一致が先、意味に含む apple が後
+        assert_eq!(ids(filter(&e, &q("リンゴ"))), vec![1]); // 意味の「りんご」は表記どおりなので一致しない
+        assert_eq!(ids(filter(&e, &q("いちご"))), vec![3, 2]); // 完全一致 > 前方一致
+        assert_eq!(ids(filter(&e, &q("えすきゅー"))), vec![5]);
+        // 見出し語欄(絞り込み)も読みに当たる。ワイルドカードも使える
+        assert_eq!(ids(filter(&e, &Query { word: "いち*え".into(), ..Default::default() })), vec![2]);
+        assert_eq!(ids(filter(&e, &Query { word: "りん".into(), ..Default::default() })), vec![1]);
+        // 意味欄は読みを見ない
+        assert!(filter(&e, &Query { meaning: "いちごいちえ".into(), ..Default::default() }).is_empty());
+        assert_eq!(to_hiragana("リンゴ ヴァ ABC 漢字"), "りんご ゔぁ ABC 漢字");
+    }
+
+    #[test]
     fn wildcard_search() {
         let e = vec![
             Entry::new(1, "apple".into(), "りんご。赤い果物".into(), "fruit red".into(), 0),
@@ -888,7 +966,7 @@ mod tests {
         }
         // 参照専用でも読める(link は空)
         let ro = open_ro(&path).unwrap();
-        assert!(!has_link(&ro).unwrap());
+        assert!(!has_column(&ro, "link").unwrap() && !has_column(&ro, "reading").unwrap());
         let v = load_all(&ro).unwrap();
         assert_eq!((v[0].word.as_str(), v[0].link.as_str()), ("old", ""));
         drop(ro);
@@ -909,6 +987,9 @@ mod tests {
         let (rows, skipped) = crate::import::to_rows(crate::import::parse_table(SAMPLE_TSV, '\t'));
         assert_eq!((rows.len(), skipped), (300, 0));
         assert!(rows.iter().all(|r| !r.word.is_empty() && !r.meaning.is_empty() && !r.tags.is_empty()));
+        // 四字熟語とことわざには、すべて読みが付いている
+        assert!(rows.iter().filter(|r| r.tags.contains("四字熟語") || r.tags.contains("ことわざ")).all(|r| !r.reading.is_empty()));
+        assert!(rows.iter().filter(|r| !r.reading.is_empty()).count() >= 150);
         assert!(rows.iter().filter(|r| !r.link.is_empty()).all(|r| link_kind(&r.link) == LinkKind::Web));
         let mut words: Vec<&str> = rows.iter().map(|r| r.word.as_str()).collect();
         words.sort_unstable();
@@ -956,15 +1037,17 @@ mod tests {
         let mut all = load_all(&conn).unwrap();
         sort_entries(&mut all);
         assert_eq!(all.iter().map(|e| e.word.as_str()).collect::<Vec<_>>(), vec!["A", "b"]);
-        let ts = update(&conn, a.id, a.updated_at, "b2", "second!", "t1 t2", "C:\\doc\\a.pdf").unwrap();
+        let f = |w: &str, m: &str, t: &str, l: &str, r: &str| Fields { word: w.into(), meaning: m.into(), tags: t.into(), link: l.into(), reading: r.into() };
+        let ts = update(&conn, a.id, a.updated_at, &f("b2", "second!", "t1 t2", "C:\\doc\\a.pdf", "ビーツー")).unwrap();
         assert!(ts > a.updated_at);
-        assert!(update(&conn, 9999, 0, "x", "y", "", "").is_err());
+        assert!(update(&conn, 9999, 0, &f("x", "y", "", "", "")).is_err());
         // 他の人が先に変更していた(更新時刻が違う)場合は上書きしない
-        assert!(update(&conn, a.id, a.updated_at, "stale", "stale", "", "").is_err());
+        assert!(update(&conn, a.id, a.updated_at, &f("stale", "stale", "", "", "")).is_err());
         let all = load_all(&conn).unwrap();
         let b = all.iter().find(|e| e.id == a.id).unwrap();
         assert_eq!((b.word.as_str(), b.meaning.as_str(), b.tags.as_str()), ("b2", "second!", "t1 t2"));
         assert_eq!(b.link, "C:\\doc\\a.pdf");
+        assert_eq!(b.reading, "ビーツー");
         assert_eq!(delete_ids(&conn, &[a.id, 12345]).unwrap(), 1);
         assert_eq!(load_all(&conn).unwrap().len(), 1);
         let ro = open_ro(&path).unwrap();
