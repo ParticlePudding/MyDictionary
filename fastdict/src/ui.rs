@@ -174,7 +174,7 @@ pub unsafe fn draw_button(dis: &DRAWITEMSTRUCT, kind: Btn, font: HFONT, parent_b
     SetTextColor(hdc, fg);
     let old = SelectObject(hdc, font);
     let mut r = inner;
-    DrawTextW(hdc, &mut text, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(hdc, &mut text, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     SelectObject(hdc, old);
 }
 

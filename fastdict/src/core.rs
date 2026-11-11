@@ -15,7 +15,7 @@ pub struct Entry {
     pub tags: String,
     /// UNIX秒(UTC)
     pub updated_at: i64,
-    /// 参照先(URL またはファイル/フォルダのパス)。無ければ空
+    /// 参照先。1行に1つ。「表示名 | URL」の形式で表示名を付けられる。無ければ空
     pub link: String,
     // 検索用の小文字化済み文字列
     word_lc: String,
@@ -25,7 +25,9 @@ pub struct Entry {
 
 impl Entry {
     pub fn new(id: i64, word: String, meaning: String, tags: String, updated_at: i64) -> Self {
-        let (word_lc, meaning_lc, tags_lc) = (word.to_lowercase(), meaning.to_lowercase(), tags.to_lowercase());
+        let (word_lc, meaning_lc) = (word.to_lowercase(), meaning.to_lowercase());
+        // タグは「#a #b」の形で持つ。「#a」で検索するとタグの先頭に一致し、「a」ならタグの途中にも一致する
+        let tags_lc = hash_tags(&tags.to_lowercase());
         Entry { dict: 0, id, word, meaning, tags, updated_at, link: String::new(), word_lc, meaning_lc, tags_lc }
     }
 
@@ -40,6 +42,11 @@ impl Entry {
     }
 }
 
+/// 表示・検索用に、各タグの頭に # を付ける("a b" → "#a #b")
+pub fn hash_tags(tags: &str) -> String {
+    tags.split(' ').filter(|t| !t.is_empty()).map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ")
+}
+
 /// 検索条件。全体検索(all)は見出し語・意味・タグのどれかに含まれればよい。
 /// word / meaning / tag は列ごとのカスタム検索で、すべてAND。
 #[derive(Clone, Debug, Default)]
@@ -48,8 +55,8 @@ pub struct Query {
     pub word: String,
     pub meaning: String,
     pub tag: String,
-    /// None なら全辞書
-    pub dict: Option<usize>,
+    /// 検索に含める辞書(添字ごとの真偽)。None なら全辞書
+    pub dicts: Option<Vec<bool>>,
 }
 
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -184,11 +191,17 @@ fn split_tags(input: &str) -> impl Iterator<Item = &str> {
     input.split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | '、')).filter(|t| !t.is_empty())
 }
 
+/// 「#」だけの語は検索語として扱わない(入力途中とみなす)
+fn is_term(t: &str) -> bool {
+    !t.trim_start_matches('#').is_empty()
+}
+
 /// タグの区切り(空白・全角空白・カンマ・読点)を単一スペースに正規化し、重複を除く
 pub fn normalize_tags(input: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     for t in split_tags(input) {
-        if !out.contains(&t) {
+        let t = t.trim_start_matches('#'); // 表示時に # を付けるので、入力された # は外す
+        if !t.is_empty() && !out.contains(&t) {
             out.push(t);
         }
     }
@@ -205,7 +218,7 @@ pub fn filter(entries: &[Entry], q: &Query) -> Vec<u32> {
 /// 入力欄に文字を追加していくときに成り立つ。
 pub fn narrows(prev: &Query, new: &Query) -> bool {
     let ext = |p: &str, n: &str| n.to_lowercase().starts_with(&p.to_lowercase());
-    prev.dict == new.dict
+    prev.dicts == new.dicts
         && ext(&prev.all, &new.all)
         && ext(&prev.word, &new.word)
         && ext(&prev.meaning, &new.meaning)
@@ -218,13 +231,13 @@ pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Ve
     let word_l = q.word.to_lowercase();
     let meaning_l = q.meaning.to_lowercase();
     let tag_l = q.tag.to_lowercase();
-    let all_t: Vec<&str> = all_l.split_whitespace().collect();
-    let word_t: Vec<&str> = word_l.split_whitespace().collect();
-    let meaning_t: Vec<&str> = meaning_l.split_whitespace().collect();
-    let tag_t: Vec<&str> = split_tags(&tag_l).collect();
+    let all_t: Vec<&str> = all_l.split_whitespace().filter(|t| is_term(t)).collect();
+    let word_t: Vec<&str> = word_l.split_whitespace().filter(|t| is_term(t)).collect();
+    let meaning_t: Vec<&str> = meaning_l.split_whitespace().filter(|t| is_term(t)).collect();
+    let tag_t: Vec<&str> = split_tags(&tag_l).filter(|t| is_term(t)).collect();
 
     let no_terms = all_t.is_empty() && word_t.is_empty() && meaning_t.is_empty() && tag_t.is_empty();
-    let dict_ok = |e: &Entry| q.dict.map_or(true, |d| e.dict == d);
+    let dict_ok = |e: &Entry| q.dicts.as_ref().map_or(true, |m| m.get(e.dict).copied().unwrap_or(false));
     if no_terms {
         return match candidates {
             Some(c) => c.iter().copied().filter(|&i| dict_ok(&entries[i as usize])).collect(),
@@ -281,14 +294,14 @@ pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Ve
 impl Query {
     /// 強調表示する語(小文字)。(見出し語用, 意味用, タグ用)
     pub fn mark_terms(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
-        let ws = |s: &str| s.to_lowercase().split_whitespace().map(str::to_owned).collect::<Vec<_>>();
+        let ws = |s: &str| s.to_lowercase().split_whitespace().filter(|t| is_term(t)).map(str::to_owned).collect::<Vec<_>>();
         let all = ws(&self.all);
         let mut word = all.clone();
         word.extend(ws(&self.word));
         let mut meaning = all.clone();
         meaning.extend(ws(&self.meaning));
         let mut tag = all;
-        tag.extend(split_tags(&self.tag.to_lowercase()).map(str::to_owned));
+        tag.extend(split_tags(&self.tag.to_lowercase()).filter(|t| is_term(t)).map(str::to_owned));
         (word, meaning, tag)
     }
 }
@@ -337,6 +350,30 @@ pub fn mark_ranges(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
     merged
 }
 
+/// 参照先の欄(1行に1つ)を (表示名, 開く先) の一覧にする。
+/// 「表示名 | URL」または「[表示名](URL)」なら表示名付き。それ以外は行全体が表示名かつ開く先。
+pub fn parse_links(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            if l.starts_with('[') && l.ends_with(')') {
+                if let Some((t, u)) = l[1..l.len() - 1].split_once("](") {
+                    if !t.trim().is_empty() && !u.trim().is_empty() {
+                        return (t.trim().to_string(), u.trim().to_string());
+                    }
+                }
+            }
+            if let Some((t, u)) = l.split_once('|') {
+                if !t.trim().is_empty() && !u.trim().is_empty() {
+                    return (t.trim().to_string(), u.trim().to_string());
+                }
+            }
+            (l.to_string(), l.to_string())
+        })
+        .collect()
+}
+
 /// 参照先の種類。開く前の確認の強さを決める。
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum LinkKind {
@@ -373,18 +410,7 @@ pub fn link_kind(link: &str) -> LinkKind {
     }
 }
 
-/// 同梱のサンプルデータ(見出し語<TAB>タグ<TAB>参照先<TAB>意味)を解析する
-pub fn parse_sample(tsv: &str) -> Vec<(String, String, String, String)> {
-    tsv.lines()
-        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
-        .filter_map(|l| {
-            let mut it = l.splitn(4, '\t');
-            let (w, t, k, m) = (it.next()?, it.next()?, it.next()?, it.next()?);
-            Some((w.trim().to_string(), normalize_tags(t), k.trim().to_string(), m.trim().to_string()))
-        })
-        .collect()
-}
-
+/// 同梱のサンプルデータ(インポートできる TSV と同じ形式)
 pub const SAMPLE_TSV: &str = include_str!("../sample/sample.tsv");
 
 /// サンプル辞書を作る(すでに語が入っていれば何もしない)。追加した件数を返す
@@ -395,13 +421,11 @@ pub fn create_sample(path: &Path) -> rusqlite::Result<usize> {
     if existing > 0 {
         return Ok(0);
     }
-    let rows = parse_sample(SAMPLE_TSV);
+    let (rows, _) = crate::import::to_rows(crate::import::parse_table(SAMPLE_TSV, '\t'));
     let tx = conn.transaction()?;
-    for (w, t, k, m) in &rows {
-        insert(&tx, w, m, t, k)?;
-    }
+    let (added, _) = crate::import::insert_rows(&tx, &rows)?;
     tx.commit()?;
-    Ok(rows.len())
+    Ok(added)
 }
 
 /// 表示用: UNIX秒(UTC)を日本時間(UTC+9)の "yyyy/MM/dd HH:mm:ss" にする。
@@ -511,7 +535,7 @@ mod tests {
         }
         assert!(!narrows(&q("apple"), &q("appl"))); // 削除は絞り込みではない
         assert!(!narrows(&q("apple"), &q("apricot")));
-        assert!(!narrows(&Query { dict: Some(0), ..Default::default() }, &Query::default()));
+        assert!(!narrows(&Query { dicts: Some(vec![true]), ..Default::default() }, &Query::default()));
         assert!(narrows(&q("a"), &Query { all: "a".into(), tag: "x".into(), ..Default::default() }));
     }
 
@@ -519,10 +543,13 @@ mod tests {
     fn dict_filter() {
         let mut e = sample();
         e[1] = e[1].clone().with_dict(1);
-        e[2] = e[2].clone().with_dict(1);
-        let r = filter(&e, &Query { dict: Some(1), ..Default::default() });
+        e[2] = e[2].clone().with_dict(2);
+        let r = filter(&e, &Query { dicts: Some(vec![false, true, false]), ..Default::default() });
+        assert_eq!(r, vec![1]);
+        // 複数の辞書を選ぶ
+        let r = filter(&e, &Query { dicts: Some(vec![false, true, true]), ..Default::default() });
         assert_eq!(r, vec![1, 2]);
-        let r = filter(&e, &Query { all: "apple".into(), dict: Some(0), ..Default::default() });
+        let r = filter(&e, &Query { all: "apple".into(), dicts: Some(vec![true, false, false]), ..Default::default() });
         assert_eq!(r, vec![0, 3]);
     }
 
@@ -541,6 +568,47 @@ mod tests {
         assert_eq!(w, t(&["a", "b", "w"]));
         assert_eq!(m, t(&["a", "b"]));
         assert_eq!(tg, t(&["a", "b", "t1", "t2"]));
+    }
+
+    #[test]
+    fn hash_search() {
+        let e = vec![
+            Entry::new(1, "apple".into(), "りんご".into(), "fruit red".into(), 0),
+            Entry::new(2, "grapefruit".into(), "柑橘".into(), "citrus".into(), 0),
+            Entry::new(3, "memo".into(), "#fruit と書いたメモ".into(), "".into(), 0),
+        ];
+        // # 付きはタグの先頭に一致(grapefruit の見出し語には一致しない)。本文に #fruit と書いてあれば一致する
+        assert_eq!(filter(&e, &q("#fruit")), vec![0, 2]);
+        assert_eq!(filter(&e, &q("#fr")), vec![0, 2]);
+        assert_eq!(filter(&e, &q("#ed")), Vec::<u32>::new()); // タグの途中には一致しない
+        assert_eq!(filter(&e, &q("ed")), vec![0]); // # 無しなら途中にも一致
+        // # だけなら検索しない(全件)
+        assert_eq!(filter(&e, &q("#")).len(), 3);
+        assert_eq!(filter(&e, &q("apple #")), vec![0]);
+        // タグ欄でも同じ
+        assert_eq!(filter(&e, &Query { tag: "#cit".into(), ..Default::default() }), vec![1]);
+        assert_eq!(filter(&e, &Query { tag: "#".into(), ..Default::default() }).len(), 3);
+        // 入力途中の「#」→「#f」は絞り込みとして扱える
+        assert!(narrows(&q("#"), &q("#f")));
+        // 強調表示: 表示上の「#fruit #red」の中の位置
+        let (_, _, tg) = q("#fr").mark_terms();
+        assert_eq!(mark_ranges(&hash_tags("fruit red"), &tg), vec![(0, 3)]);
+        assert!(q("#").mark_terms().2.is_empty());
+    }
+
+    #[test]
+    fn links() {
+        let v = parse_links("https://a.example/\n\n 公式サイト | https://b.example/ \n[仕様書](C:\\docs\\spec.pdf)\n| x\n");
+        assert_eq!(
+            v,
+            vec![
+                ("https://a.example/".to_string(), "https://a.example/".to_string()),
+                ("公式サイト".to_string(), "https://b.example/".to_string()),
+                ("仕様書".to_string(), "C:\\docs\\spec.pdf".to_string()),
+                ("| x".to_string(), "| x".to_string()),
+            ]
+        );
+        assert!(parse_links("  \n").is_empty());
     }
 
     #[test]
@@ -591,11 +659,11 @@ mod tests {
 
     #[test]
     fn sample_data() {
-        let rows = parse_sample(SAMPLE_TSV);
-        assert_eq!(rows.len(), 300);
-        assert!(rows.iter().all(|r| !r.0.is_empty() && !r.3.is_empty() && !r.1.is_empty()));
-        assert!(rows.iter().filter(|r| !r.2.is_empty()).all(|r| link_kind(&r.2) == LinkKind::Web));
-        let mut words: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+        let (rows, skipped) = crate::import::to_rows(crate::import::parse_table(SAMPLE_TSV, '\t'));
+        assert_eq!((rows.len(), skipped), (300, 0));
+        assert!(rows.iter().all(|r| !r.word.is_empty() && !r.meaning.is_empty() && !r.tags.is_empty()));
+        assert!(rows.iter().filter(|r| !r.link.is_empty()).all(|r| link_kind(&r.link) == LinkKind::Web));
+        let mut words: Vec<&str> = rows.iter().map(|r| r.word.as_str()).collect();
         words.sort_unstable();
         words.dedup();
         assert_eq!(words.len(), 300); // 見出し語の重複なし
@@ -620,6 +688,7 @@ mod tests {
     fn tags_normalize_and_sort() {
         assert_eq!(normalize_tags("  a　b\tb  c "), "a b c");
         assert_eq!(normalize_tags("x,y、z，x"), "x y z");
+        assert_eq!(normalize_tags("#a ##b # c"), "a b c"); // 入力された # は外す
         assert_eq!(normalize_tags(""), "");
         let mut e = vec![
             Entry::new(2, "b".into(), "".into(), "".into(), 5),
