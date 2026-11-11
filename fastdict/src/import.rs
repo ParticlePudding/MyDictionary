@@ -1,7 +1,7 @@
 //! CSV / TSV のインポート(画面に依存しない部分)。
 //!
-//! - 1行目が見出し行なら、列名で対応づける(見出し語 / 意味 / タグ / 参照先。英語名も可、順不同)
-//! - 見出し行が無ければ、左から 見出し語, 意味, タグ, 参照先 の順とみなす
+//! - 1行目が見出し行なら、列名で対応づける(見出し語 / 読み / 意味 / タグ / 参照先。英語名も可、順不同)
+//! - 見出し行が無ければ、左から 見出し語, 意味, タグ, 参照先, 読み の順とみなす
 //! - 値は "..." で囲める(区切り文字・改行・"" を含められる。Excel の出力と同じ)
 //! - TSV で改行を表したいときは `\n` と書ける
 
@@ -15,6 +15,9 @@ pub struct Row {
     pub meaning: String,
     pub tags: String,
     pub link: String,
+    pub reading: String,
+    /// 更新日時(UNIX秒)。None なら取り込んだ時刻
+    pub updated_at: Option<i64>,
 }
 
 /// UTF-8(BOM 有無どちらも)または UTF-16(BOM 付き)として読む。どちらでもなければ None
@@ -102,11 +105,12 @@ pub fn parse_table(text: &str, delim: char) -> Vec<Vec<String>> {
 
 fn header_kind(name: &str) -> Option<usize> {
     let n = name.trim().trim_start_matches('\u{feff}').to_lowercase();
-    const NAMES: [&[&str]; 4] = [
+    const NAMES: [&[&str]; 5] = [
         &["見出し語", "見出し", "単語", "語", "word", "term", "headword"],
         &["意味", "説明", "meaning", "definition", "description"],
         &["タグ", "tag", "tags"],
         &["参照先", "リンク", "link", "links", "url"],
+        &["読み", "よみ", "読み方", "ふりがな", "reading", "yomi", "kana"],
     ];
     NAMES.iter().position(|set| set.contains(&n.as_str()))
 }
@@ -114,12 +118,12 @@ fn header_kind(name: &str) -> Option<usize> {
 /// 表を登録用の行に変換する。戻り値は (行, 見出し語か意味が空で読み飛ばした件数)
 pub fn to_rows(table: Vec<Vec<String>>) -> (Vec<Row>, usize) {
     let mut it = table.into_iter().peekable();
-    // 列の対応: [見出し語, 意味, タグ, 参照先] がそれぞれ何列目か
-    let mut cols: [Option<usize>; 4] = [Some(0), Some(1), Some(2), Some(3)];
+    // 列の対応: [見出し語, 意味, タグ, 参照先, 読み] がそれぞれ何列目か
+    let mut cols: [Option<usize>; 5] = [Some(0), Some(1), Some(2), Some(3), Some(4)];
     if let Some(first) = it.peek() {
         let kinds: Vec<Option<usize>> = first.iter().map(|c| header_kind(c)).collect();
         if kinds.contains(&Some(0)) && kinds.contains(&Some(1)) {
-            cols = [None; 4];
+            cols = [None; 5];
             for (i, k) in kinds.iter().enumerate() {
                 if let Some(k) = k {
                     cols[*k].get_or_insert(i);
@@ -133,7 +137,7 @@ pub fn to_rows(table: Vec<Vec<String>>) -> (Vec<Row>, usize) {
     for r in it {
         let get = |k: usize| cols[k].and_then(|i| r.get(i)).map(|s| s.trim().to_string()).unwrap_or_default();
         let unescape = |s: String| s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\r\n", "\n");
-        let row = Row { word: get(0), meaning: unescape(get(1)), tags: core::normalize_tags(&get(2)), link: unescape(get(3)) };
+        let row = Row { word: get(0), meaning: unescape(get(1)), tags: core::normalize_tags(&get(2)), link: unescape(get(3)), reading: get(4), updated_at: None };
         if row.word.is_empty() || row.meaning.is_empty() {
             skipped += 1;
         } else {
@@ -154,7 +158,8 @@ pub fn insert_rows(conn: &Connection, rows: &[Row]) -> rusqlite::Result<(usize, 
     let (mut added, mut dup) = (0, 0);
     for r in rows {
         if seen.insert((r.word.clone(), r.meaning.clone())) {
-            core::insert(conn, &r.word, &r.meaning, &r.tags, &r.link)?;
+            let f = core::Fields { word: r.word.clone(), reading: r.reading.clone(), meaning: r.meaning.clone(), tags: r.tags.clone(), link: r.link.clone() };
+            core::insert_entry(conn, &f, r.updated_at)?;
             added += 1;
         } else {
             dup += 1;
@@ -175,8 +180,8 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                Row { word: "apple".into(), meaning: "りんご。\n\"赤い\"果物".into(), tags: "fruit red".into(), link: "https://example.com/".into() },
-                Row { word: "banana".into(), meaning: "バナナ".into(), tags: "x".into(), link: "".into() },
+                Row { word: "apple".into(), meaning: "りんご。\n\"赤い\"果物".into(), tags: "fruit red".into(), link: "https://example.com/".into(), reading: "".into(), updated_at: None },
+                Row { word: "banana".into(), meaning: "バナナ".into(), tags: "x".into(), link: "".into(), reading: "".into(), updated_at: None },
             ]
         );
     }
@@ -186,7 +191,10 @@ mod tests {
         let text = "apple\tりんご\\n果物\t#fruit\nbanana\tバナナ\n";
         let (rows, skipped) = to_rows(parse_table(text, '\t'));
         assert_eq!(skipped, 0);
-        assert_eq!(rows[0], Row { word: "apple".into(), meaning: "りんご\n果物".into(), tags: "fruit".into(), link: "".into() });
+        assert_eq!(rows[0], Row { word: "apple".into(), meaning: "りんご\n果物".into(), tags: "fruit".into(), link: "".into(), reading: "".into(), updated_at: None });
+        // 読みの列(列名で指定)
+        let (named, _) = to_rows(parse_table("読み\t見出し語\t意味\nりんご\t林檎\t果物\n", '\t'));
+        assert_eq!((named[0].word.as_str(), named[0].reading.as_str()), ("林檎", "りんご"));
         assert_eq!(rows[1].word, "banana");
         assert_eq!(rows[1].tags, "");
     }

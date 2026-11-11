@@ -6,6 +6,7 @@ description = "Fast personal dictionary (Win32, windows-rs, SQLite)"
 
 [dependencies]
 rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+serde_json = "1"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.58"

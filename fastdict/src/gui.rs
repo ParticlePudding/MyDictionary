@@ -605,7 +605,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
     let mut fields: Vec<(RECT, HWND)> = Vec::new();
 
     let edit = ui::field(hwnd, ID_EDIT, (0, 0, 10, 10), dpi, false, &mut fields, fonts.base);
-    let cue = wide("検索 — 見出し語・意味・タグ(スペースで AND、#タグ、* はワイルドカード)");
+    let cue = wide("検索 — 見出し語・読み・意味・タグ(スペースで AND、#タグ、* はワイルドカード)");
     send(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
     let btn_dict = owner_button(hwnd, ID_DICTS, "辞書: すべて");
     let adv = owner_button(hwnd, ID_ADV, "絞り込み");
@@ -618,7 +618,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         let _ = ShowWindow(h, SW_HIDE);
         h
     };
-    let qw = adv_edit(ID_QW, "見出し語で絞り込み");
+    let qw = adv_edit(ID_QW, "見出し語・読みで絞り込み");
     let qm = adv_edit(ID_QM, "意味で絞り込み");
     let qt = adv_edit(ID_QT, "タグで絞り込み(複数はスペース区切りで AND)");
 
@@ -880,7 +880,22 @@ unsafe fn draw_row(st: &State, hdc: HDC, row: usize) {
     SelectObject(hdc, st.fonts.heading);
     let r1 = RECT { left: x0, top: y1, right: x1 - tags_w - star_w - if tags_w > 0 { s(10) } else { 0 }, bottom: y2 };
     ui::draw_marked(hdc, &e.word, &core::mark_ranges(&e.word, &st.marks.0), &r1, ui::TEXT, ui::MARK);
+    // 見出し語の右に、読みを小さく添える(かなの種類を区別せずに強調)
+    if !e.reading.is_empty() {
+        let word_w = ui::text_width(hdc, &e.word);
+        SelectObject(hdc, st.fonts.small);
+        let rr = RECT { left: r1.left + word_w + s(10), top: y1 + s(3), right: r1.right, bottom: y2 };
+        if rr.right - rr.left > s(24) {
+            ui::draw_marked(hdc, &e.reading, &reading_marks(&e.reading, &st.marks.0), &rr, ui::MUTED, ui::MARK);
+        }
+    }
     SelectObject(hdc, old);
+}
+
+/// 読みの中の強調範囲。検索語も読みも、ひらがなにそろえてから照合する
+fn reading_marks(reading: &str, word_terms: &[String]) -> Vec<(usize, usize)> {
+    let terms: Vec<String> = word_terms.iter().map(|t| core::to_hiragana(t)).collect();
+    core::mark_ranges(&core::to_hiragana(reading), &terms)
 }
 
 // ---- 表示更新 -------------------------------------------------------------
@@ -1067,6 +1082,7 @@ unsafe fn rich_link(rich: HWND, range: (usize, usize)) {
 unsafe fn render(
     st: &State,
     title: &str,
+    reading: &str,
     meta: &str,
     body: &str,
     body_links: &[(usize, usize, String)],
@@ -1082,6 +1098,11 @@ unsafe fn render(
         (a, a + len16(s))
     };
     let r_title = push(&mut text, title);
+    let mut r_reading = (0, 0);
+    if !reading.is_empty() {
+        push(&mut text, "\n");
+        r_reading = push(&mut text, reading);
+    }
     let mut r_meta = (0, 0);
     if !meta.is_empty() {
         push(&mut text, "\n");
@@ -1121,6 +1142,10 @@ unsafe fn render(
     send(st.rich, WM_SETREDRAW, 0, 0);
     set_text(st.rich, &text.replace('\n', "\r\n"));
     rich_format(st.rich, r_title, Some(20), true, ui::TEXT);
+    rich_format(st.rich, r_reading, Some(11), false, ui::MUTED);
+    for (a, b) in reading_marks(reading, &st.marks.0) {
+        rich_format(st.rich, (r_reading.0 + a, r_reading.0 + b), None, false, ui::MARK);
+    }
     rich_format(st.rich, r_meta, Some(9), false, ui::MUTED);
     rich_format(st.rich, r_gap, Some(6), false, ui::MUTED); // 見出し部分と意味の間の空行は小さく
     rich_format(st.rich, r_body, Some(12), false, ui::TEXT);
@@ -1174,7 +1199,7 @@ unsafe fn update_detail(st: &State) {
             } else {
                 m
             };
-            render(st, t, m, "", &[], &[], &[], &[], &[]);
+            render(st, t, "", m, "", &[], &[], &[], &[], &[]);
         }
         1 => {
             let e = &st.entries[sel[0]];
@@ -1195,6 +1220,7 @@ unsafe fn update_detail(st: &State) {
             render(
                 st,
                 &e.word,
+                &e.reading,
                 &meta,
                 &body,
                 &body_links,
@@ -1204,7 +1230,7 @@ unsafe fn update_detail(st: &State) {
                 &core::mark_ranges(&body, &st.marks.1),
             );
         }
-        n => render(st, &format!("{n} 件を選択中"), "Delete キーまたは「削除」でまとめて削除できます。", "", &[], &[], &[], &[], &[]),
+        n => render(st, &format!("{n} 件を選択中"), "", "Delete キーまたは「削除」でまとめて削除できます。", "", &[], &[], &[], &[], &[]),
     }
     let marked = sel.len() == 1 && st.bm_map.contains_key(&(st.entries[sel[0]].dict, st.entries[sel[0]].id));
     set_text(st.btn_bm, if marked { "★ しおり" } else { "☆ しおり" });
@@ -1643,6 +1669,7 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
     let mut dlg = EntryDlg {
         title: "新規登録".into(),
         word,
+        reading: String::new(),
         tags: String::new(),
         meaning: String::new(),
         link: String::new(),
@@ -1655,7 +1682,8 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
         return;
     }
     let d = targets[dlg.choice];
-    let (r, stale) = guarded(st, d, |c| core::insert(c, &dlg.word, &dlg.meaning, &dlg.tags, &dlg.link));
+    let fields = core::Fields { word: dlg.word.clone(), reading: dlg.reading.clone(), meaning: dlg.meaning.clone(), tags: dlg.tags.clone(), link: dlg.link.clone() };
+    let (r, stale) = guarded(st, d, |c| core::insert_entry(c, &fields, None));
     match r {
         Ok(entry) => {
             let id = entry.id;
@@ -1687,6 +1715,7 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
     let mut dlg = EntryDlg {
         title: "編集".into(),
         word: e.word.clone(),
+        reading: e.reading.clone(),
         tags: e.tags.clone(),
         meaning: e.meaning.clone(),
         link: e.link.clone(),
@@ -1699,11 +1728,12 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
         return;
     }
     // 読み込んだ時点の更新時刻と一致するときだけ更新する(他の人の変更を上書きしない)
-    let (r, stale) = guarded(st, e.dict, |c| core::update(c, e.id, e.updated_at, &dlg.word, &dlg.meaning, &dlg.tags, &dlg.link));
+    let fields = core::Fields { word: dlg.word.clone(), reading: dlg.reading.clone(), meaning: dlg.meaning.clone(), tags: dlg.tags.clone(), link: dlg.link.clone() };
+    let (r, stale) = guarded(st, e.dict, |c| core::update(c, e.id, e.updated_at, &fields));
     match r {
         Ok(ts) => {
             if let Some(x) = st.entries.iter_mut().find(|x| x.dict == e.dict && x.id == e.id) {
-                *x = Entry::new(e.id, dlg.word.clone(), dlg.meaning.clone(), dlg.tags.clone(), ts).with_dict(e.dict).with_link(dlg.link.clone());
+                *x = Entry::new(e.id, dlg.word.clone(), dlg.meaning.clone(), dlg.tags.clone(), ts).with_dict(e.dict).with_link(dlg.link.clone()).with_reading(dlg.reading.clone());
             }
             core::sort_entries(&mut st.entries);
             after_write(hwnd, st, e.dict, stale, Some((e.dict, e.id)));

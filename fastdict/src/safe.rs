@@ -287,7 +287,7 @@ mod tests {
         write(&db, &root, |c| core::insert(c, "a", "1", "", "")).unwrap();
         let r = write(&db, &root, |c| {
             core::insert(c, "b", "2", "", "")?;
-            core::update(c, 9999, 0, "x", "y", "", "") // 存在しない → 失敗
+            core::update(c, 9999, 0, &core::Fields { word: "x".into(), meaning: "y".into(), ..Default::default() }) // 存在しない → 失敗
         });
         assert!(matches!(r, Err(WriteError::Conflict)));
         assert_eq!(words(&db), vec!["a"]); // b も入っていない(1トランザクション)
