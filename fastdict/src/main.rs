@@ -5,6 +5,7 @@ mod config;
 #[cfg(windows)]
 mod dialogs;
 mod core;
+mod import;
 mod safe;
 #[cfg(windows)]
 mod ui;

@@ -103,6 +103,7 @@ pub fn run(n: usize) -> String {
         ("見出し語のみ \"kaki\"", Query { word: "kaki".into(), ..Default::default() }),
         ("意味のみ \"概念 歴史\"", Query { meaning: "概念 歴史".into(), ..Default::default() }),
         ("タグのみ \"IT 医療\"", Query { tag: "IT 医療".into(), ..Default::default() }),
+        ("タグ先頭 \"#it\"", Query { all: "#it".into(), ..Default::default() }),
         ("ヒット無し \"zzzzq\"", Query { all: "zzzzq".into(), ..Default::default() }),
     ];
     line("検索1回あたり(5回平均):".to_string());

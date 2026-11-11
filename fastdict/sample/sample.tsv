@@ -1,4 +1,4 @@
-# fastdict サンプルデータ(見出し語<TAB>タグ<TAB>参照先<TAB>意味)。`fastdict.exe --add-sample` で「サンプル」辞書として追加される。
+見出し語	タグ	参照先	意味
 API	IT 略語		Application Programming Interface。ソフトウェア同士が機能を呼び出すための取り決め。
 SQLite	IT データベース	https://www.sqlite.org/	単一ファイルにデータを保存する、組み込み向けの軽量なリレーショナルデータベース。
 Rust	IT 言語	https://www.rust-lang.org/	メモリ安全性と実行速度の両立を目指したシステムプログラミング言語。

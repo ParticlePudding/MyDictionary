@@ -1,12 +1,14 @@
 //! モーダルダイアログ: 登録/編集、設定。
 
 use crate::config::{self, Config, DictConf, Hotkey};
+use crate::{import, safe};
 use crate::ui::{self, *};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::Once;
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
+use windows::Win32::Globalization::{MultiByteToWideChar, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::Dialogs::*;
@@ -39,6 +41,7 @@ unsafe fn register_classes() {
         for (name, proc) in [
             (w!("FastDictEntry"), entry_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
             (w!("FastDictSettings"), settings_proc),
+            (w!("FastDictSelect"), select_proc),
         ] {
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -213,7 +216,7 @@ struct EntryCtl {
 
 fn entry_height(show_choice: bool) -> i32 {
     // 20 + [見出し語] + [タグ] + [辞書] + [意味] + エラー + ボタン
-    20 + 66 + 66 + (22 + 150 + 12) + 66 + if show_choice { 62 } else { 0 } + 24 + 36 + 20
+    20 + 66 + 66 + (22 + 150 + 12) + (22 + 76 + 12) + if show_choice { 62 } else { 0 } + 24 + 36 + 20
 }
 
 /// 登録・編集ダイアログを表示する。保存されたら true(結果は `data` に入る)
@@ -249,9 +252,9 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             label(hwnd, "意味", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
             let meaning = ui::field(hwnd, E_MEANING, (s(m), s(y + 22), s(fw), s(150)), dpi, true, &mut fields, fonts.base);
             y += 22 + 150 + 12;
-            label(hwnd, "参照先(URL、またはファイル・フォルダのパス。任意)", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
-            let link = ui::field(hwnd, E_LINK, (s(m), s(y + 22), s(fw), s(CTL_H)), dpi, false, &mut fields, fonts.base);
-            y += 66;
+            label(hwnd, "参照先(任意。1行に1つ。「表示名 | URL」と書くと表示名を付けられます)", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
+            let link = ui::field(hwnd, E_LINK, (s(m), s(y + 22), s(fw), s(76)), dpi, true, &mut fields, fonts.base);
+            y += 22 + 76 + 12;
 
             let hinst = GetModuleHandleW(None).unwrap();
             let combo = CreateWindowExW(
@@ -288,7 +291,7 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
 
             set_text(word, &d.word);
-            set_text(link, &d.link);
+            set_text(link, &d.link.replace("\r\n", "\n").replace('\n', "\r\n"));
             set_text(tags, &d.tags);
             set_text(meaning, &d.meaning.replace("\r\n", "\n").replace('\n', "\r\n"));
             let _ = SetWindowTextW(hwnd, PCWSTR(wide(&d.title).as_ptr()));
@@ -354,7 +357,7 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         d.word = word;
                         d.meaning = meaning;
                         d.tags = crate::core::normalize_tags(&get_text(c.tags));
-                        d.link = get_text(c.link).trim().to_string();
+                        d.link = get_text(c.link).replace("\r\n", "\n").lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
                         if d.show_choice {
                             let sel = send(c.combo, CB_GETCURSEL, 0, 0).0;
                             if sel >= 0 {
@@ -394,6 +397,10 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
 
 pub struct SettingsDlg {
     pub cfg: Config,
+    /// 書き込み前バックアップの置き場(インポートで使う)
+    pub backup_root: PathBuf,
+    /// インポートを実行した(キャンセルで閉じても、辞書の読み直しが必要)
+    pub imported: bool,
     pub ok: bool,
 }
 
@@ -408,6 +415,7 @@ const S_NAME: usize = 420;
 const S_PATH: usize = 421;
 const S_BROWSE: usize = 422;
 const S_RO: usize = 423;
+const S_IMPORT: usize = 424;
 const S_ERR: usize = 430;
 const S_MUTED: usize = 431;
 
@@ -460,7 +468,7 @@ fn from_hk_ctrl(v: isize) -> (u32, u32) {
 /// 設定ダイアログ。保存されたら true(結果は `data` に入る)
 pub unsafe fn settings_dialog(owner: HWND, data: &mut SettingsDlg) -> bool {
     data.ok = false;
-    run_modal(owner, w!("FastDictSettings"), "設定", 640, 604, data as *mut SettingsDlg as *const c_void);
+    run_modal(owner, w!("FastDictSettings"), "設定", 640, 610, data as *mut SettingsDlg as *const c_void);
     data.ok
 }
 
@@ -627,7 +635,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             send(list, WM_SETFONT, fonts.base.0 as usize, 1);
             send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize);
             let _ = SetWindowTheme(list, w!("Explorer"), PCWSTR::null());
-            for (i, (t, wd)) in [("名前", 120), ("パス", 270), ("参照のみ", 80)].iter().enumerate() {
+            for (i, (t, wd)) in [("名前", 120), ("パス", 250), ("参照のみ", 76)].iter().enumerate() {
                 let mut tt = wide(t);
                 let col = LVCOLUMNW {
                     mask: LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM,
@@ -652,8 +660,9 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             let path = ui::field(hwnd, S_PATH, (s(m + 70), s(y), s(fw - 70 - BTN_W - 12), s(CTL_H)), dpi, false, &mut fields, fonts.base);
             button(hwnd, "参照…", S_BROWSE, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
             y += 46;
-            let ro = checkbox(hwnd, "参照のみ(この辞書では登録・編集・削除をしない)", S_RO, (s(m + 70), s(y), s(fw - 70), s(26)), fonts.base, false);
-            y += 40;
+            let ro = checkbox(hwnd, "参照のみ(登録・編集・削除をしない)", S_RO, (s(m + 70), s(y + 5), s(fw - 70 - 2 * BTN_W - 24), s(26)), fonts.base, false);
+            button(hwnd, "CSV / TSV を取り込む…", S_IMPORT, (s(m + fw - 2 * BTN_W - 12), s(y), s(2 * BTN_W + 12), s(CTL_H)), true);
+            y += 46;
 
             let err = label(hwnd, "", (s(m), s(y), s(fw), s(22)), fonts.small, S_ERR);
             y += 26;
@@ -793,6 +802,18 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                         }
                     }
                 }
+                (S_IMPORT, _) => {
+                    if let Some(r) = c.sel {
+                        let dict = d.cfg.dicts[r].clone();
+                        if dict.readonly {
+                            set_text(c.err, "参照のみの辞書には取り込めません");
+                        } else if dict.path.as_os_str().is_empty() {
+                            set_text(c.err, "先に辞書のパスを指定してください");
+                        } else if import_into(hwnd, &dict, &d.backup_root) {
+                            d.imported = true;
+                        }
+                    }
+                }
                 (S_BROWSE, _) => {
                     if let Some(r) = c.sel {
                         if let Some(p) = pick_db_path(hwnd, &d.cfg.dicts[r].path.to_string_lossy()) {
@@ -834,6 +855,270 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     let _ = DestroyWindow(hwnd);
                 }
                 (ID_CANCEL, _) => {
+                    let _ = DestroyWindow(hwnd);
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            if !ctl.is_null() {
+                let c = Box::from_raw(ctl);
+                c.fonts.destroy();
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// ============================================================================
+// CSV / TSV のインポート
+// ============================================================================
+
+unsafe fn msg_box(owner: HWND, text: &str, caption: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
+    let (t, c) = (wide(text), wide(caption));
+    MessageBoxW(owner, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), style)
+}
+
+unsafe fn pick_import_file(owner: HWND) -> Option<String> {
+    let mut buf = [0u16; 1024];
+    let filter: Vec<u16> = "CSV / TSV (*.csv;*.tsv;*.txt)\0*.csv;*.tsv;*.tab;*.txt\0すべてのファイル\0*.*\0\0".encode_utf16().collect();
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: owner,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrTitle: w!("取り込む CSV / TSV ファイルを選択"),
+        Flags: OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY,
+        ..Default::default()
+    };
+    if GetOpenFileNameW(&mut ofn).as_bool() {
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        Some(String::from_utf16_lossy(&buf[..len]))
+    } else {
+        None
+    }
+}
+
+/// UTF-8 / UTF-16 でなければ、日本語版 Excel の既定である Shift_JIS(CP932)として読む
+unsafe fn decode_text(bytes: &[u8]) -> Option<String> {
+    if let Some(s) = import::decode_unicode(bytes) {
+        return Some(s);
+    }
+    let flags = MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0x8); // MB_ERR_INVALID_CHARS
+    let n = MultiByteToWideChar(932, flags, bytes, None);
+    if n <= 0 {
+        return None;
+    }
+    let mut buf = vec![0u16; n as usize];
+    let n = MultiByteToWideChar(932, flags, bytes, Some(&mut buf));
+    (n > 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
+}
+
+/// ファイルを選び、確認のうえ辞書へ取り込む。取り込んだら true
+unsafe fn import_into(owner: HWND, dict: &DictConf, backup_root: &std::path::Path) -> bool {
+    let Some(file) = pick_import_file(owner) else { return false };
+    let bytes = match std::fs::read(&file) {
+        Ok(b) => b,
+        Err(e) => {
+            msg_box(owner, &format!("ファイルを読み込めません: {e}"), "インポート", MB_OK | MB_ICONERROR);
+            return false;
+        }
+    };
+    let Some(text) = decode_text(&bytes) else {
+        msg_box(owner, "文字コードを判別できません。UTF-8 または Shift_JIS で保存したファイルを指定してください。", "インポート", MB_OK | MB_ICONERROR);
+        return false;
+    };
+    let delim = import::sniff_delim(&text, &file);
+    let (rows, skipped) = import::to_rows(import::parse_table(&text, delim));
+    if rows.is_empty() {
+        msg_box(
+            owner,
+            "取り込める行がありません。\n\n1行目に「見出し語, 意味, タグ, 参照先」の列名を書くか、列名なしでこの順に並べてください(タグと参照先は省略できます)。",
+            "インポート",
+            MB_OK | MB_ICONWARNING,
+        );
+        return false;
+    }
+    let mut preview = String::new();
+    for r in rows.iter().take(3) {
+        let m: String = r.meaning.chars().take(30).map(|c| if c == '\n' { ' ' } else { c }).collect();
+        preview.push_str(&format!("  ・{} — {}\n", r.word, m));
+    }
+    let skip_note = if skipped > 0 { format!("\n(見出し語か意味が空の {skipped} 行は取り込みません)") } else { String::new() };
+    let ask = format!(
+        "{} 件を、辞書「{}」に取り込みます。{}\n\n{}{}\nすでに同じ見出し語と意味の語がある場合は、重複として飛ばします。\n取り込みますか?",
+        rows.len(),
+        dict.name,
+        skip_note,
+        preview,
+        if rows.len() > 3 { "  …\n" } else { "" }
+    );
+    if msg_box(owner, &ask, "インポート", MB_YESNO | MB_ICONQUESTION) != IDYES {
+        return false;
+    }
+    let old = SetCursor(LoadCursorW(None, IDC_WAIT).unwrap());
+    let r = safe::write(&dict.path, backup_root, |c| import::insert_rows(c, &rows));
+    SetCursor(old);
+    match r {
+        Ok((added, dup)) => {
+            let dup_note = if dup > 0 { format!("\n重複のため飛ばした語: {dup} 件") } else { String::new() };
+            msg_box(owner, &format!("{added} 件を取り込みました。{dup_note}"), "インポート", MB_OK | MB_ICONINFORMATION);
+            true
+        }
+        Err(e) => {
+            msg_box(owner, &format!("取り込めませんでした。辞書は変更されていません。\n\n{e}"), "インポート", MB_OK | MB_ICONERROR);
+            false
+        }
+    }
+}
+
+// ============================================================================
+// 検索に含める辞書の選択
+// ============================================================================
+
+pub struct SelectDlg {
+    pub names: Vec<String>,
+    pub checked: Vec<bool>,
+    pub ok: bool,
+}
+
+const D_LIST: usize = 501;
+const D_ALL: usize = 502;
+const D_NONE: usize = 503;
+const D_ERR: usize = 504;
+const LVM_GETITEMSTATE_: u32 = 0x102C;
+
+struct SelectCtl {
+    data: *mut SelectDlg,
+    fonts: Fonts,
+    dpi: i32,
+    list: HWND,
+    err: HWND,
+}
+
+/// 検索に含める辞書を選ぶ。OK なら true(結果は `data.checked`)
+pub unsafe fn select_dialog(owner: HWND, data: &mut SelectDlg) -> bool {
+    data.ok = false;
+    run_modal(owner, w!("FastDictSelect"), "検索する辞書", 420, 400, data as *mut SelectDlg as *const c_void);
+    data.ok
+}
+
+unsafe fn set_check(list: HWND, i: usize, on: bool) {
+    // 状態イメージ 1 = 未チェック、2 = チェック済み
+    let it = LVITEMW {
+        stateMask: LIST_VIEW_ITEM_STATE_FLAGS(0xF000),
+        state: LIST_VIEW_ITEM_STATE_FLAGS(if on { 0x2000 } else { 0x1000 }),
+        ..Default::default()
+    };
+    send(list, LVM_SETITEMSTATE, i, &it as *const _ as isize);
+}
+
+unsafe fn get_check(list: HWND, i: usize) -> bool {
+    (send(list, LVM_GETITEMSTATE_, i, 0xF000).0 as u32 >> 12) == 2
+}
+
+unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let ctl = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SelectCtl;
+    match msg {
+        WM_CREATE => {
+            let cs = &*(lparam.0 as *const CREATESTRUCTW);
+            let data = cs.lpCreateParams as *mut SelectDlg;
+            let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+            let s = |v: i32| scale(v, dpi);
+            let fonts = Fonts::new(dpi);
+            let d = &*data;
+            let (m, fw) = (20, 420 - 40);
+            let hinst = GetModuleHandleW(None).unwrap();
+            let mut y = 18;
+            label(hwnd, "検索に含める辞書にチェックを入れてください", (s(m), s(y), s(fw), s(22)), fonts.base, 0);
+            y += 30;
+            let list = CreateWindowExW(
+                WS_EX_CLIENTEDGE,
+                w!("SysListView32"),
+                PCWSTR::null(),
+                WINDOW_STYLE(
+                    WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | LVS_REPORT as u32 | LVS_SINGLESEL as u32 | LVS_SHOWSELALWAYS as u32 | LVS_NOCOLUMNHEADER as u32,
+                ),
+                s(m),
+                s(y),
+                s(fw),
+                s(220),
+                hwnd,
+                HMENU(D_LIST as *mut c_void),
+                hinst,
+                None,
+            )
+            .unwrap();
+            send(list, WM_SETFONT, fonts.base.0 as usize, 1);
+            send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize);
+            let _ = SetWindowTheme(list, w!("Explorer"), PCWSTR::null());
+            let col = LVCOLUMNW { mask: LVCF_WIDTH, cx: s(fw - 30), ..Default::default() };
+            send(list, LVM_INSERTCOLUMNW, 0, &col as *const _ as isize);
+            for (i, name) in d.names.iter().enumerate() {
+                let mut t = wide(name);
+                let item = LVITEMW { mask: LVIF_TEXT, iItem: i as i32, pszText: PWSTR(t.as_mut_ptr()), ..Default::default() };
+                send(list, LVM_INSERTITEMW, 0, &item as *const _ as isize);
+                set_check(list, i, d.checked.get(i).copied().unwrap_or(true));
+            }
+            y += 230;
+            button(hwnd, "すべて選択", D_ALL, (s(m), s(y), s(BTN_W), s(CTL_H)), true);
+            button(hwnd, "すべて解除", D_NONE, (s(m + BTN_W + 10), s(y), s(BTN_W), s(CTL_H)), true);
+            y += 44;
+            let err = label(hwnd, "", (s(m), s(y), s(fw), s(20)), fonts.small, D_ERR);
+            y += 24;
+            button(hwnd, "OK", ID_OK, (s(m + fw - 2 * BTN_W - 10), s(y), s(BTN_W), s(CTL_H)), true);
+            button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
+
+            let c = Box::new(SelectCtl { data, fonts, dpi, list, err });
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(c) as isize);
+            let _ = SetFocus(list);
+            LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+            let hdc = HDC(wparam.0 as *mut c_void);
+            let color = if GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize == D_ERR { DANGER } else { TEXT };
+            ui::ctl_color(hdc, color, WHITE, white_brush())
+        }
+        WM_DRAWITEM => {
+            let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
+            if !ctl.is_null() {
+                let kind = if dis.CtlID as usize == ID_OK { Btn::Primary } else { Btn::Secondary };
+                ui::draw_button(dis, kind, (*ctl).fonts.base, WHITE, (*ctl).dpi);
+            }
+            LRESULT(1)
+        }
+        WM_COMMAND => {
+            if ctl.is_null() {
+                return LRESULT(0);
+            }
+            let c = &mut *ctl;
+            let d = &mut *c.data;
+            match wparam.0 & 0xFFFF {
+                D_ALL | D_NONE => {
+                    for i in 0..d.names.len() {
+                        set_check(c.list, i, wparam.0 & 0xFFFF == D_ALL);
+                    }
+                    set_text(c.err, "");
+                }
+                ID_OK => {
+                    let checked: Vec<bool> = (0..d.names.len()).map(|i| get_check(c.list, i)).collect();
+                    if checked.iter().any(|&b| b) {
+                        d.checked = checked;
+                        d.ok = true;
+                        let _ = DestroyWindow(hwnd);
+                    } else {
+                        set_text(c.err, "辞書を1つ以上選んでください");
+                    }
+                }
+                ID_CANCEL => {
                     let _ = DestroyWindow(hwnd);
                 }
                 _ => {}
