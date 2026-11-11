@@ -1,20 +1,35 @@
-using Microsoft.VisualBasic;
-using System;
-using System.CodeDom;
-using System.ComponentModel.Design;
 using System.Data;
 using System.Data.SQLite;
-using System.Windows.Forms;
-using System.Windows.Input;
 
 class QueryDB
 {
+    private static readonly TimeZoneInfo JstZone = GetJstZone();
+
+    private static TimeZoneInfo GetJstZone()
+    {
+        foreach (var id in new[] { "Tokyo Standard Time", "Asia/Tokyo" })
+        {
+            try { return TimeZoneInfo.FindSystemTimeZoneById(id); }
+            catch (TimeZoneNotFoundException) { }
+            catch (InvalidTimeZoneException) { }
+        }
+        return TimeZoneInfo.Local;
+    }
+
     /// <summary>
-    /// ƒf[ƒ^ƒx[ƒX‚Édictionaryƒe[ƒuƒ‹‚ğì¬‚·‚éƒƒ\ƒbƒh
+    /// UTC(DBä¿å­˜å€¤)ã‚’æ—¥æœ¬æ™‚é–“ã«å¤‰æ›ã™ã‚‹
+    /// </summary>
+    public static DateTime ToJst(object utcValue)
+    {
+        DateTime utc = DateTime.SpecifyKind(Convert.ToDateTime(utcValue), DateTimeKind.Utc);
+        return TimeZoneInfo.ConvertTimeFromUtc(utc, JstZone);
+    }
+
+    /// <summary>
+    /// dictionaryãƒ†ãƒ¼ãƒ–ãƒ«ã‚’ä½œæˆã™ã‚‹
     /// </summary>
     public static void CreateTable(SQLiteConnection connection)
     {
-        // ƒe[ƒuƒ‹ì¬
         string queryCreateTable = @"CREATE TABLE IF NOT EXISTS dictionary (
                                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                                     word TEXT NOT NULL,
@@ -31,88 +46,94 @@ class QueryDB
     }
 
     /// <summary>
-    /// ƒf[ƒ^ƒx[ƒX‚©‚çŒŸõŒ‹‰Ê‚Ìƒe[ƒuƒ‹‚ğæ“¾‚·‚éƒƒ\ƒbƒh
+    /// æ¤œç´¢èªå¥ã‚’GLOBãƒ‘ã‚¿ãƒ¼ãƒ³ã«å¤‰æ›ã™ã‚‹ã€‚
+    /// ç©ºãªã‚‰å…¨ä»¶ã€ãƒ¯ã‚¤ãƒ«ãƒ‰ã‚«ãƒ¼ãƒ‰(* ? [)ã‚’å«ã¾ãªã‘ã‚Œã°éƒ¨åˆ†ä¸€è‡´ã«ã™ã‚‹ã€‚
     /// </summary>
-    public static DataTable DisplayData(SQLiteConnection connection, string searchWord, string searchMeaning, string searchTag, DataTable table)
+    private static string ToGlobPattern(string input)
     {
-        // ŒŸõğŒ‚ª‹ó‚Ìê‡‚Í‘SŒæ“¾
-        if (string.IsNullOrEmpty(searchWord))
-        {
-            searchWord = "*";
-        }
-        if (string.IsNullOrEmpty(searchMeaning))
-        {
-            searchMeaning = "*";
-        }
-        string addSearchTag = "";
-        if (!string.IsNullOrEmpty(searchTag))
-        {
-            addSearchTag ="AND (tag1 = @searchTag OR tag2 = @searchTag OR tag3 = @searchTag)";
-        }
-
-        string selectQuery = $@"SELECT * FROM dictionary WHERE word GLOB @searchWord AND meaning GLOB @searchMeaning {addSearchTag};";
-
-        using (var command = new SQLiteCommand(selectQuery, connection))
-        {
-            command.Parameters.AddWithValue("@searchWord", searchWord);
-            command.Parameters.AddWithValue("@searchMeaning", searchMeaning);
-            if (!string.IsNullOrEmpty(searchTag))
-            {
-                command.Parameters.AddWithValue("@searchTag", searchTag);
-            }
-            using (SQLiteDataAdapter adapter = new SQLiteDataAdapter(command))
-            {
-                adapter.Fill(table);
-
-                // ƒf[ƒ^ƒe[ƒuƒ‹‚ğ®Œ`
-                table.Columns.Add("Tags", typeof(string));
-                foreach (DataRow row in table.Rows)
-                {
-                   
-                    List<string> tags = new List<string>();
-
-                    // NULL’l‚Å‚Í‚È‚¢ƒ^ƒO‚ğW‚ß‚é
-                    var tag1 = row["tag1"] as string;
-                    if (!string.IsNullOrEmpty(tag1))
-                    {
-                        tags.Add(tag1);
-                    }
-                    var tag2 = row["tag2"] as string;
-                    if (!string.IsNullOrEmpty(tag2))
-                    {
-                        tags.Add(tag2);
-                    }
-                    var tag3 = row["tag3"] as string;
-                    if (!string.IsNullOrEmpty(tag3))
-                    {
-                        tags.Add(tag3);
-                    }
-
-                    // ƒ^ƒO‚ğƒJƒ“ƒ}‹æØ‚è‚Ì•¶š—ñ‚Æ‚µ‚ÄŒ‹‡
-                    row["Tags"] = string.Join(", ", tags);
-
-                    // XV‚ğ“ú–{‚É•ÏŠ·
-                    if (row["LastUpdate"] != DBNull.Value)
-                    {
-                        DateTime utcTime = Convert.ToDateTime(row["LastUpdate"]);
-                        TimeZoneInfo jstZone = TimeZoneInfo.FindSystemTimeZoneById("Asia/Tokyo");
-                        DateTime jstTime = TimeZoneInfo.ConvertTimeFromUtc(utcTime, jstZone);
-                        row["LastUpdate"] = jstTime;
-                    }                
-                }
-            }
-        }
-
-        return table;
+        if (string.IsNullOrWhiteSpace(input)) return "*";
+        input = input.Trim();
+        return input.IndexOfAny(new[] { '*', '?', '[' }) >= 0 ? input : $"*{input}*";
     }
 
     /// <summary>
-    /// V‚µ‚¢ƒŒƒR[ƒh‚ğ“o˜^‚·‚éƒƒ\ƒbƒh
+    /// æ¤œç´¢çµæœã®DataTableã‚’è¿”ã™
     /// </summary>
-    /// <param name="connection"> SQLiteConnection </param>
-    /// <param name="word"> “o˜^‚·‚é’PŒê </param>
-    /// <param name="meaning"> ’PŒê‚ÌˆÓ–¡ </param>
-    /// <param name="tag"> ’PŒê‚Ìƒ^ƒOií•Êj </param>
+    public static DataTable DisplayData(SQLiteConnection connection, string searchWord, string searchMeaning, string searchTag)
+    {
+        string addSearchTag = "";
+        bool hasTag = !string.IsNullOrWhiteSpace(searchTag);
+        if (hasTag)
+        {
+            addSearchTag = "AND (tag1 = @searchTag OR tag2 = @searchTag OR tag3 = @searchTag)";
+        }
+
+        string selectQuery = $@"SELECT * FROM dictionary WHERE word GLOB @searchWord AND meaning GLOB @searchMeaning {addSearchTag} ORDER BY id;";
+
+        var table = new DataTable("Table");
+        using (var command = new SQLiteCommand(selectQuery, connection))
+        {
+            command.Parameters.AddWithValue("@searchWord", ToGlobPattern(searchWord));
+            command.Parameters.AddWithValue("@searchMeaning", ToGlobPattern(searchMeaning));
+            if (hasTag)
+            {
+                command.Parameters.AddWithValue("@searchTag", searchTag.Trim());
+            }
+            using (var adapter = new SQLiteDataAdapter(command))
+            {
+                adapter.Fill(table);
+            }
+        }
+
+        // è¡¨ç¤ºç”¨ã®åˆ—ã‚’è¿½åŠ (LastUpdateã¯æ–‡å­—åˆ—åˆ—ã¨ã—ã¦æ—¥æœ¬æ™‚é–“ã§ä¿æŒ)
+        if (!table.Columns.Contains("Tags"))
+        {
+            table.Columns.Add("Tags", typeof(string));
+        }
+        var lastUpdateCol = table.Columns["lastupdate"]!;
+        lastUpdateCol.ColumnName = "LastUpdate";
+        var display = table.Clone();
+        display.Columns["LastUpdate"]!.DataType = typeof(string);
+
+        foreach (DataRow row in table.Rows)
+        {
+            var tags = new List<string>();
+            foreach (var name in new[] { "tag1", "tag2", "tag3" })
+            {
+                var t = row[name] as string;
+                if (!string.IsNullOrEmpty(t)) tags.Add(t);
+            }
+            var newRow = display.NewRow();
+            foreach (DataColumn col in table.Columns)
+            {
+                if (col.ColumnName == "LastUpdate") continue;
+                newRow[col.ColumnName] = row[col];
+            }
+            newRow["Tags"] = string.Join(", ", tags);
+            newRow["LastUpdate"] = row["LastUpdate"] == DBNull.Value
+                ? ""
+                : ToJst(row["LastUpdate"]).ToString("yyyy/MM/dd HH:mm:ss");
+            display.Rows.Add(newRow);
+        }
+        return display;
+    }
+
+    /// <summary>
+    /// æœ€çµ‚æ›´æ–°æ—¥æ™‚(JST)ã‚’å–å¾—ã™ã‚‹ã€‚ãƒ¬ã‚³ãƒ¼ãƒ‰ãŒãªã‘ã‚Œã°null
+    /// </summary>
+    public static DateTime? GetLastUpdate(SQLiteConnection connection)
+    {
+        using (var command = new SQLiteCommand("SELECT MAX(lastupdate) FROM dictionary", connection))
+        {
+            var result = command.ExecuteScalar();
+            if (result == null || result == DBNull.Value) return null;
+            return ToJst(result);
+        }
+    }
+
+    /// <summary>
+    /// æ–°ã—ã„ãƒ¬ã‚³ãƒ¼ãƒ‰ã‚’ç™»éŒ²ã™ã‚‹
+    /// </summary>
     public static void InsertRecord(SQLiteConnection connection, string word, string meaning,
         string tag1, string tag2, string tag3)
     {
@@ -127,26 +148,17 @@ class QueryDB
             command.Parameters.AddWithValue("@tag3", tag3);
             command.ExecuteNonQuery();
         }
-
     }
 
     /// <summary>
-    /// w’è‚µ‚½ID‚ÌƒŒƒR[ƒh‚ğíœ‚·‚éƒƒ\ƒbƒh
+    /// æŒ‡å®šã—ãŸIDã®ãƒ¬ã‚³ãƒ¼ãƒ‰ã‚’å‰Šé™¤ã™ã‚‹
     /// </summary>
-    /// <param name="connection"> SQLiteConnection </param>
-    /// <param name="id"> íœ‚·‚éƒŒƒR[ƒh‚ÌID </param>
     public static void DeleteRecord(SQLiteConnection connection, int id)
     {
-        string queryDelete = @"DELETE FROM dictionary WHERE id = @id;";
-        using (var command = new SQLiteCommand(queryDelete, connection))
+        using (var command = new SQLiteCommand("DELETE FROM dictionary WHERE id = @id;", connection))
         {
             command.Parameters.AddWithValue("@id", id);
             command.ExecuteNonQuery();
         }
     }
 }
-
-
-
-
-
