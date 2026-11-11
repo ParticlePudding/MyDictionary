@@ -169,6 +169,9 @@ struct State {
     /// 破損時の復元を一度たずねた辞書(同じ質問を繰り返さない)
     asked_restore: HashSet<PathBuf>,
 
+    /// マウスが乗っているリンクの開く先(左下に表示する)
+    hover_link: Option<String>,
+
     /// しおり(各自の設定フォルダに保存)
     bookmarks: Bookmarks,
     bm_path: PathBuf,
@@ -667,6 +670,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         cell: Vec::new(),
         pending_select: None,
         asked_restore: HashSet::new(),
+        hover_link: None,
         bookmarks: if init_shared { Bookmarks::default() } else { Bookmarks::load(&bm_path) },
         bm_path,
         bm_map: HashMap::new(),
@@ -967,7 +971,28 @@ unsafe fn refresh(st: &mut State) {
     update_status(st);
 }
 
+/// リンクの開く先を、左下に表示するための文字列にする
+fn link_label(target: &str) -> String {
+    match target.strip_prefix(core::WORD_SCHEME) {
+        Some(word) => format!("リンク先: この辞書の「{}」", word.trim()),
+        None => format!("リンク先: {target}"),
+    }
+}
+
+/// マウスが乗っているリンクが変わったら、左下の表示を切り替える
+unsafe fn set_hover_link(st: &mut State, target: Option<String>) {
+    if st.hover_link != target {
+        st.hover_link = target;
+        update_status(st);
+    }
+}
+
 unsafe fn update_status(st: &State) {
+    // リンクの上にマウスがある間は、開く先を表示する(クリックする前に確かめられるように)
+    if let Some(target) = &st.hover_link {
+        set_text(st.status, &link_label(target));
+        return;
+    }
     let errs: Vec<String> = st
         .dicts
         .iter()
@@ -1503,18 +1528,35 @@ unsafe fn link_at(st: &State, x: i32, y: i32) -> Option<String> {
     None
 }
 
-/// 本文欄のサブクラス: リンクの上にあるときだけ、カーソルを指のマークにする
+/// 本文欄のサブクラス: リンクの上にあるとき、カーソルを指のマークにし、左下に開く先を表示する
 unsafe extern "system" fn rich_subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, parent: usize) -> LRESULT {
-    if msg == WM_SETCURSOR && (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
-        if let Some(st) = state(HWND(parent as *mut c_void)) {
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            let _ = ScreenToClient(hwnd, &mut pt);
-            if link_at(st, pt.x, pt.y).is_some() {
-                SetCursor(LoadCursorW(None, IDC_HAND).unwrap());
-                return LRESULT(1);
+    let st = state(HWND(parent as *mut c_void));
+    match msg {
+        WM_SETCURSOR if (lparam.0 & 0xFFFF) as u32 == HTCLIENT => {
+            if let Some(st) = st {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let _ = ScreenToClient(hwnd, &mut pt);
+                let target = link_at(st, pt.x, pt.y);
+                let on_link = target.is_some();
+                set_hover_link(st, target);
+                if on_link {
+                    SetCursor(LoadCursorW(None, IDC_HAND).unwrap());
+                    return LRESULT(1);
+                }
             }
         }
+        WM_MOUSEMOVE => {
+            // マウスが本文欄から出たことを知るために、WM_MOUSELEAVE を依頼しておく
+            let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: hwnd, dwHoverTime: 0 };
+            let _ = TrackMouseEvent(&mut tme);
+        }
+        0x02A3 /* WM_MOUSELEAVE */ => {
+            if let Some(st) = st {
+                set_hover_link(st, None);
+            }
+        }
+        _ => {}
     }
     DefSubclassProc(hwnd, msg, wparam, lparam)
 }
@@ -2197,6 +2239,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_LINK => {
             let target = *Box::from_raw(lparam.0 as *mut String);
             if let Some(st) = state(hwnd) {
+                st.hover_link = None; // 移動や表示の切替で、リンクの位置が変わる
                 open_link(hwnd, st, &target);
             }
             LRESULT(0)
