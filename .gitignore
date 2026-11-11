@@ -7,3 +7,6 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# データベースファイル
+*.db
