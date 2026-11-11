@@ -506,9 +506,12 @@ cargo test
    - `app.rc` の `FILEVERSION` / `PRODUCTVERSION` と、`FileVersion` / `ProductVersion`
    - `src/ui.rs` の `APP_VERSION`
 2. `docs/release-notes.md` を、その版の内容に書き換える。
-3. 既定のブランチに反映し、`v2.00` のようなタグを付けて push する。
+3. 既定のブランチに反映する。
+4. GitHub の Actions の画面で「release」→「Run workflow」を選び、`tag` に `v2.00` のようなタグ名を入れて実行する
+   (`v2.00` のようなタグを push しても、同じ処理が動く)。
 
-タグが push されると、GitHub Actions(`.github/workflows/release.yml`)が Windows 上でテストとビルドを行い、Release を作って `MyDictionary.exe` を添付します。
+GitHub Actions(`.github/workflows/release.yml`)が Windows 上でテストとビルドを行い、タグと Release を作って `MyDictionary.exe` を添付します。
+`tag` を空にして実行すると、Release は作らず、ビルドした exe を Artifacts に残すだけです(Windows でのビルド確認に使えます)。
 
 ### 計測
 ```
