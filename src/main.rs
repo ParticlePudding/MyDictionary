@@ -33,7 +33,7 @@ fn main() {
         }
         #[cfg(not(windows))]
         match args.get(i + 1) {
-            Some(p) => println!("{:?}", core::create_sample(std::path::Path::new(p))),
+            Some(p) => println!("{:?}", core::create_sample(std::path::Path::new(p), core::SAMPLE_TSV)),
             None => eprintln!("usage: fastdict --add-sample <path>"),
         }
         return;

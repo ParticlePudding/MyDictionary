@@ -387,6 +387,10 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             }
             LRESULT(0)
         }
+        WM_NEXTDLGCTL => {
+            ui::next_dlg_ctl(hwnd, wparam, lparam);
+            LRESULT(0)
+        }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -892,6 +896,10 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             }
             LRESULT(0)
         }
+        WM_NEXTDLGCTL => {
+            ui::next_dlg_ctl(hwnd, wparam, lparam);
+            LRESULT(0)
+        }
         WM_CLOSE => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -1166,6 +1174,10 @@ unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
                 }
                 _ => {}
             }
+            LRESULT(0)
+        }
+        WM_NEXTDLGCTL => {
+            ui::next_dlg_ctl(hwnd, wparam, lparam);
             LRESULT(0)
         }
         WM_CLOSE => {

@@ -363,37 +363,45 @@ pub fn show_report(report: &str) {
     }
 }
 
-/// `--add-sample`: サンプル辞書(約300語)を作り、設定に「サンプル」として追加する。
-/// 普段の辞書とは別ファイルなので、不要になったら設定で外すだけでよい。
+/// `--add-sample`: サンプル辞書を作り、設定に追加する。
+/// 「サンプル」(約300語)と「サンプル2」(長い文章の20語)の2つ。普段の辞書とは別ファイルなので、
+/// 不要になったら設定で外すだけでよい。すでにある場合は、足りない語と読みを補う。
 pub fn add_sample() {
     unsafe {
         let init = load_config();
         let mut cfg = init.cfg;
         let base = init.cfg_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-        let path = base.join("sample.db");
-        let text = match core::create_sample(&path) {
-            Ok((added, updated)) => {
-                let mut msg = match (added, updated) {
-                    (0, 0) => "サンプル辞書は最新です(変更はありません)。".to_string(),
-                    (a, 0) => format!("サンプル辞書に {a} 語を追加しました。"),
-                    (0, u) => format!("サンプル辞書の {u} 語に、読みを追加しました。"),
-                    (a, u) => format!("サンプル辞書に {a} 語を追加し、{u} 語に読みを追加しました。"),
-                };
-                if !cfg.dicts.iter().any(|d| d.path == path) {
-                    cfg.dicts.push(config::DictConf { name: "サンプル".into(), path: path.clone(), readonly: false });
-                    match std::fs::write(&init.cfg_path, config::to_ini(&cfg, &base)) {
-                        Ok(()) => msg.push_str("\n設定に辞書「サンプル」を追加しました。"),
-                        Err(e) => msg.push_str(&format!("\n設定ファイルを更新できませんでした: {e}")),
+        let mut lines: Vec<String> = Vec::new();
+        let mut changed = false;
+        for (name, file, tsv) in [("サンプル", "sample.db", core::SAMPLE_TSV), ("サンプル2", "sample2.db", core::SAMPLE2_TSV)] {
+            let path = base.join(file);
+            match core::create_sample(&path, tsv) {
+                Ok((added, updated)) => {
+                    lines.push(match (added, updated) {
+                        (0, 0) => format!("「{name}」は最新です(変更なし)。"),
+                        (a, 0) => format!("「{name}」に {a} 語を追加しました。"),
+                        (0, u) => format!("「{name}」の {u} 語に読みを追加しました。"),
+                        (a, u) => format!("「{name}」に {a} 語を追加し、{u} 語に読みを追加しました。"),
+                    });
+                    if !cfg.dicts.iter().any(|d| d.path == path) {
+                        cfg.dicts.push(config::DictConf { name: name.into(), path, readonly: false });
+                        changed = true;
                     }
                 }
-                // 起動中なら、すぐ反映させる
-                if let Ok(existing) = FindWindowW(CLASS_NAME, PCWSTR::null()) {
-                    let _ = PostMessageW(existing, WM_APP_RELOAD, WPARAM(0), LPARAM(0));
-                }
-                format!("{msg}\n\n場所: {}\n不要になったら、設定の「辞書」から外してください(ファイルは残ります)。", path.display())
+                Err(e) => lines.push(format!("「{name}」を作成できませんでした: {e}")),
             }
-            Err(e) => format!("サンプル辞書を作成できませんでした: {e}"),
-        };
+        }
+        if changed {
+            match std::fs::write(&init.cfg_path, config::to_ini(&cfg, &base)) {
+                Ok(()) => lines.push("設定に辞書を追加しました。".into()),
+                Err(e) => lines.push(format!("設定ファイルを更新できませんでした: {e}")),
+            }
+        }
+        // 起動中なら、すぐ反映させる
+        if let Ok(existing) = FindWindowW(CLASS_NAME, PCWSTR::null()) {
+            let _ = PostMessageW(existing, WM_APP_RELOAD, WPARAM(0), LPARAM(0));
+        }
+        let text = format!("{}\n\n場所: {}\n不要になったら、設定の「辞書」から外してください(ファイルは残ります)。", lines.join("\n"), base.display());
         let (t, c) = (wide(&text), wide("fastdict サンプルデータ"));
         MessageBoxW(None, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), MB_OK | MB_ICONINFORMATION);
     }
@@ -778,7 +786,7 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
     let h = (bottom - top).max(s(80));
 
     // --- 左: 候補リスト(枠の内側に置く) ---
-    let list_w = (w * 36 / 100).clamp(s(320), s(440));
+    let list_w = s(320); // 候補リストの幅は固定(ウィンドウを広げた分は、本文の側が広がる)
     st.list_box = RECT { left: m, top, right: m + list_w, bottom: top + h };
     let inset = s(2);
     // 枠の上部: しおり表示の切替と並び順
@@ -855,7 +863,9 @@ unsafe fn draw_row(st: &State, hdc: HDC, row: usize) {
     }
 
     // 2行目: 意味の抜粋
-    let snippet: String = e.meaning.chars().take(200).map(|c| if c == '\r' || c == '\n' { ' ' } else { c }).collect();
+    // 先頭の一部だけを使う。本文と同じく [[語]] の括弧は外し、改行は空白にする
+    let head: String = e.meaning.chars().take(240).collect();
+    let snippet: String = core::body_links(&head).0.chars().map(|c| if c == '\r' || c == '\n' { ' ' } else { c }).collect();
     let r2 = RECT { left: x0, top: y2, right: x1 - dict_w - if dict_w > 0 { s(10) } else { 0 }, bottom: rc.bottom };
     ui::draw_marked(hdc, &snippet, &core::mark_ranges(&snippet, &st.marks.1), &r2, ui::MUTED, ui::MARK);
 
@@ -1352,7 +1362,7 @@ fn sort_label(sort: Sort) -> &'static str {
         Sort::Word => "見出し語順",
         Sort::UpdatedAsc => "更新が古い順",
         Sort::UpdatedDesc => "更新が新しい順",
-        Sort::Bookmark => "しおりに追加した順",
+        Sort::Bookmark => "しおり追加順",
     }
 }
 
@@ -1638,6 +1648,8 @@ unsafe fn report_write_error(hwnd: HWND, st: &mut State, d: usize, e: WriteError
 
 /// 書き込み成功後: メモリの内容が古ければ読み直し、そうでなければ変更検知用の印だけ更新する
 unsafe fn after_write(hwnd: HWND, st: &mut State, d: usize, stale: bool, select: Option<(usize, i64)>) {
+    // 語の並び(添字)が変わったので、前回の検索結果は再利用しない
+    st.last_query = None;
     if stale {
         st.pending_select = select;
         start_load(hwnd, st, true);
@@ -1797,6 +1809,7 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
         }
     }
     st.entries.retain(|e| !removed.contains(&(e.dict, e.id)));
+    st.last_query = None; // 添字が変わったので、前回の検索結果は再利用しない
     // 削除した語のしおりも外す
     let mut dropped = 0;
     for (d, ids) in by_dict.iter().enumerate() {
@@ -1892,6 +1905,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_NEXTDLGCTL => {
+            ui::next_dlg_ctl(hwnd, wparam, lparam);
+            LRESULT(0)
+        }
         WM_PAINT => {
             if let Some(st) = state(hwnd) {
                 paint(hwnd, st);
