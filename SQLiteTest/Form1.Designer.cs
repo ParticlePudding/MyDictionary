@@ -1,4 +1,6 @@
-﻿using System.Text;
+﻿using System;
+using System.Drawing;
+using System.Text;
 using System.Windows.Forms;
 
 namespace MyDictionary
@@ -428,11 +430,6 @@ namespace MyDictionary
             tabControlRead.ResumeLayout(false);
             ResumeLayout(false);
             PerformLayout();
-        }
-
-        private void Form1_Load1(object sender, EventArgs e)
-        {
-            throw new NotImplementedException();
         }
 
         #endregion

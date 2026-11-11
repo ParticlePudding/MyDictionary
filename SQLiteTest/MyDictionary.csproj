@@ -26,7 +26,7 @@
 
   <!-- SQLiteのネイティブDLL(x64)を exe にリソースとして埋め込む(Costuraが実行時に読み込む) -->
   <ItemGroup>
-    <EmbeddedResource Include="$(NuGetPackageRoot)system.data.sqlite.core\1.0.119\build\net46\x64\SQLite.Interop.dll"
+    <EmbeddedResource Include="$(NuGetPackageRoot)stub.system.data.sqlite.core.netframework\1.0.119\build\net46\x64\SQLite.Interop.dll"
                       LogicalName="costura64.sqlite.interop.dll"
                       Visible="false" />
   </ItemGroup>
