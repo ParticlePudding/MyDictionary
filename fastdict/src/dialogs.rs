@@ -93,6 +93,9 @@ unsafe fn run_modal(owner: HWND, class: PCWSTR, title: &str, client_w: i32, clie
             let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_OK), LPARAM(0));
             continue;
         }
+        if ui::select_all_if_edit(&msg) {
+            continue;
+        }
         if !IsDialogMessageW(hwnd, &msg).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);

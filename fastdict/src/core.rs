@@ -445,6 +445,74 @@ pub fn mark_ranges(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
     merged
 }
 
+/// 別の語へのリンクを表す開く先の接頭辞(例: `word:apple`)
+pub const WORD_SCHEME: &str = "word:";
+
+/// 意味の文中のリンクを取り出す。
+/// - `[[語]]` は別の語へのリンク(表示は括弧を外した「語」)
+/// - `http://` / `https://` で始まる URL
+/// 戻り値は (表示用の文字列, [(開始, 終了, 開く先)])。位置は表示用の文字列の UTF-16 単位。
+pub fn body_links(text: &str) -> (String, Vec<(usize, usize, String)>) {
+    let mut out = String::new();
+    let mut links = Vec::new();
+    let mut pos16 = 0usize;
+    let mut rest = text;
+    loop {
+        let next_word = rest.find("[[");
+        let next_url = [rest.find("http://"), rest.find("https://")].into_iter().flatten().min();
+        let (at, is_word) = match (next_word, next_url) {
+            (Some(w), Some(u)) => {
+                if w < u {
+                    (w, true)
+                } else {
+                    (u, false)
+                }
+            }
+            (Some(w), None) => (w, true),
+            (None, Some(u)) => (u, false),
+            (None, None) => break,
+        };
+        let before = &rest[..at];
+        out.push_str(before);
+        pos16 += before.encode_utf16().count();
+        let tail = &rest[at..];
+        if is_word {
+            // 同じ行の中で閉じている [[語]] だけをリンクにする
+            let close = tail[2..].find("]]").filter(|&c| c > 0 && !tail[2..2 + c].contains('\n') && !tail[2..2 + c].trim().is_empty());
+            match close {
+                Some(c) => {
+                    let word = tail[2..2 + c].trim();
+                    let n = word.encode_utf16().count();
+                    links.push((pos16, pos16 + n, format!("{WORD_SCHEME}{word}")));
+                    out.push_str(word);
+                    pos16 += n;
+                    rest = &tail[2 + c + 2..];
+                }
+                None => {
+                    out.push_str("[[");
+                    pos16 += 2;
+                    rest = &tail[2..];
+                }
+            }
+        } else {
+            // URL は空白や和文の括弧・句読点の手前まで。末尾の句読点は含めない
+            let end = tail
+                .find(|c: char| c.is_whitespace() || matches!(c, '「' | '」' | '『' | '』' | '（' | '）' | '、' | '。' | '<' | '>' | '"' | '　'))
+                .unwrap_or(tail.len());
+            let url = tail[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '\'']);
+            let n = url.encode_utf16().count();
+            if url.len() > "https://".len() {
+                links.push((pos16, pos16 + n, url.to_string()));
+            }
+            out.push_str(url);
+            pos16 += n;
+            rest = &tail[url.len()..];
+        }
+    }
+    out.push_str(rest);
+    (out, links)
+}
+
 /// 参照先の欄(1行に1つ)を (表示名, 開く先) の一覧にする。
 /// 「表示名 | URL」または「[表示名](URL)」なら表示名付き。それ以外は行全体が表示名かつ開く先。
 pub fn parse_links(text: &str) -> Vec<(String, String)> {
@@ -452,6 +520,12 @@ pub fn parse_links(text: &str) -> Vec<(String, String)> {
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(|l| {
+            // [[語]] は、この辞書の別の語へのリンク
+            if let Some(w) = l.strip_prefix("[[").and_then(|r| r.strip_suffix("]]")) {
+                if !w.trim().is_empty() {
+                    return (w.trim().to_string(), format!("{WORD_SCHEME}{}", w.trim()));
+                }
+            }
             if l.starts_with('[') && l.ends_with(')') {
                 if let Some((t, u)) = l[1..l.len() - 1].split_once("](") {
                     if !t.trim().is_empty() && !u.trim().is_empty() {
@@ -472,6 +546,8 @@ pub fn parse_links(text: &str) -> Vec<(String, String)> {
 /// 参照先の種類。開く前の確認の強さを決める。
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum LinkKind {
+    /// この辞書の別の語(`word:語`)。アプリ内で移動する
+    Word,
     /// http / https の Web ページ。そのまま開く
     Web,
     /// 実行される可能性のあるファイル(.exe / .bat / .lnk など)。強い警告を出す
@@ -482,6 +558,9 @@ pub enum LinkKind {
 
 pub fn link_kind(link: &str) -> LinkKind {
     let l = link.trim().trim_matches('"').to_lowercase();
+    if l.starts_with(WORD_SCHEME) {
+        return LinkKind::Word;
+    }
     if l.starts_with("http://") || l.starts_with("https://") {
         return LinkKind::Web;
     }
@@ -751,6 +830,32 @@ mod tests {
             ]
         );
         assert!(parse_links("  \n").is_empty());
+    }
+
+    #[test]
+    fn word_and_body_links() {
+        assert_eq!(link_kind("word:apple"), LinkKind::Word);
+        assert_eq!(parse_links("[[りんご]]\n類義語 | word:apple"), vec![
+            ("りんご".to_string(), "word:りんご".to_string()),
+            ("類義語".to_string(), "word:apple".to_string()),
+        ]);
+        let (disp, links) = body_links("😀[[apple]] の一種。詳しくは https://example.com/a?b=1。別名[[ pine ]]、[[未完");
+        assert_eq!(disp, "😀apple の一種。詳しくは https://example.com/a?b=1。別名pine、[[未完");
+        assert_eq!(
+            links,
+            vec![
+                (2, 7, "word:apple".to_string()), // 😀 は UTF-16 で2単位
+                (17, 42, "https://example.com/a?b=1".to_string()),
+                (45, 49, "word:pine".to_string()),
+            ]
+        );
+        // リンクが無ければそのまま。末尾の句読点や閉じ括弧は URL に含めない
+        assert_eq!(body_links("plain [text]"), ("plain [text]".to_string(), vec![]));
+        let (d, l) = body_links("(see http://a.example/x).");
+        assert_eq!(d, "(see http://a.example/x).");
+        assert_eq!(l, vec![(5, 23, "http://a.example/x".to_string())]);
+        // 空の [[ ]] や、行をまたぐものはリンクにしない
+        assert_eq!(body_links("[[]] [[a\nb]]").1, vec![]);
     }
 
     #[test]
