@@ -191,9 +191,84 @@ fn split_tags(input: &str) -> impl Iterator<Item = &str> {
     input.split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | '、')).filter(|t| !t.is_empty())
 }
 
-/// 「#」だけの語は検索語として扱わない(入力途中とみなす)
+/// 「#」や「*」だけの語は検索語として扱わない(入力途中とみなす)
 fn is_term(t: &str) -> bool {
-    !t.trim_start_matches('#').is_empty()
+    t.chars().any(|c| c != '#' && c != '*')
+}
+
+/// 検索語1つ。`*` を含む語はワイルドカード(`*` は任意の文字列)。
+enum Term<'a> {
+    /// 部分一致
+    Plain(&'a str),
+    /// `*` で区切った断片と、先頭・末尾が固定かどうか(`app*` は先頭固定、`*ing` は末尾固定)
+    Glob { parts: Vec<&'a str>, start: bool, end: bool },
+}
+
+impl<'a> Term<'a> {
+    fn new(t: &'a str) -> Term<'a> {
+        if t.contains('*') {
+            Term::Glob { parts: t.split('*').filter(|p| !p.is_empty()).collect(), start: !t.starts_with('*'), end: !t.ends_with('*') }
+        } else {
+            Term::Plain(t)
+        }
+    }
+
+    /// 文字列全体に対して照合する(見出し語・タグ用)。Plain は部分一致
+    fn matches_whole(&self, text: &str) -> bool {
+        match self {
+            Term::Plain(t) => text.contains(t),
+            Term::Glob { parts, start, end } => glob(text, parts, *start, *end),
+        }
+    }
+
+    /// 文章の中から探す(意味用)。ワイルドカードは「断片がこの順に現れる」
+    fn matches_within(&self, text: &str) -> bool {
+        match self {
+            Term::Plain(t) => text.contains(t),
+            Term::Glob { parts, .. } => glob(text, parts, false, false),
+        }
+    }
+
+    /// タグ(「#a #b」形式)のどれか1つに一致するか
+    fn matches_tags(&self, tags_lc: &str) -> bool {
+        match self {
+            Term::Plain(t) => tags_lc.contains(t),
+            Term::Glob { parts, start, end } => {
+                // 「#」から書かれていれば # 込みで、そうでなければ # を除いたタグ名と照合する
+                let with_hash = *start && parts.first().map_or(false, |p| p.starts_with('#'));
+                tags_lc.split(' ').any(|tag| glob(if with_hash { tag } else { tag.trim_start_matches('#') }, parts, *start, *end))
+            }
+        }
+    }
+
+    fn matches_any(&self, e: &Entry) -> bool {
+        self.matches_whole(&e.word_lc) || self.matches_within(&e.meaning_lc) || self.matches_tags(&e.tags_lc)
+    }
+}
+
+/// `parts` が `text` の中にこの順で(重ならずに)現れるか。start / end が真なら先頭 / 末尾に固定する
+fn glob(text: &str, parts: &[&str], start: bool, end: bool) -> bool {
+    let mut rest = text;
+    let last = parts.len().saturating_sub(1);
+    for (i, p) in parts.iter().enumerate() {
+        if i == 0 && start {
+            match rest.strip_prefix(p) {
+                Some(r) => rest = r,
+                None => return false,
+            }
+            if i == last && end {
+                return rest.is_empty();
+            }
+        } else if i == last && end {
+            return rest.ends_with(p);
+        } else {
+            match rest.find(p) {
+                Some(pos) => rest = &rest[pos + p.len()..],
+                None => return false,
+            }
+        }
+    }
+    true
 }
 
 /// タグの区切り(空白・全角空白・カンマ・読点)を単一スペースに正規化し、重複を除く
@@ -217,6 +292,10 @@ pub fn filter(entries: &[Entry], q: &Query) -> Vec<u32> {
 /// `new` が `prev` の条件を絞り込むだけ(= `prev` のヒットの部分集合になる)か。
 /// 入力欄に文字を追加していくときに成り立つ。
 pub fn narrows(prev: &Query, new: &Query) -> bool {
+    // ワイルドカードは文字を足すと一致範囲が広がることがある(例: 「a*b」→「a*bc」)ので対象外
+    if [&new.all, &new.word, &new.meaning, &new.tag].iter().any(|s| s.contains('*')) {
+        return false;
+    }
     let ext = |p: &str, n: &str| n.to_lowercase().starts_with(&p.to_lowercase());
     prev.dicts == new.dicts
         && ext(&prev.all, &new.all)
@@ -231,10 +310,10 @@ pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Ve
     let word_l = q.word.to_lowercase();
     let meaning_l = q.meaning.to_lowercase();
     let tag_l = q.tag.to_lowercase();
-    let all_t: Vec<&str> = all_l.split_whitespace().filter(|t| is_term(t)).collect();
-    let word_t: Vec<&str> = word_l.split_whitespace().filter(|t| is_term(t)).collect();
-    let meaning_t: Vec<&str> = meaning_l.split_whitespace().filter(|t| is_term(t)).collect();
-    let tag_t: Vec<&str> = split_tags(&tag_l).filter(|t| is_term(t)).collect();
+    let all_t: Vec<Term> = all_l.split_whitespace().filter(|t| is_term(t)).map(Term::new).collect();
+    let word_t: Vec<Term> = word_l.split_whitespace().filter(|t| is_term(t)).map(Term::new).collect();
+    let meaning_t: Vec<Term> = meaning_l.split_whitespace().filter(|t| is_term(t)).map(Term::new).collect();
+    let tag_t: Vec<Term> = split_tags(&tag_l).filter(|t| is_term(t)).map(Term::new).collect();
 
     let no_terms = all_t.is_empty() && word_t.is_empty() && meaning_t.is_empty() && tag_t.is_empty();
     let dict_ok = |e: &Entry| q.dicts.as_ref().map_or(true, |m| m.get(e.dict).copied().unwrap_or(false));
@@ -245,14 +324,9 @@ pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Ve
         };
     }
 
-    // 順位付けの基準: 見出し語欄があればそれ、なければ全体検索
-    let (key, first) = if !word_t.is_empty() {
-        (word_t.join(" "), word_t[0])
-    } else if !all_t.is_empty() {
-        (all_t.join(" "), all_t[0])
-    } else {
-        (String::new(), "")
-    };
+    // 順位付けの基準: 見出し語欄があればその先頭の語、なければ全体検索の先頭の語
+    let first: Option<&Term> = word_t.first().or(all_t.first());
+    let key: String = if !word_t.is_empty() { word_l.split_whitespace().collect::<Vec<_>>().join(" ") } else { all_l.split_whitespace().collect::<Vec<_>>().join(" ") };
 
     let mut hits: Vec<(u8, u32)> = Vec::new();
     let all_idx: Vec<u32>;
@@ -268,21 +342,32 @@ pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Ve
         if !dict_ok(e) {
             continue;
         }
-        let ok = all_t.iter().all(|t| e.word_lc.contains(t) || e.meaning_lc.contains(t) || e.tags_lc.contains(t))
-            && word_t.iter().all(|t| e.word_lc.contains(t))
-            && meaning_t.iter().all(|t| e.meaning_lc.contains(t))
-            && tag_t.iter().all(|t| e.tags_lc.contains(t));
+        let ok = all_t.iter().all(|t| t.matches_any(e))
+            && word_t.iter().all(|t| t.matches_whole(&e.word_lc))
+            && meaning_t.iter().all(|t| t.matches_within(&e.meaning_lc))
+            && tag_t.iter().all(|t| t.matches_tags(&e.tags_lc));
         if ok {
-            let rank = if first.is_empty() {
-                3
-            } else if e.word_lc == key {
-                0
-            } else if e.word_lc.starts_with(first) {
-                1
-            } else if e.word_lc.contains(first) {
-                2
-            } else {
-                3
+            // 見出し語の完全一致 > 前方一致(ワイルドカードは見出し語への一致) > 見出し語に含む > その他
+            let rank = match first {
+                None => 3,
+                Some(Term::Plain(f)) => {
+                    if e.word_lc == key {
+                        0
+                    } else if e.word_lc.starts_with(f) {
+                        1
+                    } else if e.word_lc.contains(f) {
+                        2
+                    } else {
+                        3
+                    }
+                }
+                Some(g) => {
+                    if g.matches_whole(&e.word_lc) {
+                        1
+                    } else {
+                        3
+                    }
+                }
             };
             hits.push((rank, i));
         }
@@ -294,14 +379,24 @@ pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Ve
 impl Query {
     /// 強調表示する語(小文字)。(見出し語用, 意味用, タグ用)
     pub fn mark_terms(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
-        let ws = |s: &str| s.to_lowercase().split_whitespace().filter(|t| is_term(t)).map(str::to_owned).collect::<Vec<_>>();
+        // ワイルドカードの語は、`*` で区切った断片をそれぞれ強調する
+        // (英数字1文字だけの断片は、あちこちが赤くなって読みにくいので強調しない)
+        let pieces = |t: &str| {
+            let glob = t.contains('*');
+            t.split('*')
+                .filter(|p| is_term(p))
+                .filter(|p| !(glob && p.chars().count() == 1 && p.chars().all(|c| c.is_ascii_alphanumeric())))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let ws = |s: &str| s.to_lowercase().split_whitespace().filter(|t| is_term(t)).flat_map(pieces).collect::<Vec<_>>();
         let all = ws(&self.all);
         let mut word = all.clone();
         word.extend(ws(&self.word));
         let mut meaning = all.clone();
         meaning.extend(ws(&self.meaning));
         let mut tag = all;
-        tag.extend(split_tags(&self.tag.to_lowercase()).filter(|t| is_term(t)).map(str::to_owned));
+        tag.extend(split_tags(&self.tag.to_lowercase()).filter(|t| is_term(t)).flat_map(pieces));
         (word, meaning, tag)
     }
 }
@@ -594,6 +689,53 @@ mod tests {
         let (_, _, tg) = q("#fr").mark_terms();
         assert_eq!(mark_ranges(&hash_tags("fruit red"), &tg), vec![(0, 3)]);
         assert!(q("#").mark_terms().2.is_empty());
+    }
+
+    #[test]
+    fn wildcard_search() {
+        let e = vec![
+            Entry::new(1, "apple".into(), "りんご。赤い果物".into(), "fruit red".into(), 0),
+            Entry::new(2, "pineapple".into(), "パイナップル。熱帯の果物".into(), "fruit".into(), 0),
+            Entry::new(3, "Apple Inc".into(), "アップル社".into(), "company it".into(), 0),
+            Entry::new(4, "running".into(), "走ること。apple は関係ない".into(), "verb".into(), 0),
+        ];
+        let w = |s: &str| filter(&e, &Query { word: s.into(), ..Default::default() });
+        assert_eq!(w("app*"), vec![0, 2]); // app で始まる
+        assert_eq!(w("*apple"), vec![0, 1]); // apple で終わる
+        assert_eq!(w("*ing"), vec![3]);
+        assert_eq!(w("a*e"), vec![0]); // a で始まり e で終わる
+        assert_eq!(w("a*c"), vec![2]);
+        assert_eq!(w("*pp*"), vec![0, 1, 2]); // 両側 * は部分一致と同じ
+        assert_eq!(w("p*a*e"), vec![1]);
+        assert_eq!(w("apple*"), vec![0, 2]); // * は空文字にも一致
+        assert_eq!(w("a*a"), Vec::<u32>::new()); // 断片は重ならない
+        // 意味: 断片がこの順に現れる
+        let m = |s: &str| filter(&e, &Query { meaning: s.into(), ..Default::default() });
+        assert_eq!(m("りんご*果物"), vec![0]);
+        assert_eq!(m("果物*りんご"), Vec::<u32>::new());
+        assert_eq!(m("*果物"), vec![0, 1]);
+        // タグ: タグ1つずつに照合。# 付きでも同じ
+        let t = |s: &str| filter(&e, &Query { tag: s.into(), ..Default::default() });
+        assert_eq!(t("f*"), vec![0, 1]);
+        assert_eq!(t("#f*"), vec![0, 1]);
+        assert_eq!(t("*d"), vec![0]); // red(fruit red を1つの文字列としては見ない)
+        assert_eq!(t("f*d"), Vec::<u32>::new());
+        // 全体検索: 見出し語・意味・タグのどれかに一致。見出し語に一致したものが先
+        assert_eq!(filter(&e, &q("app*")), vec![0, 2, 3]); // running は意味に「apple は…」を含む
+        assert_eq!(filter(&e, &q("#i*")), vec![2]);
+        assert_eq!(filter(&e, &q("app* fruit")), vec![0]); // 他の語との AND
+        // * だけなら検索しない
+        assert_eq!(filter(&e, &q("*")).len(), 4);
+        assert_eq!(filter(&e, &q("**")).len(), 4);
+        // 絞り込みの再利用はしない(結果が広がることがあるため)
+        assert!(!narrows(&q("a*b"), &q("a*bc")));
+        assert!(!narrows(&q("ap"), &q("ap*")));
+        // 強調は断片ごと
+        let (wm, _, tg) = Query { all: "a*e".into(), tag: "#f*t".into(), ..Default::default() }.mark_terms();
+        assert!(wm.is_empty()); // 英数字1文字の断片は強調しない
+        assert_eq!(tg, vec!["#f".to_string()]);
+        let (wm, _, _) = q("app*ng 果*物 a").mark_terms();
+        assert_eq!(wm, vec!["app".to_string(), "ng".to_string(), "果".to_string(), "物".to_string(), "a".to_string()]);
     }
 
     #[test]
