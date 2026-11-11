@@ -222,11 +222,13 @@ pub fn delete_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<usize> {
 
 /// 見出し語順に並べる
 pub fn sort_entries(entries: &mut [Entry]) {
-    // 読みがあれば読みの順(五十音順)。無ければ見出し語そのもの
-    fn key(e: &Entry) -> (&str, &str) {
-        (if e.reading_norm.is_empty() { &e.word_lc } else { &e.reading_norm }, &e.word_lc)
+    // 並べ替えに使う文字列: 読みがあれば読み、無ければ見出し語。
+    // カタカナはひらがなと同じ扱いにして、読みの無いカタカナ語も五十音の中に並べる。
+    fn key(e: &Entry) -> impl Iterator<Item = char> + '_ {
+        let k = if e.reading_norm.is_empty() { &e.word_lc } else { &e.reading_norm };
+        k.chars().map(|c| if ('\u{30A1}'..='\u{30F6}').contains(&c) { char::from_u32(c as u32 - 0x60).unwrap_or(c) } else { c })
     }
-    entries.sort_unstable_by(|a, b| key(a).cmp(&key(b)).then(a.dict.cmp(&b.dict)).then(a.id.cmp(&b.id)));
+    entries.sort_unstable_by(|a, b| key(a).cmp(key(b)).then_with(|| a.word_lc.cmp(&b.word_lc)).then(a.dict.cmp(&b.dict)).then(a.id.cmp(&b.id)));
 }
 
 fn split_tags(input: &str) -> impl Iterator<Item = &str> {
@@ -846,6 +848,21 @@ mod tests {
         // 意味欄は読みを見ない
         assert!(filter(&e, &Query { meaning: "いちごいちえ".into(), ..Default::default() }).is_empty());
         assert_eq!(to_hiragana("リンゴ ヴァ ABC 漢字"), "りんご ゔぁ ABC 漢字");
+
+        // 並び全体: 数字 → 英字 → かな(読み、または読みの無いかな・カタカナ語)→ 読みの無い漢字
+        let mut v = vec![
+            mk(1, "辞書", "", ""),
+            mk(2, "アジェンダ", "", ""),
+            mk(3, "稟議", "りんぎ", ""),
+            mk(4, "zebra", "", ""),
+            mk(5, "API", "えーぴーあい", ""),
+            mk(6, "5W1H", "", ""),
+            mk(7, "いろは", "", ""),
+            mk(8, "Apple", "", ""),
+        ];
+        sort_entries(&mut v);
+        let words: Vec<&str> = v.iter().map(|x| x.word.as_str()).collect();
+        assert_eq!(words, vec!["5W1H", "Apple", "zebra", "アジェンダ", "いろは", "API", "稟議", "辞書"]);
     }
 
     #[test]
