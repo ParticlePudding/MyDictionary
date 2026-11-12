@@ -862,10 +862,9 @@ unsafe fn draw_row(st: &State, hdc: HDC, row: usize) {
     SelectObject(hdc, old);
 }
 
-/// 読みの中の強調範囲。検索語も読みも、ひらがなにそろえてから照合する
+/// 読みの中の強調範囲(かなの種類などは、検索と同じ規則でそろえて照合される)
 fn reading_marks(reading: &str, word_terms: &[String]) -> Vec<(usize, usize)> {
-    let terms: Vec<String> = word_terms.iter().map(|t| core::to_hiragana(t)).collect();
-    core::mark_ranges(&core::to_hiragana(reading), &terms)
+    core::mark_ranges(reading, word_terms)
 }
 
 // ---- 表示更新 -------------------------------------------------------------
@@ -1292,8 +1291,9 @@ unsafe fn jump_to_word(st: &mut State, word: &str) {
     }
     set_text(st.edit, word);
     refresh(st);
-    let lw = word.to_lowercase();
-    let row = st.matches.iter().position(|&i| st.entries[i as usize].word.to_lowercase() == lw);
+    // 検索と同じ規則でそろえて、見出し語が一致する語を選ぶ
+    let key = core::fold(word.trim());
+    let row = st.matches.iter().position(|&i| st.entries[i as usize].word_norm() == key);
     match row {
         Some(r) => {
             select_row(st, Some(r));

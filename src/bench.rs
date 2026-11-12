@@ -85,7 +85,7 @@ pub fn run(n: usize) -> String {
     core::sort_entries(&mut entries);
     let sort_ms = ms(t);
     line(format!(
-        "起動時の読み込み合計: {:.1} ms  (open {:.1} / 読み込み+小文字化 {:.1} / 並べ替え {:.1})",
+        "起動時の読み込み合計: {:.1} ms  (open {:.1} / 読み込み+文字のそろえ {:.1} / 並べ替え {:.1})",
         ms(t_all),
         open_ms,
         load_ms,
