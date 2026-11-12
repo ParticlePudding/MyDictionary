@@ -11,6 +11,7 @@
 //!       "meaning": "一生に一度の出会い。\nその機会を大切にすべきだという教え。",
 //!       "tags": ["四字熟語"],
 //!       "links": ["公式サイト | https://example.com/", "[[温故知新]]"],
+//!       "id": 12,
 //!       "updated_at": 1730000000,
 //!       "updated": "2024/10/27 12:33:20"
 //!     }
@@ -19,9 +20,11 @@
 //! ```
 //! 取り込み時に必須なのは `word` と `meaning` だけ。`entries` を省いて配列をそのまま書いてもよい。
 //! `updated_at` は UNIX 秒(`updated` は人が読むための日本時間で、取り込み時には使わない)。
+//! `id` は語の番号。`updated_at` と合わせて、上書きの取り込みで「どの語か」を照合するのに使う
+//! (CSV / TSV の「管理用」の列と同じ役割。`import::import_rows` を参照)。
 
 use crate::core::{self, Entry};
-use crate::import::Row;
+use crate::import::{Given, Row};
 use serde_json::Value;
 
 fn quote(s: &str) -> String {
@@ -37,12 +40,13 @@ pub fn export(entries: &[Entry]) -> String {
         let tags = list(e.tags.split(' ').filter(|t| !t.is_empty()).collect());
         let links = list(e.link.lines().map(str::trim).filter(|l| !l.is_empty()).collect());
         out.push_str(&format!(
-            "    {{\n      \"word\": {},\n      \"reading\": {},\n      \"meaning\": {},\n      \"tags\": [{}],\n      \"links\": [{}],\n      \"updated_at\": {},\n      \"updated\": {}\n    }}",
+            "    {{\n      \"word\": {},\n      \"reading\": {},\n      \"meaning\": {},\n      \"tags\": [{}],\n      \"links\": [{}],\n      \"id\": {},\n      \"updated_at\": {},\n      \"updated\": {}\n    }}",
             quote(&e.word),
             quote(&e.reading),
             quote(&e.meaning.replace("\r\n", "\n")),
             tags,
             links,
+            e.id,
             e.updated_at,
             quote(&core::format_jst(e.updated_at)),
         ));
@@ -90,13 +94,18 @@ pub fn parse(text: &str) -> Result<(Vec<Row>, usize), String> {
         }
         // links(配列)が無ければ link(文字列。改行区切り)を見る
         let links = if o.contains_key("links") { joined(o.get("links"), "\n") } else { joined(o.get("link"), "\n") };
+        let updated_at = o.get("updated_at").and_then(Value::as_i64).filter(|&t| t > 0);
+        let id = o.get("id").and_then(Value::as_i64).filter(|&i| i > 0);
         rows.push(Row {
             word,
             meaning,
             tags: core::normalize_tags(&joined(o.get("tags"), " ")),
             link: links.replace("\r\n", "\n"),
             reading: text_of(o.get("reading")),
-            updated_at: o.get("updated_at").and_then(Value::as_i64).filter(|&t| t > 0),
+            updated_at,
+            // キーがある項目だけ「指定あり」とする(上書きのとき、無い項目は今の値を残す)
+            given: Given { tags: o.contains_key("tags"), link: o.contains_key("links") || o.contains_key("link"), reading: o.contains_key("reading") },
+            key: id.zip(updated_at),
         });
     }
     Ok((rows, skipped))
@@ -125,6 +134,9 @@ mod tests {
         assert_eq!(rows[0].tags, "四字熟語 名言");
         assert_eq!(rows[0].link, e[0].link);
         assert_eq!(rows[0].updated_at, Some(1_730_000_000));
+        // 語の番号と更新日時(上書きの取り込みで照合に使う)、キーのある項目
+        assert_eq!(rows[0].key, Some((1, 1_730_000_000)));
+        assert_eq!(rows[0].given, Given { tags: true, link: true, reading: true });
         assert_eq!((rows[1].tags.as_str(), rows[1].link.as_str(), rows[1].reading.as_str()), ("", "", ""));
         assert_eq!(parse(&export(&[])).unwrap().0.len(), 0);
     }
@@ -142,6 +154,10 @@ mod tests {
         assert_eq!(skipped, 2);
         assert_eq!((rows[0].tags.as_str(), rows[0].link.as_str()), ("t1 t2", "https://a.example/"));
         assert_eq!((rows[1].word.as_str(), rows[1].meaning.as_str(), rows[1].updated_at), ("c", "y", None));
+        // 自分で書いた JSON: 番号は無い。キーのある項目だけ「指定あり」
+        assert_eq!((rows[0].key, rows[1].key), (None, None));
+        assert_eq!(rows[0].given, Given { tags: true, link: true, reading: false });
+        assert_eq!(rows[1].given, Given::default());
         assert!(parse("{\"x\": 1}").is_err());
         assert!(parse("not json").is_err());
         assert!(parse("42").is_err());

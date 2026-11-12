@@ -14,6 +14,7 @@ mod json_io;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod license;
 mod safe;
+mod undo;
 #[cfg(windows)]
 mod ui;
 #[cfg(windows)]
