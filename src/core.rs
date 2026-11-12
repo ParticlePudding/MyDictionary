@@ -28,7 +28,8 @@ pub struct Entry {
 
 impl Entry {
     pub fn new(id: i64, word: String, meaning: String, tags: String, updated_at: i64) -> Self {
-        let (word_lc, meaning_lc) = (fold(&word), fold(&meaning));
+        // 意味は、表示する文字列(リンクや画像の記法を取り除いたもの)を検索の対象にする
+        let (word_lc, meaning_lc) = (fold(&word), fold(&display_text(&meaning)));
         // タグは「#a #b」の形で持つ。「#a」で検索するとタグの先頭に一致し、「a」ならタグの途中にも一致する
         let tags_lc = hash_tags(&fold(&tags));
         Entry { dict: 0, id, word, reading: String::new(), meaning, tags, updated_at, link: String::new(), word_lc, reading_norm: String::new(), meaning_lc, tags_lc }
@@ -786,19 +787,119 @@ pub fn mark_ranges(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
 /// 別の語へのリンクを表す開く先の接頭辞(例: `word:apple`)
 pub const WORD_SCHEME: &str = "word:";
 
-/// 意味の文中のリンクを取り出す。
+/// 画像の代わりに表示する文字(説明)に付けるリンクの、開く先の接頭辞(例: `img:pic\a.png`)
+pub const IMAGE_SCHEME: &str = "img:";
+
+/// 意味の文を、表示用に解析したもの
+#[derive(Debug, Default, PartialEq)]
+pub struct Body {
+    /// 表示する文字列(記法を取り除いたもの)。検索と強調表示も、この文字列に対して行う
+    pub text: String,
+    /// リンク (開始, 終了, 開く先)。位置は `text` の UTF-16 単位
+    pub links: Vec<(usize, usize, String)>,
+    /// 画像 (開始, 終了, パス)。範囲は、画像の代わりに表示する文字(説明。無ければファイル名)の位置。
+    /// 同じ範囲が `links` にも入っている(開く先は `img:パス`)。画像を表示できるときは、この範囲を画像に置き換える
+    pub images: Vec<(usize, usize, String)>,
+}
+
+/// `[表示名](開く先)` の「開く先」として扱うか。
+/// 条件を付けないと、`funcs[0](x)` のような文がリンクになってしまう。
+/// - URL(`https://…` など、`://` を含むもの)、`mailto:`、`word:`
+/// - 絶対パス(`C:\…`、`\\サーバー\…`)
+/// - `.\` か `..\` で始まる相対パス(`/` でもよい)
+pub fn is_link_target(t: &str) -> bool {
+    let l = t.to_lowercase();
+    if l.starts_with(WORD_SCHEME) || l.starts_with("mailto:") {
+        return true;
+    }
+    if let Some((scheme, rest)) = l.split_once(':') {
+        let ok = scheme.len() >= 2 && scheme.starts_with(|c: char| c.is_ascii_alphabetic()) && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'));
+        if ok && rest.starts_with("//") {
+            return true;
+        }
+    }
+    is_absolute_path(t) || [".\\", "..\\", "./", "../"].iter().any(|p| t.starts_with(p))
+}
+
+/// Windows の絶対パス(`C:\…` `C:/…` `\\サーバー\…`)か
+pub fn is_absolute_path(t: &str) -> bool {
+    let b = t.as_bytes();
+    t.starts_with("\\\\") || t.starts_with("//") || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
+}
+
+/// 開く先が、ファイルの相対パスか(URL などのスキーム付きでも、絶対パスでもないもの)
+pub fn is_relative_path(t: &str) -> bool {
+    if t.is_empty() || is_absolute_path(t) {
+        return false;
+    }
+    match t.split_once(':') {
+        // 「スキーム:」で始まるもの(https: mailto: word: など)は、パスではない
+        Some((scheme, _)) => !(scheme.len() >= 2 && scheme.starts_with(|c: char| c.is_ascii_alphabetic()) && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))),
+        None => true,
+    }
+}
+
+/// 相対パスを、`base`(辞書ファイルのあるフォルダ)を基準にしたパスにする。相対パスでなければ、そのまま
+pub fn resolve_path(target: &str, base: &Path) -> String {
+    if is_relative_path(target) {
+        let rel = target.trim_start_matches(".\\").trim_start_matches("./");
+        base.join(rel).to_string_lossy().to_string()
+    } else {
+        target.to_string()
+    }
+}
+
+/// `[` の直後から、`表示名](開く先)` を読む。戻り値は (表示名, 開く先, 読んだバイト数)。
+/// 表示名も開く先も、同じ行の中で閉じていること。開く先は、対応する `)` まで(中の括弧は、対になっていればよい)。
+/// 開く先は、空白や日本語を含んでいてもよい。`<…>` や `"…"` で囲んであれば、外す
+fn bracket_link(tail: &str) -> Option<(&str, &str, usize)> {
+    let line = &tail[..tail.find('\n').unwrap_or(tail.len())];
+    let close = line.find("](")?;
+    let text = &line[..close];
+    if text.contains('[') {
+        return None; // 内側の [ から読み直す
+    }
+    let dest_start = close + 2;
+    let mut depth = 0usize;
+    let mut end = None;
+    for (i, c) in line[dest_start..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' if depth == 0 => {
+                end = Some(dest_start + i);
+                break;
+            }
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    let end = end?;
+    let dest = line[dest_start..end].trim();
+    let dest = dest.strip_prefix('<').and_then(|d| d.strip_suffix('>')).unwrap_or(dest);
+    let dest = dest.trim().trim_matches('"').trim();
+    Some((text.trim(), dest, end + 1))
+}
+
+/// 意味の文を解析して、表示する文字列と、リンク・画像の位置を取り出す。
 /// - `[[語]]` は別の語へのリンク(表示は括弧を外した「語」)
+/// - `[表示名](開く先)` はリンク(表示は「表示名」。開く先が `is_link_target` のときだけ)
+/// - `![説明](パス)` は画像(表示は「説明」。無ければファイル名)。パスが URL のときは画像にせず、リンクにする
 /// - `http://` / `https://` で始まる URL
-/// 戻り値は (表示用の文字列, [(開始, 終了, 開く先)])。位置は表示用の文字列の UTF-16 単位。
-pub fn body_links(text: &str) -> (String, Vec<(usize, usize, String)>) {
-    let mut out = String::new();
-    let mut links = Vec::new();
+pub fn parse_body(text: &str) -> Body {
+    let mut b = Body::default();
     let mut pos16 = 0usize;
     let mut rest = text;
+    // 表示する文字を足し、その UTF-16 の範囲を返す
+    fn push(b: &mut Body, pos16: &mut usize, s: &str) -> (usize, usize) {
+        let a = *pos16;
+        b.text.push_str(s);
+        *pos16 += s.encode_utf16().count();
+        (a, *pos16)
+    }
     loop {
-        let next_word = rest.find("[[");
+        let next_br = rest.find('[');
         let next_url = [rest.find("http://"), rest.find("https://")].into_iter().flatten().min();
-        let (at, is_word) = match (next_word, next_url) {
+        let (at, is_br) = match (next_br, next_url) {
             (Some(w), Some(u)) => {
                 if w < u {
                     (w, true)
@@ -810,45 +911,90 @@ pub fn body_links(text: &str) -> (String, Vec<(usize, usize, String)>) {
             (None, Some(u)) => (u, false),
             (None, None) => break,
         };
-        let before = &rest[..at];
-        out.push_str(before);
-        pos16 += before.encode_utf16().count();
-        let tail = &rest[at..];
-        if is_word {
-            // 同じ行の中で閉じている [[語]] だけをリンクにする
-            let close = tail[2..].find("]]").filter(|&c| c > 0 && !tail[2..2 + c].contains('\n') && !tail[2..2 + c].trim().is_empty());
-            match close {
-                Some(c) => {
-                    let word = tail[2..2 + c].trim();
-                    let n = word.encode_utf16().count();
-                    links.push((pos16, pos16 + n, format!("{WORD_SCHEME}{word}")));
-                    out.push_str(word);
-                    pos16 += n;
-                    rest = &tail[2 + c + 2..];
-                }
-                None => {
-                    out.push_str("[[");
-                    pos16 += 2;
-                    rest = &tail[2..];
-                }
-            }
-        } else {
+        if !is_br {
+            push(&mut b, &mut pos16, &rest[..at]);
+            let tail = &rest[at..];
             // URL は空白や和文の括弧・句読点の手前まで。末尾の句読点は含めない
             let end = tail
                 .find(|c: char| c.is_whitespace() || matches!(c, '「' | '」' | '『' | '』' | '（' | '）' | '、' | '。' | '<' | '>' | '"' | '　'))
                 .unwrap_or(tail.len());
             let url = tail[..end].trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '\'']);
-            let n = url.encode_utf16().count();
+            let r = push(&mut b, &mut pos16, url);
             if url.len() > "https://".len() {
-                links.push((pos16, pos16 + n, url.to_string()));
+                b.links.push((r.0, r.1, url.to_string()));
             }
-            out.push_str(url);
-            pos16 += n;
             rest = &tail[url.len()..];
+            continue;
+        }
+        let tail = &rest[at..];
+        if tail.starts_with("[[") {
+            push(&mut b, &mut pos16, &rest[..at]);
+            // 同じ行の中で閉じている [[語]] だけをリンクにする
+            let close = tail[2..].find("]]").filter(|&c| c > 0 && !tail[2..2 + c].contains('\n') && !tail[2..2 + c].trim().is_empty());
+            match close {
+                Some(c) => {
+                    let word = tail[2..2 + c].trim();
+                    let r = push(&mut b, &mut pos16, word);
+                    b.links.push((r.0, r.1, format!("{WORD_SCHEME}{word}")));
+                    rest = &tail[2 + c + 2..];
+                }
+                None => {
+                    push(&mut b, &mut pos16, "[[");
+                    rest = &tail[2..];
+                }
+            }
+            continue;
+        }
+        // `![説明](パス)`(画像)か、`[表示名](開く先)`(リンク)
+        let is_img = at > 0 && rest.as_bytes()[at - 1] == b'!';
+        let parsed = bracket_link(&tail[1..]).filter(|(_, dest, _)| !dest.is_empty());
+        match parsed {
+            Some((alt, dest, used)) if is_img => {
+                push(&mut b, &mut pos16, &rest[..at - 1]); // `!` は表示しない
+                let is_url = dest.to_lowercase().starts_with("http://") || dest.to_lowercase().starts_with("https://");
+                // 説明が無ければ、ファイル名を表示する
+                let name = dest.rsplit(['\\', '/']).next().unwrap_or(dest);
+                let r = push(&mut b, &mut pos16, if alt.is_empty() { if is_url { dest } else { name } } else { alt });
+                if is_url {
+                    // 通信はしないので、URL の画像は読み込まない。リンクとして表示する
+                    b.links.push((r.0, r.1, dest.to_string()));
+                } else {
+                    b.links.push((r.0, r.1, format!("{IMAGE_SCHEME}{dest}")));
+                    b.images.push((r.0, r.1, dest.to_string()));
+                }
+                rest = &tail[1 + used..];
+            }
+            Some((label, dest, used)) if !is_img && is_link_target(dest) => {
+                push(&mut b, &mut pos16, &rest[..at]);
+                let r = push(&mut b, &mut pos16, if label.is_empty() { dest } else { label });
+                b.links.push((r.0, r.1, dest.to_string()));
+                rest = &tail[1 + used..];
+            }
+            _ => {
+                // 記法ではない `[`: そのまま表示して、続きを読む
+                push(&mut b, &mut pos16, &rest[..at + 1]);
+                rest = &tail[1..];
+            }
         }
     }
-    out.push_str(rest);
-    (out, links)
+    push(&mut b, &mut pos16, rest);
+    b
+}
+
+/// 意味の文中のリンクを取り出す(`parse_body` の、表示する文字列とリンクだけ)。
+/// 戻り値は (表示用の文字列, [(開始, 終了, 開く先)])。位置は表示用の文字列の UTF-16 単位。
+pub fn body_links(text: &str) -> (String, Vec<(usize, usize, String)>) {
+    let b = parse_body(text);
+    (b.text, b.links)
+}
+
+/// 意味の文の、表示する文字列(記法を取り除いたもの)。記法が無ければ、そのまま返す
+pub fn display_text(meaning: &str) -> std::borrow::Cow<'_, str> {
+    if meaning.contains('[') {
+        std::borrow::Cow::Owned(parse_body(meaning).text)
+    } else {
+        std::borrow::Cow::Borrowed(meaning)
+    }
 }
 
 /// 参照先の欄(1行に1つ)を (表示名, 開く先) の一覧にする。
@@ -1456,6 +1602,82 @@ mod tests {
         assert_eq!(l, vec![(5, 23, "http://a.example/x".to_string())]);
         // 空の [[ ]] や、行をまたぐものはリンクにしない
         assert_eq!(body_links("[[]] [[a\nb]]").1, vec![]);
+    }
+
+    #[test]
+    fn bracket_links_and_images() {
+        // [表示名](開く先): URL、word:、絶対パス、.\ で始まる相対パスのときだけリンクにする
+        let b = parse_body("詳しくは[公式サイト](https://example.com/a(b))と[設計メモ](\\\\server\\share\\設計 メモ.txt)、[隣](.\\doc\\a.pdf)、[語](word:りんご)。");
+        assert_eq!(b.text, "詳しくは公式サイトと設計メモ、隣、語。");
+        assert_eq!(
+            b.links,
+            vec![
+                (4, 9, "https://example.com/a(b)".to_string()),
+                (10, 14, "\\\\server\\share\\設計 メモ.txt".to_string()),
+                (15, 16, ".\\doc\\a.pdf".to_string()),
+                (17, 18, "word:りんご".to_string()),
+            ]
+        );
+        assert!(b.images.is_empty());
+        // 開く先がリンクらしくないものは、書いたとおりに表示する(プログラムの式など)
+        for t in ["funcs[0](x)", "a[i](j) と b[k]", "[注1](参照)", "[x](ns::f)", "[a]()", "[a](", "[a] (https://x.example/)"] {
+            let b = parse_body(t);
+            assert!(b.links.iter().all(|l| l.2.starts_with("http")), "{t}");
+            assert!(b.text.contains('['), "{t}");
+        }
+        // 文字の途中の URL は、これまでどおりリンクになる
+        assert_eq!(parse_body("[a] (https://x.example/)").links, vec![(5, 23, "https://x.example/".to_string())]);
+        // 表示名が空なら、開く先を表示する。<…> や "…" で囲んだ開く先
+        assert_eq!(parse_body("[](https://x.example/)").text, "https://x.example/");
+        assert_eq!(parse_body("[a](<C:\\My Docs\\x (1).txt>)").links, vec![(0, 1, "C:\\My Docs\\x (1).txt".to_string())]);
+        // 行をまたぐものは、リンクにしない
+        assert!(parse_body("[a\nb](https://x.example/)").links.iter().all(|l| l.0 > 0));
+
+        // ![説明](パス): 画像。表示は説明(無ければファイル名)。パスの条件は無い
+        let b = parse_body("図: ![構成図](dictionary_pic\\構成 図(1).png) と ![](C:\\pic\\a.jpg)。");
+        assert_eq!(b.text, "図: 構成図 と a.jpg。");
+        assert_eq!(b.images, vec![(3, 6, "dictionary_pic\\構成 図(1).png".to_string()), (9, 14, "C:\\pic\\a.jpg".to_string())]);
+        assert_eq!(b.links, vec![(3, 6, "img:dictionary_pic\\構成 図(1).png".to_string()), (9, 14, "img:C:\\pic\\a.jpg".to_string())]);
+        // URL の画像は読み込まない(通信しない)。リンクとして表示する
+        let b = parse_body("![ロゴ](https://example.com/logo.png)");
+        assert_eq!((b.text.as_str(), b.images.len()), ("ロゴ", 0));
+        assert_eq!(b.links, vec![(0, 2, "https://example.com/logo.png".to_string())]);
+        // 閉じていない書き方は、そのまま表示する
+        assert_eq!(parse_body("びっくり![a](b").text, "びっくり![a](b");
+        assert_eq!(parse_body("![]()").text, "![]()");
+        // [[語]] と組み合わせても、位置がずれない(😀 は UTF-16 で2単位)
+        let b = parse_body("😀[[語]]と![図](p.png)と[リンク](https://x.example/)");
+        assert_eq!(b.text, "😀語と図とリンク");
+        assert_eq!(b.links.iter().map(|l| (l.0, l.1)).collect::<Vec<_>>(), vec![(2, 3), (4, 5), (6, 9)]);
+
+        // 検索は、表示する文字列に対して行う(記法をまたぐ語句も引ける。開く先やパスは対象外)
+        let e = vec![
+            Entry::new(1, "a".into(), "これは[[りんご]]です。![構成図](pic\\kousei.png)を見る。[公式](https://example.com/secret)".into(), "".into(), 0),
+            Entry::new(2, "b".into(), "記法なし kousei.png".into(), "".into(), 0),
+        ];
+        assert_eq!(filter(&e, &q("りんごです")), vec![0]);
+        assert_eq!(filter(&e, &q("構成図を見る")), vec![0]);
+        assert_eq!(filter(&e, &q("kousei")), vec![1]); // パスは検索しない
+        assert_eq!(filter(&e, &q("secret")), Vec::<u32>::new()); // 開く先も検索しない
+        assert_eq!(filter(&e, &q("公式")), vec![0]);
+        assert_eq!(display_text("記法なし"), "記法なし");
+
+        // 開く先の判定と、相対パスの基準
+        for t in ["https://a.example/", "notes://x", "mailto:a@example.com", "word:語", "C:\\a.txt", "c:/a.txt", "\\\\s\\x", ".\\a", "..\\a", "./a", "../a"] {
+            assert!(is_link_target(t), "{t}");
+        }
+        for t in ["a.txt", "x", "ns::f", "参照", "", "C:", "1://x"] {
+            assert!(!is_link_target(t), "{t}");
+        }
+        let base = Path::new("base");
+        let j = |p: &str| base.join(p).to_string_lossy().to_string();
+        assert_eq!(resolve_path("pic\\a.png", base), j("pic\\a.png"));
+        assert_eq!(resolve_path(".\\pic\\a.png", base), j("pic\\a.png"));
+        assert_eq!(resolve_path("C:\\x\\a.png", base), "C:\\x\\a.png");
+        assert_eq!(resolve_path("\\\\s\\x\\a.png", base), "\\\\s\\x\\a.png");
+        assert_eq!(resolve_path("https://a.example/", base), "https://a.example/");
+        assert_eq!(resolve_path("word:語", base), "word:語");
+        assert_eq!(resolve_path("mailto:a@example.com", base), "mailto:a@example.com");
     }
 
     #[test]

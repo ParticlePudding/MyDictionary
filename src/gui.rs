@@ -10,18 +10,23 @@ use crate::config::{self, Config, Sort};
 use crate::core::{self, Entry, Query};
 use crate::dialogs::{self, EntryDlg, SelectDlg, SettingsDlg, TagAction, TagsDlg};
 use crate::safe::{self, WriteError};
+use crate::pics;
 use crate::undo::{self, Snapshot, Undo};
 use crate::ui::{self, quiet, scale, Btn, Fonts, BTN_W, CTL_H};
 use crate::ui::{get_text, send, set_text, wide};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::SystemTime;
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
+use windows::Win32::Graphics::Imaging::*;
+use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Controls::RichEdit::*;
 use windows::Win32::UI::Controls::*;
@@ -61,6 +66,7 @@ const WM_APP_LOADED: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
 const WM_APP_SHOW: u32 = WM_APP + 3;
 const WM_APP_LINK: u32 = WM_APP + 5; // 本文のリンクがクリックされた(lParam = Box<String>)
+const WM_APP_IMAGE: u32 = WM_APP + 6; // 本文の画像を読み終えた(lParam = Box<PicMsg>)
 const MENU_OPEN: usize = 1;
 const MENU_SETTINGS: usize = 2;
 const MENU_OPEN_CFG: usize = 3;
@@ -138,6 +144,38 @@ struct UndoOp {
     bookmarks: Vec<Bookmark>,
 }
 
+/// 読み込んだ画像(ファイルの中身と、大きさ)
+struct Pic {
+    bytes: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
+/// 本文の中の画像1つ。はじめは説明の文字(リンク)を表示しておき、画像を読み終えたら、その範囲を画像に置き換える
+struct ImgSlot {
+    /// いまの本文欄の上での範囲(文字位置)。画像に置き換えた後は、画像の1文字ぶん
+    start: i32,
+    end: i32,
+    /// 画像のパス(相対パスは、辞書のフォルダを基準に直したもの)
+    path: String,
+    alt: String,
+    /// 画像を表示しているときの、表示の大きさ(ピクセル)。クリックの判定に使う
+    shown: Option<(i32, i32)>,
+}
+
+/// 画像を読むスレッドからの結果
+struct PicMsg {
+    /// どの表示のための画像か(`State::detail_gen`。表示が変わっていたら捨てる)
+    gen: u32,
+    index: usize,
+    path: String,
+    stamp: Option<SystemTime>,
+    pic: Option<Arc<Pic>>,
+}
+
+/// 覚えておく画像の数(同じ語を見直したときや、ウィンドウの大きさを変えたときに、読み直さない)
+const PIC_CACHE: usize = 24;
+
 struct InitData {
     cfg: Config,
     cfg_path: PathBuf,
@@ -212,6 +250,18 @@ struct State {
     back: Vec<View>,
     /// 直前の操作を元に戻すための記録
     undo: Option<UndoOp>,
+    /// 本文を表示し直すたびに増える番号(前の表示のための画像を捨てるため。画像を読むスレッドも見る)
+    detail_gen: Arc<AtomicU32>,
+    /// いま表示している語の画像
+    img_slots: RefCell<Vec<ImgSlot>>,
+    /// 最近読んだ画像 (パス, ファイルの更新時刻, 画像)
+    pic_cache: RefCell<Vec<(String, Option<SystemTime>, Arc<Pic>)>>,
+    /// 画像を本文に入れる方法: 0 = まだ試していない、1 = EM_INSERTIMAGE、2 = DIB に変換して RTF で入れる、3 = 入れられない(説明の文字のまま)
+    img_mode: Cell<u8>,
+    /// ウィンドウの大きさを変えている途中か(終わってから、画像の大きさを合わせ直す)
+    in_sizemove: Cell<bool>,
+    /// 画像の大きさを決めたときの、本文欄の幅
+    img_width: Cell<i32>,
     /// 「新しい版のアプリでも使われている」と知らせた辞書(同じ知らせを繰り返さない)
     warned_version: HashSet<PathBuf>,
     /// 絞り込みのタグ欄の横の「一覧…」
@@ -300,6 +350,8 @@ pub fn run() {
         }
 
         let init = load_config();
+        // 本文に画像を入れる処理が COM を使う
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_LISTVIEW_CLASSES | ICC_HOTKEY_CLASS | ICC_LINK_CLASS,
@@ -733,6 +785,12 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         hover_link: None,
         back: Vec::new(),
         undo: None,
+        detail_gen: Arc::new(AtomicU32::new(0)),
+        img_slots: RefCell::new(Vec::new()),
+        pic_cache: RefCell::new(Vec::new()),
+        img_mode: Cell::new(0),
+        in_sizemove: Cell::new(false),
+        img_width: Cell::new(0),
         warned_version: HashSet::new(),
         btn_tags,
         bookmarks: if init_shared { Bookmarks::default() } else { Bookmarks::load(&bm_path) },
@@ -1062,6 +1120,9 @@ fn link_label(target: &str) -> String {
     if let Some(tag) = target.strip_prefix(TAG_SCHEME) {
         return format!("クリックすると、タグ「{tag}」の語を表示します");
     }
+    if let Some(path) = target.strip_prefix(core::IMAGE_SCHEME) {
+        return format!("画像: {path}(クリックすると開きます)");
+    }
     match target.strip_prefix(core::WORD_SCHEME) {
         Some(word) => format!("リンク先: この辞書の「{}」", word.trim()),
         None => format!("リンク先: {target}"),
@@ -1182,7 +1243,12 @@ unsafe fn render(
     links: &[(String, String)],
     title_marks: &[(usize, usize)], meta_marks: &[(usize, usize)], body_marks: &[(usize, usize)],
     meta_links: &[(usize, usize, String)],
+    images: &[(usize, usize, String)],
+    base: &Path,
 ) {
+    // 前の表示のための画像は、もう使わない
+    let gen = st.detail_gen.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    st.img_slots.borrow_mut().clear();
     let body = body.replace("\r\n", "\n");
     // 文字位置は UTF-16 単位で数える。RichEdit 内部では改行は1文字なので、'\n' = 1 のままでよい
     let mut text = String::new();
@@ -1278,6 +1344,241 @@ unsafe fn render(
     send(st.rich, WM_VSCROLL, 6 /* SB_TOP */, 0);
     send(st.rich, WM_SETREDRAW, 1, 0);
     let _ = InvalidateRect(st.rich, None, true);
+    drop(store);
+    // 画像: まず説明の文字(リンク)を表示してあるので、別スレッドで読んでから、その範囲を画像に置き換える
+    if !images.is_empty() && st.img_mode.get() != 3 {
+        let mut slots = st.img_slots.borrow_mut();
+        // 自動で読むのは、ファイルのパスだけ(URL などは、説明の文字のリンクのままにする)
+        for (a, b, path) in images.iter().filter(|i| pics::loadable(&i.2)).take(pics::MAX_IMAGES) {
+            let alt: String = body.encode_utf16().skip(*a).take(b - a).map(|u| char::from_u32(u as u32).unwrap_or(' ')).collect();
+            slots.push(ImgSlot { start: (r_body.0 + a) as i32, end: (r_body.0 + b) as i32, path: core::resolve_path(path, base), alt, shown: None });
+        }
+        drop(slots);
+        start_pics(st, gen);
+    }
+}
+
+/// 本文欄の、文字を並べる領域の幅
+unsafe fn rich_width(st: &State) -> i32 {
+    let mut rc = RECT::default();
+    send(st.rich, EM_GETRECT, 0, &mut rc as *mut _ as isize);
+    rc.right - rc.left
+}
+
+/// いま表示している語の画像を、別スレッドで読む(遅い共有フォルダでも、画面を止めない)。
+/// 読み終えた画像は、1枚ずつ `WM_APP_IMAGE` で届く
+unsafe fn start_pics(st: &State, gen: u32) {
+    st.img_width.set(rich_width(st));
+    let wanted: Vec<(usize, String)> = st.img_slots.borrow().iter().enumerate().map(|(i, s)| (i, s.path.clone())).collect();
+    // すでに読んである画像(ファイルが変わっていなければ、読み直さない)
+    let cached: Vec<(String, Option<SystemTime>, Arc<Pic>)> = st.pic_cache.borrow().iter().filter(|c| wanted.iter().any(|w| w.1 == c.0)).cloned().collect();
+    let hwnd = GetParent(st.rich).unwrap_or_default().0 as usize;
+    let live = st.detail_gen.clone();
+    std::thread::spawn(move || {
+        for (index, path) in wanted {
+            // ほかの語に移っていたら、残りは読まない
+            if live.load(Ordering::Relaxed) != gen {
+                return;
+            }
+            let meta = std::fs::metadata(&path).ok();
+            let stamp = meta.as_ref().and_then(|m| m.modified().ok());
+            let pic = match cached.iter().find(|c| c.0 == path && c.1 == stamp && stamp.is_some()) {
+                Some(c) => Some(c.2.clone()),
+                None => meta.filter(|m| m.is_file() && m.len() <= pics::MAX_BYTES).and_then(|_| std::fs::read(&path).ok()).and_then(|bytes| {
+                    let (_, w, h) = pics::probe(&bytes)?;
+                    Some(Arc::new(Pic { bytes, w, h }))
+                }),
+            };
+            let boxed = Box::into_raw(Box::new(PicMsg { gen, index, path, stamp, pic }));
+            if PostMessageW(HWND(hwnd as *mut c_void), WM_APP_IMAGE, WPARAM(0), LPARAM(boxed as isize)).is_err() {
+                drop(Box::from_raw(boxed));
+                return;
+            }
+        }
+    });
+}
+
+/// 本文欄の、その位置の文字(UTF-16 の1単位)。画像などの埋め込みは U+FFFC
+unsafe fn rich_char_at(rich: HWND, pos: i32) -> u16 {
+    let mut buf = [0u16; 4];
+    let tr = TEXTRANGEW { chrg: CHARRANGE { cpMin: pos, cpMax: pos + 1 }, lpstrText: PWSTR(buf.as_mut_ptr()) };
+    send(rich, EM_GETTEXTRANGE, 0, &tr as *const _ as isize);
+    buf[0]
+}
+
+unsafe fn rich_text_len(rich: HWND) -> i32 {
+    let g = GETTEXTLENGTHEX { flags: GTL_NUMCHARS, codepage: 1200 };
+    send(rich, EM_GETTEXTLENGTHEX, &g as *const _ as usize, 0).0 as i32
+}
+
+/// 選択範囲を、画像に置き換える(Windows 8 以降の RichEdit の機能)。ピクセルの大きさは、1/100 mm に直して渡す
+unsafe fn insert_image_native(rich: HWND, pic: &Pic, w: i32, h: i32, dpi: i32, alt: &str) -> bool {
+    let Some(stream) = SHCreateMemStream(Some(&pic.bytes)) else { return false };
+    let alt_w = wide(alt);
+    let hm = |px: i32| (px as i64 * 2540 / dpi.max(1) as i64) as i32;
+    let params = RICHEDIT_IMAGE_PARAMETERS {
+        xWidth: hm(w),
+        yHeight: hm(h),
+        Ascent: hm(h),
+        Type: TA_BASELINE.0 as i32,
+        pwszAlternateText: PCWSTR(alt_w.as_ptr()),
+        pIStream: std::mem::ManuallyDrop::new(Some(stream)),
+    };
+    let hr = send(rich, EM_INSERTIMAGE, 0, &params as *const _ as isize).0;
+    let RICHEDIT_IMAGE_PARAMETERS { pIStream, .. } = params;
+    drop(std::mem::ManuallyDrop::into_inner(pIStream));
+    hr == 0
+}
+
+/// RTF を読ませるときに、データを渡す関数(`cookie` は、(データ, 読んだ位置) へのポインタ)
+unsafe extern "system" fn rtf_read(cookie: usize, buf: *mut u8, cb: i32, pcb: *mut i32) -> u32 {
+    let cur = &mut *(cookie as *mut (Vec<u8>, usize));
+    let n = (cur.0.len() - cur.1).min(cb.max(0) as usize);
+    std::ptr::copy_nonoverlapping(cur.0.as_ptr().add(cur.1), buf, n);
+    cur.1 += n;
+    *pcb = n as i32;
+    0
+}
+
+/// 画像を、表示する大きさ `w` x `h` の DIB に変換する(Windows の画像の部品 WIC で読んで、縮小する)。
+/// 透明な部分は、本文の背景色の上に重ねる
+unsafe fn decode_dib(pic: &Pic, w: i32, h: i32) -> Option<Vec<u8>> {
+    let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+    let stream = SHCreateMemStream(Some(&pic.bytes))?;
+    let decoder = factory.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand).ok()?;
+    let frame = decoder.GetFrame(0).ok()?;
+    // 不透明度つきの形にそろえてから縮小する
+    let conv = factory.CreateFormatConverter().ok()?;
+    conv.Initialize(&frame, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeCustom).ok()?;
+    let scaler = factory.CreateBitmapScaler().ok()?;
+    scaler.Initialize(&conv, w as u32, h as u32, WICBitmapInterpolationModeFant).ok()?;
+    let mut pixels = vec![0u8; w as usize * h as usize * 4];
+    scaler.CopyPixels(std::ptr::null(), w as u32 * 4, &mut pixels).ok()?;
+    let bg = ui::WHITE.0;
+    pics::dib_from_pbgra(&pixels, w as usize, h as usize, ((bg & 0xFF) as u8, ((bg >> 8) & 0xFF) as u8, ((bg >> 16) & 0xFF) as u8))
+}
+
+/// Wine(Linux などで Windows のアプリを動かす仕組み)の上で動いているか
+unsafe fn on_wine() -> bool {
+    use std::sync::OnceLock;
+    static WINE: OnceLock<bool> = OnceLock::new();
+    *WINE.get_or_init(|| GetModuleHandleW(w!("ntdll.dll")).map_or(false, |m| GetProcAddress(m, windows::core::s!("wine_get_version")).is_some()))
+}
+
+/// 選択範囲を、画像に置き換える(画像を DIB に変換して、RTF の形で渡す方法)。
+/// `EM_INSERTIMAGE` が使えない環境のための方法。大きさは、1/1440 インチに直して渡す
+unsafe fn insert_image_rtf(rich: HWND, pic: &Pic, w: i32, h: i32, dpi: i32) -> bool {
+    let Some(mut dib) = decode_dib(pic, w, h) else { return false };
+    // RTF の `\dibitmap` は「情報ヘッダ(40 バイト)のすぐ後ろに画素」という並び。
+    // Wine の RichEdit は、ヘッダを 44 バイトとして読む(色の表が1つあるものとして数える)ので、
+    // Wine の上では 4 バイト空けておく。空けないと、色が1バイトぶんずれて表示される
+    if on_wine() {
+        dib.splice(40..40, [0u8; 4]);
+    }
+    let tw = |px: i32| px as i64 * 1440 / dpi.max(1) as i64;
+    let mut rtf = format!("{{\\rtf1{{\\pict\\dibitmap0\\picw{w}\\pich{h}\\picwgoal{}\\pichgoal{} ", tw(w), tw(h)).into_bytes();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    rtf.reserve(dib.len() * 2 + 4);
+    for &b in &dib {
+        rtf.push(HEX[(b >> 4) as usize]);
+        rtf.push(HEX[(b & 15) as usize]);
+    }
+    rtf.extend_from_slice(b"}}");
+    let mut cur = (rtf, 0usize);
+    let es = EDITSTREAM { dwCookie: &mut cur as *mut _ as usize, dwError: 0, pfnCallback: Some(rtf_read) };
+    send(rich, EM_STREAMIN, (SF_RTF | SFF_SELECTION) as usize, &es as *const _ as isize);
+    let err = es.dwError;
+    err == 0
+}
+
+/// 読み終えた画像を、本文の説明の文字と置き換える。
+/// 置き換えると文字位置がずれるので、後ろにあるリンクと画像の位置を直す
+unsafe fn show_pic(st: &State, index: usize, pic: &Pic) {
+    let Some((start, end, alt)) = st.img_slots.borrow().get(index).filter(|s| s.shown.is_none()).map(|s| (s.start, s.end, s.alt.clone())) else { return };
+    let mode = st.img_mode.get();
+    if mode == 3 {
+        return;
+    }
+    let (w, h) = pics::fit(pic.w, pic.h, st.img_width.get() - scale(8, st.dpi), st.dpi);
+    // 選択とスクロールの位置を控えて、置き換えの後で戻す(画像は、読んでいる途中にも届く)
+    let mut sel = CHARRANGE::default();
+    send(st.rich, EM_EXGETSEL, 0, &mut sel as *mut _ as isize);
+    let mut scroll = POINT::default();
+    send(st.rich, EM_GETSCROLLPOS, 0, &mut scroll as *mut _ as isize);
+    send(st.rich, WM_SETREDRAW, 0, 0);
+    send(st.rich, EM_SETREADONLY, 0, 0);
+    let before = rich_text_len(st.rich);
+    let range = CHARRANGE { cpMin: start, cpMax: end };
+    // 入った文字数(画像は1文字ぶん)。0 なら、画像は入っていない。
+    // 「成功」が返っても何も起きない環境があるので、その位置の文字が画像になったかで確かめる
+    // (画像などの埋め込みは U+FFFC。空白で表す実装もある。説明の文字は、どちらでも始まらない)
+    let inserted_by = |ok: bool| {
+        let n = rich_text_len(st.rich) - (before - (end - start));
+        if ok && (1..=3).contains(&n) && matches!(rich_char_at(st.rich, start), 0xFFFC | 0x20) {
+            n
+        } else {
+            0
+        }
+    };
+    let mut inserted = 0;
+    if mode <= 1 {
+        send(st.rich, EM_EXSETSEL, 0, &range as *const _ as isize);
+        inserted = inserted_by(insert_image_native(st.rich, pic, w, h, st.dpi, &alt));
+        if inserted >= 1 {
+            st.img_mode.set(1);
+        }
+    }
+    // EM_INSERTIMAGE が使えない環境では、RTF の形で入れてみる
+    if inserted == 0 && mode != 1 && rich_text_len(st.rich) == before {
+        send(st.rich, EM_EXSETSEL, 0, &range as *const _ as isize);
+        inserted = inserted_by(insert_image_rtf(st.rich, pic, w, h, st.dpi));
+        if inserted >= 1 {
+            st.img_mode.set(2);
+        } else if mode == 0 && rich_text_len(st.rich) == before {
+            st.img_mode.set(3); // どちらの方法でも入らない: 以後は試さない
+        }
+    }
+    send(st.rich, EM_SETREADONLY, 1, 0);
+    let delta = rich_text_len(st.rich) - before;
+    if (1..=3).contains(&inserted) {
+        // 説明の文字の範囲を、画像の範囲に直す。後ろにあるものは、ずれた分だけ動かす
+        let new_end = start + inserted;
+        for (a, b, target) in st.links.borrow_mut().iter_mut() {
+            if *a == start && *b == end && target.starts_with(core::IMAGE_SCHEME) {
+                *b = new_end;
+            } else if *a >= end {
+                *a += delta;
+                *b += delta;
+            }
+        }
+        for (i, s) in st.img_slots.borrow_mut().iter_mut().enumerate() {
+            if i == index {
+                s.end = new_end;
+                s.shown = Some((w, h));
+            } else if s.start >= end {
+                s.start += delta;
+                s.end += delta;
+            }
+        }
+        let fix = |p: i32| if p >= end { p + delta } else { p.min(start) };
+        sel = CHARRANGE { cpMin: fix(sel.cpMin), cpMax: fix(sel.cpMax) };
+    }
+    send(st.rich, EM_EXSETSEL, 0, &sel as *const _ as isize);
+    send(st.rich, EM_SETSCROLLPOS, 0, &scroll as *const _ as isize);
+    send(st.rich, WM_SETREDRAW, 1, 0);
+    let _ = InvalidateRect(st.rich, None, true);
+    if delta != 0 && !(1..=3).contains(&inserted) {
+        // 思わぬ形で文字が変わった: 位置が合わなくなるので、画像なしで表示し直す
+        st.img_mode.set(3);
+        update_detail(st);
+    }
+}
+
+/// ウィンドウの大きさが変わったとき: 画像を表示している語は、幅に合わせて表示し直す
+unsafe fn refit_pics(st: &State) {
+    if !st.img_slots.borrow().is_empty() && rich_width(st) != st.img_width.get() {
+        update_detail(st);
+    }
 }
 
 /// 本文欄: 0件(案内)/ 1件(内容)/ 複数(件数)
@@ -1299,7 +1600,7 @@ unsafe fn update_detail(st: &State) {
             } else {
                 m
             };
-            render(st, t, "", m, "", &[], &[], &[], &[], &[], &[]);
+            render(st, t, "", m, "", &[], &[], &[], &[], &[], &[], &[], Path::new(""));
         }
         1 => {
             let e = &st.entries[sel[0]];
@@ -1313,8 +1614,11 @@ unsafe fn update_detail(st: &State) {
             }
             parts.push(format!("更新 {}", core::format_jst(e.updated_at)));
             let meta = parts.join("    ·    ");
-            // 意味の文中の [[語]] と URL をリンクにする(表示は [[ ]] を外した形)
-            let (body, body_links) = core::body_links(&e.meaning.replace("\r\n", "\n"));
+            // 意味の文中の [[語]]・[表示名](開く先)・URL をリンクに、![説明](パス) を画像にする(表示は、記法を外した形)
+            let parsed = core::parse_body(&e.meaning.replace("\r\n", "\n"));
+            let (body, body_links) = (parsed.text, parsed.links);
+            // 相対パスの基準は、その語の辞書ファイルのあるフォルダ
+            let base = st.dicts.get(e.dict).and_then(|d| d.path.parent()).map(Path::to_path_buf).unwrap_or_default();
             // タグは meta の先頭にあるので、強調位置はそのまま使える
             let meta_marks = if tags.is_empty() { Vec::new() } else { core::mark_ranges(&tags, &st.marks.2) };
             // タグ1つずつをリンクにする(「#a #b」の中の位置。UTF-16 単位)
@@ -1337,9 +1641,11 @@ unsafe fn update_detail(st: &State) {
                 &meta_marks,
                 &core::mark_ranges(&body, &st.marks.1),
                 &meta_links,
+                &parsed.images,
+                &base,
             );
         }
-        n => render(st, &format!("{n} 件を選択中"), "", "Delete キーまたは「削除」でまとめて削除できます。", "", &[], &[], &[], &[], &[], &[]),
+        n => render(st, &format!("{n} 件を選択中"), "", "Delete キーまたは「削除」でまとめて削除できます。", "", &[], &[], &[], &[], &[], &[], &[], Path::new("")),
     }
     let marked = sel.len() == 1 && st.bm_map.contains_key(&(st.entries[sel[0]].dict, st.entries[sel[0]].id));
     set_text(st.btn_bm, if marked { "★ しおり" } else { "☆ しおり" });
@@ -1367,6 +1673,11 @@ unsafe fn open_link(hwnd: HWND, st: &mut State, link: &str) {
         search_tag(st, tag);
         return;
     }
+    // 画像: 拡張子が画像のものなら、確認なしで開く(それ以外は、ふつうのリンクと同じ確認をする)
+    let (link, plain_image) = match link.strip_prefix(core::IMAGE_SCHEME) {
+        Some(p) => (p.to_string(), pics::has_image_ext(p) && pics::loadable(p)),
+        None => (link, false),
+    };
     match core::link_kind(&link) {
         core::LinkKind::Word => {
             let word = link[core::WORD_SCHEME.len()..].trim().to_string();
@@ -1374,6 +1685,7 @@ unsafe fn open_link(hwnd: HWND, st: &mut State, link: &str) {
             return;
         }
         core::LinkKind::Web => {}
+        core::LinkKind::Other if plain_image => {}
         core::LinkKind::Other => {
             let text = format!("次の参照先を開きますか?\n\n{link}");
             if message_box(hwnd, &text, "参照先を開く", MB_YESNO | MB_ICONQUESTION) != IDYES {
@@ -1389,7 +1701,13 @@ unsafe fn open_link(hwnd: HWND, st: &mut State, link: &str) {
             }
         }
     }
-    let w = wide(&link);
+    // 相対パスは、選んでいる語の辞書ファイルのあるフォルダを基準にする
+    let base = selected_entries(st).first().and_then(|&i| st.dicts.get(st.entries[i].dict)).and_then(|d| d.path.parent()).map(Path::to_path_buf);
+    let target = match &base {
+        Some(b) => core::resolve_path(&link, b),
+        None => link.clone(),
+    };
+    let w = wide(&target);
     let r = ShellExecuteW(hwnd, w!("open"), PCWSTR(w.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
     if r.0 as isize <= 32 {
         notice(st, &format!("参照先を開けませんでした: {link}"));
@@ -1832,6 +2150,15 @@ unsafe fn rich_pos(rich: HWND, index: i32) -> POINTL {
 /// 本文欄の座標 (x, y) にあるリンクの開く先
 unsafe fn link_at(st: &State, x: i32, y: i32) -> Option<String> {
     let pt = POINTL { x, y };
+    // 画像は、行の高さではなく、表示している大きさで判定する
+    for s in st.img_slots.borrow().iter() {
+        if let Some((w, h)) = s.shown {
+            let p = rich_pos(st.rich, s.start);
+            if x >= p.x && x <= p.x + w && y >= p.y && y <= p.y + h {
+                return Some(format!("{}{}", core::IMAGE_SCHEME, s.path));
+            }
+        }
+    }
     let idx = send(st.rich, EM_CHARFROMPOS, 0, &pt as *const _ as isize).0 as i32;
     let line_h = scale(26, st.dpi);
     for (a, b, target) in st.links.borrow().iter() {
@@ -1919,7 +2246,7 @@ unsafe fn rich_menu(hwnd: HWND, st: &mut State, x: i32, y: i32) {
         }
         CM_COPY_LINK => {
             if let Some(l) = link {
-                let shown = l.strip_prefix(core::WORD_SCHEME).unwrap_or(&l).to_string();
+                let shown = [core::WORD_SCHEME, core::IMAGE_SCHEME, TAG_SCHEME].iter().find_map(|p| l.strip_prefix(p)).unwrap_or(&l).to_string();
                 ui::set_clipboard(hwnd, &shown);
             }
         }
@@ -2139,6 +2466,7 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
         orig_word: String::new(),
         open_existing: None,
         all_tags: core::tag_counts(st.entries.iter()),
+        dict_paths: st.dicts.iter().map(|d| d.path.clone()).collect(),
         ok: false,
     };
     if !dialogs::entry_dialog(hwnd, &mut dlg) {
@@ -2201,6 +2529,7 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
         orig_word: e.word.clone(),
         open_existing: None,
         all_tags: core::tag_counts(st.entries.iter()),
+        dict_paths: st.dicts.iter().map(|d| d.path.clone()).collect(),
         ok: false,
     };
     if !dialogs::entry_dialog(hwnd, &mut dlg) {
@@ -2449,6 +2778,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_SIZE => {
             if let Some(st) = state(hwnd) {
                 layout(hwnd, st);
+                // 大きさを変えている途中は、終わってから(WM_EXITSIZEMOVE)画像を合わせ直す
+                if !st.in_sizemove.get() && wparam.0 != 1 /* SIZE_MINIMIZED */ {
+                    refit_pics(st);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_ENTERSIZEMOVE => {
+            if let Some(st) = state(hwnd) {
+                st.in_sizemove.set(true);
+            }
+            LRESULT(0)
+        }
+        WM_EXITSIZEMOVE => {
+            if let Some(st) = state(hwnd) {
+                st.in_sizemove.set(false);
+                refit_pics(st);
             }
             LRESULT(0)
         }
@@ -2710,6 +3056,25 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     do_edit(hwnd, st);
                 } else if hdr.code == NM_RCLICK {
                     list_menu(hwnd, st);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_APP_IMAGE => {
+            let m = *Box::from_raw(lparam.0 as *mut PicMsg);
+            if let Some(st) = state(hwnd) {
+                if let Some(pic) = &m.pic {
+                    // 読んだ画像を覚えておく(古いものから捨てる)
+                    let mut cache = st.pic_cache.borrow_mut();
+                    cache.retain(|c| c.0 != m.path);
+                    cache.push((m.path.clone(), m.stamp, pic.clone()));
+                    if cache.len() > PIC_CACHE {
+                        cache.remove(0);
+                    }
+                    drop(cache);
+                    if m.gen == st.detail_gen.load(Ordering::Relaxed) {
+                        show_pic(st, m.index, pic);
+                    }
                 }
             }
             LRESULT(0)
