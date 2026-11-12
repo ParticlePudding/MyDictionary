@@ -319,7 +319,9 @@ pub fn update(conn: &Connection, id: i64, expected_ts: i64, f: &Fields) -> rusql
     Ok(ts)
 }
 
-/// 複数IDを削除する(トランザクションは呼び出し側で管理)
+/// 複数IDを削除する(トランザクションは呼び出し側で管理)。
+/// 画面からの削除は、元に戻せるように `undo::delete_with_snapshots` を使う
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn delete_ids(conn: &Connection, ids: &[i64]) -> rusqlite::Result<usize> {
     let mut n = 0;
     for id in ids {

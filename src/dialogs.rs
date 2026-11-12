@@ -1,6 +1,7 @@
 //! モーダルダイアログ: 登録/編集、設定、ライセンス情報。
 
 use crate::config::{self, Config, DictConf, Hotkey};
+use crate::undo::Undo;
 use crate::{core, import, json_io, license, safe};
 use crate::ui::{self, *};
 use std::collections::HashMap;
@@ -614,6 +615,8 @@ pub struct SettingsDlg {
     pub cfg_path: PathBuf,
     /// インポートを実行した(キャンセルで閉じても、辞書の読み直しが必要)
     pub imported: bool,
+    /// 最後に実行した取り込みを、元に戻すための記録: (辞書のパス, 記録, 何を元に戻すのか)
+    pub undo: Option<(PathBuf, Undo, String)>,
     pub ok: bool,
 }
 
@@ -1091,8 +1094,10 @@ label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(2
                             set_text(c.err, "参照のみの辞書には取り込めません");
                         } else if dict.path.as_os_str().is_empty() {
                             set_text(c.err, "先に辞書のパスを指定してください");
-                        } else if import_into(hwnd, &dict, &d.backup_root) {
+                        } else if let Some((out, undo)) = import_into(hwnd, &dict, &d.backup_root) {
                             d.imported = true;
+                            // 元に戻せるのは、直前の1回だけ
+                            d.undo = (!undo.is_empty()).then(|| (dict.path.clone(), undo, format!("{} 件の取り込み", out.writes())));
                         }
                     }
                 }
@@ -1356,19 +1361,87 @@ unsafe fn decode_text(bytes: &[u8]) -> Option<String> {
     (n > 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
 }
 
-/// ファイルを選び、確認のうえ辞書へ取り込む。取り込んだら true
-unsafe fn import_into(owner: HWND, dict: &DictConf, backup_root: &std::path::Path) -> bool {
-    let Some(file) = pick_import_file(owner) else { return false };
+/// 取り込みの確認画面。3つの扱い(両方残す・上書き・飛ばす)から選んでもらう。
+/// `plans` は、それぞれを選んだときの見込み。キャンセルなら None。
+/// 選択肢つきの標準の確認画面(TaskDialog)を使う。使えない環境では、これまでと同じ「両方残す」だけの確認にする
+unsafe fn ask_import_mode(owner: HWND, dict_name: &str, total: usize, preview: &str, plans: &[import::Outcome; 3]) -> Option<import::Mode> {
+    const ID_GO: i32 = 1; // IDOK
+    const R_KEEP: i32 = 101;
+    const R_OVER: i32 = 102;
+    const R_SKIP: i32 = 103;
+    let title = wide("取り込み");
+    let main = wide(&format!("{total} 件を、辞書「{dict_name}」に取り込みます"));
+    let content = wide(&format!("{preview}\n同じ見出し語の語がすでにあるときの扱いを選んでください。"));
+    let radios_text = [
+        wide(&format!("両方残す(これまでの動作): {}", plans[0].summary())),
+        wide(&format!("ファイルの内容で上書きする: {}", plans[1].summary())),
+        wide(&format!("見出し語がすでにある語は取り込まない: {}", plans[2].summary())),
+    ];
+    let radios = [
+        TASKDIALOG_BUTTON { nButtonID: R_KEEP, pszButtonText: PCWSTR(radios_text[0].as_ptr()) },
+        TASKDIALOG_BUTTON { nButtonID: R_OVER, pszButtonText: PCWSTR(radios_text[1].as_ptr()) },
+        TASKDIALOG_BUTTON { nButtonID: R_SKIP, pszButtonText: PCWSTR(radios_text[2].as_ptr()) },
+    ];
+    let (go, cancel) = (wide("取り込む"), wide("キャンセル"));
+    let buttons = [
+        TASKDIALOG_BUTTON { nButtonID: ID_GO, pszButtonText: PCWSTR(go.as_ptr()) },
+        TASKDIALOG_BUTTON { nButtonID: 2 /* IDCANCEL */, pszButtonText: PCWSTR(cancel.as_ptr()) },
+    ];
+    // 上書きを選んだときに何が起きるかを、「詳細」に出す
+    let details = import::overwrite_details(&plans[1]);
+    let details_w = wide(&details);
+    let (show, hide) = (wide("上書きの詳細を表示"), wide("詳細を隠す"));
+    let mut cfg = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: owner,
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW,
+        pszWindowTitle: PCWSTR(title.as_ptr()),
+        pszMainInstruction: PCWSTR(main.as_ptr()),
+        pszContent: PCWSTR(content.as_ptr()),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        nDefaultButton: ID_GO,
+        cRadioButtons: radios.len() as u32,
+        pRadioButtons: radios.as_ptr(),
+        nDefaultRadioButton: R_KEEP,
+        cxWidth: 300,
+        ..Default::default()
+    };
+    if !details.is_empty() {
+        cfg.pszExpandedInformation = PCWSTR(details_w.as_ptr());
+        cfg.pszCollapsedControlText = PCWSTR(show.as_ptr());
+        cfg.pszExpandedControlText = PCWSTR(hide.as_ptr());
+    }
+    let (mut button, mut radio) = (0i32, 0i32);
+    if TaskDialogIndirect(&cfg, Some(&mut button), Some(&mut radio), None).is_ok() {
+        return match (button, radio) {
+            (ID_GO, R_OVER) => Some(import::Mode::Overwrite),
+            (ID_GO, R_SKIP) => Some(import::Mode::Skip),
+            (ID_GO, _) => Some(import::Mode::KeepBoth),
+            _ => None,
+        };
+    }
+    // TaskDialog が使えないとき: これまでと同じ確認
+    let ask = format!(
+        "{total} 件を、辞書「{dict_name}」に取り込みます。\n\n{preview}\nすでに同じ見出し語と意味の語がある場合は、重複として飛ばします。\n({})\n取り込みますか?",
+        plans[0].summary()
+    );
+    (msg_box(owner, &ask, "インポート", MB_YESNO | MB_ICONQUESTION) == IDYES).then_some(import::Mode::KeepBoth)
+}
+
+/// ファイルを選び、確認のうえ辞書へ取り込む。取り込んだら、結果と、元に戻すための記録を返す
+unsafe fn import_into(owner: HWND, dict: &DictConf, backup_root: &std::path::Path) -> Option<(import::Outcome, Undo)> {
+    let file = pick_import_file(owner)?;
     let bytes = match std::fs::read(&file) {
         Ok(b) => b,
         Err(e) => {
             msg_box(owner, &format!("ファイルを読み込めません: {e}"), "インポート", MB_OK | MB_ICONERROR);
-            return false;
+            return None;
         }
     };
     let Some(text) = decode_text(&bytes) else {
         msg_box(owner, "文字コードを判別できません。UTF-8 または Shift_JIS で保存したファイルを指定してください。", "インポート", MB_OK | MB_ICONERROR);
-        return false;
+        return None;
     };
     // 拡張子が .json、または中身が [ か { で始まっていれば JSON として読む
     let head = text.trim_start_matches('\u{feff}').trim_start();
@@ -1378,7 +1451,7 @@ unsafe fn import_into(owner: HWND, dict: &DictConf, backup_root: &std::path::Pat
             Ok(r) => r,
             Err(e) => {
                 msg_box(owner, &format!("取り込めません。\n\n{e}"), "インポート", MB_OK | MB_ICONERROR);
-                return false;
+                return None;
             }
         }
     } else {
@@ -1391,37 +1464,56 @@ unsafe fn import_into(owner: HWND, dict: &DictConf, backup_root: &std::path::Pat
             "インポート",
             MB_OK | MB_ICONWARNING,
         );
-        return false;
+        return None;
     }
     let mut preview = String::new();
     for r in rows.iter().take(3) {
         let m: String = r.meaning.chars().take(30).map(|c| if c == '\n' { ' ' } else { c }).collect();
         preview.push_str(&format!("  ・{} — {}\n", r.word, m));
     }
-    let skip_note = if skipped > 0 { format!("\n(見出し語か意味が空の {skipped} 行は取り込みません)") } else { String::new() };
-    let ask = format!(
-        "{} 件を、辞書「{}」に取り込みます。{}\n\n{}{}\nすでに同じ見出し語と意味の語がある場合は、重複として飛ばします。\n取り込みますか?",
-        rows.len(),
-        dict.name,
-        skip_note,
-        preview,
-        if rows.len() > 3 { "  …\n" } else { "" }
-    );
-    if msg_box(owner, &ask, "インポート", MB_YESNO | MB_ICONQUESTION) != IDYES {
-        return false;
+    if rows.len() > 3 {
+        preview.push_str("  …\n");
     }
+    if skipped > 0 {
+        preview.push_str(&format!("(見出し語か意味が空の {skipped} 行は取り込みません)\n"));
+    }
+
+    // 3つの扱いそれぞれの見込みを出す(辞書は変更しない)。まだ無い辞書は、ここで作られる
     let old = SetCursor(LoadCursorW(None, IDC_WAIT).unwrap());
-    let r = safe::write(&dict.path, backup_root, |c| import::insert_rows(c, &rows));
+    let plans = core::open_ro(&dict.path).or_else(|_| core::open(&dict.path)).and_then(|c| {
+        let p = |mode| import::import_rows(&c, &rows, mode, true).map(|r| r.0);
+        Ok([p(import::Mode::KeepBoth)?, p(import::Mode::Overwrite)?, p(import::Mode::Skip)?])
+    });
+    SetCursor(old);
+    let plans = match plans {
+        Ok(p) => p,
+        Err(e) => {
+            msg_box(owner, &format!("辞書を読み込めません。\n\n{e}"), "インポート", MB_OK | MB_ICONERROR);
+            return None;
+        }
+    };
+    let mode = ask_import_mode(owner, &dict.name, rows.len(), &preview, &plans)?;
+
+    // 書き込みの中で、もう一度照合し直す(確認している間に、ほかの人が変更しているかもしれないため)
+    let old = SetCursor(LoadCursorW(None, IDC_WAIT).unwrap());
+    let r = safe::write(&dict.path, backup_root, |c| import::import_rows(c, &rows, mode, false));
     SetCursor(old);
     match r {
-        Ok((added, dup)) => {
-            let dup_note = if dup > 0 { format!("\n重複のため飛ばした語: {dup} 件") } else { String::new() };
-            msg_box(owner, &format!("{added} 件を取り込みました。{dup_note}"), "インポート", MB_OK | MB_ICONINFORMATION);
-            true
+        Ok((out, undo)) => {
+            let mut text = format!("{}。\n", out.summary());
+            let details = import::overwrite_details(&import::Outcome { changes: Vec::new(), ..out.clone() });
+            if !details.is_empty() {
+                text.push_str(&format!("\n{details}"));
+            }
+            if !undo.is_empty() {
+                text.push_str("\nこの取り込みは、設定の画面を閉じたあと、メイン画面の下段の「元に戻す」で取り消せます。");
+            }
+            msg_box(owner, &text, "インポート", MB_OK | MB_ICONINFORMATION);
+            Some((out, undo))
         }
         Err(e) => {
             msg_box(owner, &format!("取り込めませんでした。辞書は変更されていません。\n\n{e}"), "インポート", MB_OK | MB_ICONERROR);
-            false
+            None
         }
     }
 }
@@ -1592,52 +1684,105 @@ unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
 }
 
 // ============================================================================
-// JSON へのエクスポート
+// 書き出し(JSON / CSV / TSV)
 // ============================================================================
 
-unsafe fn pick_export_file(owner: HWND, default_name: &str) -> Option<String> {
+/// 書き出しの形式
+#[derive(Clone, Copy, PartialEq)]
+enum ExportKind {
+    Json,
+    Csv,
+    Tsv,
+}
+
+impl ExportKind {
+    fn ext(self) -> &'static str {
+        match self {
+            ExportKind::Json => "json",
+            ExportKind::Csv => "csv",
+            ExportKind::Tsv => "tsv",
+        }
+    }
+
+    fn of_ext(path: &str) -> Option<ExportKind> {
+        let l = path.to_lowercase();
+        [ExportKind::Json, ExportKind::Csv, ExportKind::Tsv].into_iter().find(|k| l.ends_with(&format!(".{}", k.ext())))
+    }
+}
+
+/// 書き出し先と形式を選んでもらう。
+/// ファイル名に .json / .csv / .tsv を書いていれば、その形式。書いていなければ「ファイルの種類」で決めて、拡張子を足す
+/// (保存の画面には拡張子を自動で足させない。足されたものか、書かれたものかを見分けられないため)
+unsafe fn pick_export_file(owner: HWND, default_name: &str) -> Option<(String, ExportKind)> {
     let mut buf = [0u16; 1024];
     for (i, ch) in default_name.encode_utf16().take(200).enumerate() {
         buf[i] = ch;
     }
-    let filter: Vec<u16> = "JSON (*.json)\0*.json\0すべてのファイル\0*.*\0\0".encode_utf16().collect();
+    let filter: Vec<u16> =
+        "JSON — そのまま取り込める控え (*.json)\0*.json\0CSV — Excel で開く (*.csv)\0*.csv\0TSV — タブ区切り (*.tsv)\0*.tsv\0すべてのファイル\0*.*\0\0".encode_utf16().collect();
     let mut ofn = OPENFILENAMEW {
         lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner,
         lpstrFilter: PCWSTR(filter.as_ptr()),
         lpstrFile: PWSTR(buf.as_mut_ptr()),
         nMaxFile: buf.len() as u32,
-        lpstrDefExt: w!("json"),
-        lpstrTitle: w!("書き出し先を指定"),
+        lpstrTitle: w!("書き出し先と形式を指定"),
         Flags: OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_OVERWRITEPROMPT,
         ..Default::default()
     };
-    if GetSaveFileNameW(&mut ofn).as_bool() {
-        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
-        Some(String::from_utf16_lossy(&buf[..len]))
-    } else {
-        None
+    if !GetSaveFileNameW(&mut ofn).as_bool() {
+        return None;
     }
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+    let chosen = String::from_utf16_lossy(&buf[..len]);
+    let (path, kind) = match ExportKind::of_ext(&chosen) {
+        Some(k) => (chosen.clone(), k),
+        None => {
+            let k = match ofn.nFilterIndex {
+                2 => ExportKind::Csv,
+                3 => ExportKind::Tsv,
+                _ => ExportKind::Json,
+            };
+            (format!("{chosen}.{}", k.ext()), k)
+        }
+    };
+    // 拡張子を足した場合は、上書きの確認をここで行う(保存の画面は、足す前の名前で確認している)
+    if path != chosen && std::path::Path::new(&path).exists() {
+        let text = format!("{path}\n\nこのファイルは、すでにあります。上書きしますか?");
+        if msg_box(owner, &text, "書き出し", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES {
+            return None;
+        }
+    }
+    Some((path, kind))
 }
 
-/// 辞書の全語を JSON ファイルに書き出す(辞書ファイルの現在の内容を読む)
+/// 辞書の全語をファイルに書き出す(辞書ファイルの現在の内容を読む)
 unsafe fn export_dict(owner: HWND, dict: &DictConf) {
     // ファイル名に使えない文字は置き換える
     let safe_name: String = dict.name.chars().map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c }).collect();
-    let Some(file) = pick_export_file(owner, &format!("{safe_name}.json")) else { return };
+    let Some((file, kind)) = pick_export_file(owner, &safe_name) else { return };
     let old = SetCursor(LoadCursorW(None, IDC_WAIT).unwrap());
     let loaded = core::open_ro(&dict.path).and_then(|c| core::load_all(&c));
     let result = match loaded {
         Ok(mut entries) => {
             core::sort_entries(&mut entries);
-            std::fs::write(&file, json_io::export(&entries)).map(|_| entries.len()).map_err(|e| e.to_string())
+            let text = match kind {
+                ExportKind::Json => json_io::export(&entries),
+                ExportKind::Csv => import::export_table(&entries, ','),
+                ExportKind::Tsv => import::export_table(&entries, '\t'),
+            };
+            std::fs::write(&file, text).map(|_| entries.len()).map_err(|e| e.to_string())
         }
         Err(e) => Err(format!("辞書を読み込めません: {e}")),
     };
     SetCursor(old);
     match result {
         Ok(n) => {
-            msg_box(owner, &format!("辞書「{}」の {n} 語を書き出しました。\n\n{file}\n\nこのファイルは「取り込む…」でそのまま取り込めます。", dict.name), "エクスポート", MB_OK | MB_ICONINFORMATION);
+            let note = match kind {
+                ExportKind::Json => "このファイルは「取り込む…」でそのまま取り込めます。",
+                _ => "表を直してから「取り込む…」で「上書きする」を選ぶと、直した内容を辞書に反映できます。\n「管理用」の列は、どの語かを見分けるためのものです。変えないでください。",
+            };
+            msg_box(owner, &format!("辞書「{}」の {n} 語を書き出しました。\n\n{file}\n\n{note}", dict.name), "エクスポート", MB_OK | MB_ICONINFORMATION);
         }
         Err(e) => {
             msg_box(owner, &format!("書き出せませんでした。\n\n{e}"), "エクスポート", MB_OK | MB_ICONERROR);

@@ -5,11 +5,12 @@
 //! - 登録・編集・設定はモーダルダイアログ。書き込みは safe モジュール経由(バックアップ + 検査 + ロールバック)
 //! - DBの読み込みは別スレッド。他の人の変更はウィンドウを前面に出したときに検知して読み直す
 
-use crate::bookmarks::Bookmarks;
+use crate::bookmarks::{Bookmark, Bookmarks};
 use crate::config::{self, Config, Sort};
 use crate::core::{self, Entry, Query};
 use crate::dialogs::{self, EntryDlg, SelectDlg, SettingsDlg};
 use crate::safe::{self, WriteError};
+use crate::undo::{self, Snapshot, Undo};
 use crate::ui::{self, quiet, scale, Btn, Fonts, BTN_W, CTL_H};
 use crate::ui::{get_text, send, set_text, wide};
 use std::cell::RefCell;
@@ -51,6 +52,7 @@ const ID_BM: usize = 123; // しおりを付ける/外す
 const ID_BACK: usize = 124; // リンクで移動する前の状態に戻る(Alt+←、マウスの戻るボタン)
 /// 戻れる回数の上限
 const BACK_MAX: usize = 50;
+const ID_UNDO: usize = 125; // 下段の「元に戻す」のリンク
 const HOTKEY_ID: i32 = 1;
 const WM_APP_LOADED: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
@@ -72,6 +74,7 @@ const CM_COPY_BOTH: usize = 213;
 const CM_EDIT: usize = 214;
 const CM_DELETE: usize = 215;
 const CM_BOOKMARK: usize = 216;
+const CM_UNDO: usize = 217;
 const CM_SORT_BASE: usize = 300;
 
 const EN_SETFOCUS_: usize = 0x0100;
@@ -120,6 +123,16 @@ struct View {
     selected: Option<(usize, i64)>,
 }
 
+/// 直前の操作(登録・編集・削除・取り込み)を元に戻すための記録。起動中だけ持つ
+struct UndoOp {
+    /// 何を元に戻すのか(例:「3 件の削除」)
+    label: String,
+    /// 辞書ごとの記録。辞書は、設定が変わっても探せるようにパスで持つ
+    parts: Vec<(PathBuf, Undo)>,
+    /// 削除と一緒に外したしおり(元に戻すときに付け直す)
+    bookmarks: Vec<Bookmark>,
+}
+
 struct InitData {
     cfg: Config,
     cfg_path: PathBuf,
@@ -150,6 +163,9 @@ struct State {
     btn_del: HWND,
     status: HWND,
     hint: HWND,
+    /// 下段の左端の「元に戻す」(元に戻せる操作があるときだけ表示)
+    undo_link: HWND,
+    undo_w: i32,
 
     fonts: Fonts,
     dpi: i32,
@@ -187,6 +203,8 @@ struct State {
     hover_link: Option<String>,
     /// リンクで移動する前の状態(新しいものが後ろ)。起動中だけ持ち、保存はしない
     back: Vec<View>,
+    /// 直前の操作を元に戻すための記録
+    undo: Option<UndoOp>,
 
     /// しおり(各自の設定フォルダに保存)
     bookmarks: Bookmarks,
@@ -643,6 +661,8 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
     let btn_del = owner_button(hwnd, ID_DEL, "削除");
     let status = create_child(hwnd, w!("STATIC"), 0, 0x0000000C | 0x80 /* SS_LEFTNOWORDWRAP | SS_NOPREFIX */, ID_STATUS).unwrap();
     let hint = create_child(hwnd, w!("STATIC"), 0, 0x2 | 0x80 /* SS_RIGHT | SS_NOPREFIX */, ID_HINT).unwrap();
+    let undo_link = create_child(hwnd, w!("SysLink"), 0, 0, ID_UNDO).unwrap_or_default();
+    let _ = ShowWindow(undo_link, SW_HIDE);
     set_text(hint, "↑↓ 候補    Ctrl+N 新規    F2 編集    Ctrl+D しおり    Esc 閉じる");
 
     let bm_path = init.cfg_path.with_file_name("bookmarks.tsv");
@@ -669,6 +689,8 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         btn_del,
         status,
         hint,
+        undo_link,
+        undo_w: 0,
         fonts,
         dpi,
         fields,
@@ -696,6 +718,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         asked_restore: HashSet::new(),
         hover_link: None,
         back: Vec::new(),
+        undo: None,
         bookmarks: if init_shared { Bookmarks::default() } else { Bookmarks::load(&bm_path) },
         bm_path,
         bm_map: HashMap::new(),
@@ -711,6 +734,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
 }
 
 unsafe fn apply_fonts(st: &State) {
+    send(st.undo_link, WM_SETFONT, st.fonts.small.0 as usize, 1);
     let f = &st.fonts;
     for (h, font) in [
         (st.edit, f.base),
@@ -767,7 +791,12 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
     let status_h = s(30);
     st.status_top = rc.bottom - status_h;
     let hint_w = (w * 62 / 100).min(s(600));
-    let _ = MoveWindow(st.status, m, st.status_top + s(6), w - hint_w - gap, s(20), true);
+    // 左端に「元に戻す」(元に戻せる操作があるときだけ)、その右に件数と操作の結果
+    let undo_w = if st.undo.is_some() { st.undo_w.min(w - hint_w - gap - s(80)).max(0) } else { 0 };
+    let _ = ShowWindow(st.undo_link, if undo_w > 0 { SW_SHOW } else { SW_HIDE });
+    let _ = MoveWindow(st.undo_link, m, st.status_top + s(6), undo_w, s(20), true);
+    let sx = m + undo_w + if undo_w > 0 { s(14) } else { 0 };
+    let _ = MoveWindow(st.status, sx, st.status_top + s(6), (m + w - hint_w - gap - sx).max(0), s(20), true);
     let _ = MoveWindow(st.hint, m + w - hint_w, st.status_top + s(6), hint_w, s(20), true);
     let bottom = st.status_top - s(12);
     let h = (bottom - top).max(s(80));
@@ -1591,6 +1620,11 @@ unsafe fn list_menu(hwnd: HWND, st: &mut State) {
     let _ = AppendMenuW(menu, gray(single && editable), CM_EDIT, w!("編集…\tF2"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, gray(editable), CM_DELETE, w!("削除\tDel"));
+    if let Some(op) = &st.undo {
+        let t = wide(&format!("元に戻す({})\tCtrl+Z", op.label));
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(menu, MF_STRING, CM_UNDO, PCWSTR(t.as_ptr()));
+    }
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
@@ -1600,6 +1634,7 @@ unsafe fn list_menu(hwnd: HWND, st: &mut State) {
         CM_BOOKMARK => toggle_bookmark(st),
         CM_EDIT => do_edit(hwnd, st),
         CM_DELETE => do_delete(hwnd, st),
+        CM_UNDO => do_undo(hwnd, st),
         _ => {}
     }
 }
@@ -1799,6 +1834,96 @@ unsafe fn after_write(hwnd: HWND, st: &mut State, d: usize, stale: bool, select:
     }
 }
 
+/// 見出し語を、案内の文に入れられる長さにする
+fn short(word: &str) -> String {
+    if word.chars().count() > 20 {
+        format!("{}…", word.chars().take(20).collect::<String>())
+    } else {
+        word.to_string()
+    }
+}
+
+/// 元に戻せる操作を控える(None なら消す)。下段の「元に戻す」の表示も合わせる
+unsafe fn set_undo(hwnd: HWND, st: &mut State, op: Option<UndoOp>) {
+    st.undo = op.filter(|o| o.parts.iter().any(|p| !p.1.is_empty()));
+    let text = match &st.undo {
+        // SysLink は <a> を記号として読むので、語の中の < > は全角にしておく
+        Some(o) => format!("<a>元に戻す</a>({})", o.label.replace('<', "＜").replace('>', "＞")),
+        None => String::new(),
+    };
+    set_text(st.undo_link, &text);
+    let mut ideal = SIZE::default();
+    send(st.undo_link, LM_GETIDEALSIZE, scale(400, st.dpi) as usize, &mut ideal as *mut _ as isize);
+    st.undo_w = ideal.cx;
+    layout(hwnd, st);
+}
+
+/// 直前の操作を元に戻す。ほかの人がその後に変更した語は戻さず、件数を知らせる
+unsafe fn do_undo(hwnd: HWND, st: &mut State) {
+    let Some(op) = st.undo.take() else {
+        notice(st, "元に戻せる操作がありません");
+        return;
+    };
+    let text = format!("直前の操作({})を元に戻しますか?", op.label);
+    if message_box(hwnd, &text, "元に戻す", MB_YESNO | MB_ICONQUESTION) != IDYES {
+        st.undo = Some(op);
+        return;
+    }
+    let mut total = undo::Reverted::default();
+    let mut left: Vec<(PathBuf, Undo)> = Vec::new(); // 戻せなかった分(あとでやり直せるように残す)
+    let mut errors: Vec<String> = Vec::new();
+    for (path, u) in op.parts {
+        let Some(d) = st.dicts.iter().position(|x| x.path == path) else {
+            errors.push(format!("辞書 {} は、いまの設定にありません", path.display()));
+            left.push((path, u));
+            continue;
+        };
+        if let Err(m) = writable(&st.dicts[d]) {
+            errors.push(m);
+            left.push((path, u));
+            continue;
+        }
+        let (r, _) = guarded(st, d, |c| undo::revert(c, &u));
+        match r {
+            Ok(rv) => {
+                total.done += rv.done;
+                total.skipped += rv.skipped;
+            }
+            Err(e) => {
+                errors.push(format!("辞書「{}」: {}", st.dicts[d].name, e));
+                left.push((path, u));
+            }
+        }
+    }
+    // 削除と一緒に外したしおりを、付け直す
+    if !op.bookmarks.is_empty() && !st.cfg.shared && left.is_empty() {
+        for b in op.bookmarks {
+            if st.bookmarks.added(&b.dict, b.id).is_none() {
+                st.bookmarks.items.push(b);
+            }
+        }
+        rebuild_bm_map(st);
+        save_bookmarks(st);
+    }
+    let retry = if left.is_empty() { None } else { Some(UndoOp { label: op.label.clone(), parts: left, bookmarks: Vec::new() }) };
+    set_undo(hwnd, st, retry);
+    // 内容を読み直す(読み終わるまで、今の表示のまま)。結果の案内は、読み終わったときに下段へ出す
+    if total.done > 0 {
+        st.warns.push(format!("元に戻しました({})", op.label));
+    }
+    remember_selection(st);
+    start_load(hwnd, st, true);
+    if !errors.is_empty() {
+        message_box(hwnd, &format!("元に戻せなかった操作があります。\n\n{}", errors.join("\n")), "元に戻す", MB_OK | MB_ICONWARNING);
+    } else if total.skipped > 0 {
+        let text = format!(
+            "{} 件を元に戻しました。\n\n{} 件は、ほかの人がその後に変更または削除していたため、元に戻していません。",
+            total.done, total.skipped
+        );
+        message_box(hwnd, &text, "元に戻す", MB_OK | MB_ICONINFORMATION);
+    }
+}
+
 unsafe fn do_new(hwnd: HWND, st: &mut State) {
     if !st.loaded {
         notice(st, "データベースの読み込みが完了していません");
@@ -1843,9 +1968,15 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
     let (r, stale) = guarded(st, d, |c| core::insert_entry(c, &fields, None));
     match r {
         Ok(entry) => {
-            let id = entry.id;
+            let (id, ts) = (entry.id, entry.updated_at);
             st.entries.push(entry.with_dict(d));
             core::sort_entries(&mut st.entries);
+            let op = UndoOp {
+                label: format!("「{}」の登録", short(&dlg.word)),
+                parts: vec![(st.dicts[d].path.clone(), Undo { inserted: vec![(id, ts)], ..Default::default() })],
+                bookmarks: Vec::new(),
+            };
+            set_undo(hwnd, st, Some(op));
             after_write(hwnd, st, d, stale, Some((d, id)));
             let msg = if st.dicts.len() > 1 {
                 format!("「{}」を「{}」に登録しました", dlg.word, st.dicts[d].name)
@@ -1897,6 +2028,12 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
     let (r, stale) = guarded(st, e.dict, |c| core::update(c, e.id, e.updated_at, &fields));
     match r {
         Ok(ts) => {
+            let op = UndoOp {
+                label: format!("「{}」の編集", short(&e.word)),
+                parts: vec![(st.dicts[e.dict].path.clone(), Undo { updated: vec![(Snapshot::of(&e), ts)], ..Default::default() })],
+                bookmarks: Vec::new(),
+            };
+            set_undo(hwnd, st, Some(op));
             if let Some(x) = st.entries.iter_mut().find(|x| x.dict == e.dict && x.id == e.id) {
                 *x = Entry::new(e.id, dlg.word.clone(), dlg.meaning.clone(), dlg.tags.clone(), ts).with_dict(e.dict).with_link(dlg.link.clone()).with_reading(dlg.reading.clone());
             }
@@ -1932,7 +2069,7 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
         }
         t
     };
-    text.push_str("\nこの操作は元に戻せません。");
+    text.push_str("\n削除した直後なら、下段の「元に戻す」で取り消せます。");
     if message_box(hwnd, &text, "削除の確認", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES {
         return;
     }
@@ -1945,13 +2082,16 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
     let mut removed: HashSet<(usize, i64)> = HashSet::new();
     let mut any_stale = false;
     let mut failed: Option<(usize, WriteError)> = None;
+    // 元に戻せるように、消す前の内容を控える
+    let mut undo_parts: Vec<(PathBuf, Undo)> = Vec::new();
     for (d, ids) in by_dict.iter().enumerate() {
         if ids.is_empty() {
             continue;
         }
-        let (r, stale) = guarded(st, d, |c| core::delete_ids(c, ids));
+        let (r, stale) = guarded(st, d, |c| undo::delete_with_snapshots(c, ids));
         match r {
-            Ok(_) => {
+            Ok(snaps) => {
+                undo_parts.push((st.dicts[d].path.clone(), Undo { deleted: snaps, ..Default::default() }));
                 removed.extend(ids.iter().map(|&id| (d, id)));
                 any_stale |= stale;
                 st.dicts[d].stamp = safe::file_stamp(&st.dicts[d].path);
@@ -1964,17 +2104,24 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
     }
     st.entries.retain(|e| !removed.contains(&(e.dict, e.id)));
     st.last_query = None; // 添字が変わったので、前回の検索結果は再利用しない
-    // 削除した語のしおりも外す
-    let mut dropped = 0;
+    // 削除した語のしおりも外す(元に戻すときに付け直せるよう、控えておく)
+    let mut dropped: Vec<Bookmark> = Vec::new();
     for (d, ids) in by_dict.iter().enumerate() {
         let gone: Vec<i64> = ids.iter().copied().filter(|&id| removed.contains(&(d, id))).collect();
         if !gone.is_empty() {
-            dropped += st.bookmarks.remove_ids(&st.dicts[d].path.to_string_lossy(), &gone);
+            let path = st.dicts[d].path.to_string_lossy().to_string();
+            let key = path.to_lowercase();
+            dropped.extend(st.bookmarks.items.iter().filter(|b| gone.contains(&b.id) && b.dict.to_lowercase() == key).cloned());
+            st.bookmarks.remove_ids(&path, &gone);
         }
     }
-    if dropped > 0 {
+    if !dropped.is_empty() {
         rebuild_bm_map(st);
         save_bookmarks(st);
+    }
+    if !removed.is_empty() {
+        let op = UndoOp { label: format!("{} 件の削除", removed.len()), parts: undo_parts, bookmarks: dropped };
+        set_undo(hwnd, st, Some(op));
     }
     if any_stale {
         start_load(hwnd, st, true);
@@ -1988,8 +2135,13 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
 }
 
 unsafe fn do_settings(hwnd: HWND, st: &mut State) {
-    let mut dlg = SettingsDlg { cfg: st.cfg.clone(), backup_root: backup_root(), cfg_path: st.cfg_path.clone(), imported: false, ok: false };
-    if !dialogs::settings_dialog(hwnd, &mut dlg) {
+    let mut dlg = SettingsDlg { cfg: st.cfg.clone(), backup_root: backup_root(), cfg_path: st.cfg_path.clone(), imported: false, undo: None, ok: false };
+    let saved = dialogs::settings_dialog(hwnd, &mut dlg);
+    // 設定の画面で取り込みを行っていたら、元に戻せるようにする
+    if let Some((path, u, label)) = dlg.undo.take() {
+        set_undo(hwnd, st, Some(UndoOp { label, parts: vec![(path, u)], bookmarks: Vec::new() }));
+    }
+    if !saved {
         // キャンセルでも、インポートを実行していたら辞書を読み直す
         if dlg.imported {
             start_load(hwnd, st, true);
@@ -2146,7 +2298,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let id = GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize;
             match state(hwnd) {
                 Some(st) => match id {
-                    ID_STATUS | ID_HINT => ui::ctl_color(hdc, ui::MUTED, ui::WHITE, st.white),
+                    ID_STATUS | ID_HINT | ID_UNDO => ui::ctl_color(hdc, ui::MUTED, ui::WHITE, st.white),
                     _ => ui::ctl_color(hdc, ui::TEXT, ui::WHITE, st.white),
                 },
                 None => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -2285,6 +2437,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_NOTIFY => {
             let hdr = &*(lparam.0 as *const NMHDR);
             let Some(st) = state(hwnd) else { return LRESULT(0) };
+            if hdr.idFrom == ID_UNDO {
+                if hdr.code == NM_CLICK || hdr.code == NM_RETURN {
+                    do_undo(hwnd, st);
+                }
+                return LRESULT(0);
+            }
             if hdr.idFrom == ID_RICH {
                 if hdr.code == EN_MSGFILTER {
                     let mf = &*(lparam.0 as *const MSGFILTER);
@@ -2338,6 +2496,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let kd = &*(lparam.0 as *const NMLVKEYDOWN);
                     if kd.wVKey == 'C' as u16 && GetKeyState(VK_CONTROL.0 as i32) < 0 {
                         copy_selected(hwnd, st, CM_COPY_BOTH);
+                    } else if kd.wVKey == 'Z' as u16 && GetKeyState(VK_CONTROL.0 as i32) < 0 {
+                        do_undo(hwnd, st);
                     } else if kd.wVKey == VK_DELETE.0 {
                         do_delete(hwnd, st);
                     } else if kd.wVKey == VK_RETURN.0 {
