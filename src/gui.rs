@@ -26,7 +26,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED};
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, LoadLibraryW};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Controls::RichEdit::*;
 use windows::Win32::UI::Controls::*;
@@ -218,7 +218,6 @@ struct State {
     list_box: RECT,
     pane: RECT,
     status_top: i32,
-    white: HBRUSH,
 
     cfg: Config,
     cfg_path: PathBuf,
@@ -350,6 +349,8 @@ pub fn run() {
         }
 
         let init = load_config();
+        // 配色は、ウィンドウを作る前に決める(設定を変えても、次に起動するまでは変わらない)
+        ui::init_theme(init.cfg.theme);
         // 本文に画像を入れる処理が COM を使う
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let icc = INITCOMMONCONTROLSEX {
@@ -365,7 +366,7 @@ pub fn run() {
             lpfnWndProc: Some(wndproc),
             hInstance: hinst.into(),
             hCursor: LoadCursorW(None, IDC_ARROW).unwrap(),
-            hbrBackground: CreateSolidBrush(ui::WHITE),
+            hbrBackground: CreateSolidBrush(ui::pal().bg),
             lpszClassName: CLASS_NAME,
             hIcon: ui::app_icon(),
             hIconSm: ui::app_icon(),
@@ -389,6 +390,7 @@ pub fn run() {
             Some(init_ptr as *const c_void),
         )
         .unwrap();
+        ui::apply_dark(hwnd);
 
         // ウィンドウを先に出す(すぐ入力できる)。読み込みは裏で。
         if !background {
@@ -710,7 +712,15 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
     let rich_style = WS_VSCROLL.0 | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32;
     let (rich, rich_ok) = match create_child(hwnd, w!("RICHEDIT50W"), 0, rich_style, ID_RICH) {
         Some(h) => {
-            send(h, EM_SETBKGNDCOLOR, 0, ui::WHITE.0 as isize);
+            send(h, EM_SETBKGNDCOLOR, 0, ui::pal().bg.0 as isize);
+            if ui::pal().dark {
+                // 書式を付けていない文字(既定は黒)が、暗い地の上で見えなくならないように、既定の文字の色を決めておく
+                let mut cf = CHARFORMAT2W::default();
+                cf.Base.cbSize = std::mem::size_of::<CHARFORMAT2W>() as u32;
+                cf.Base.dwMask = CFM_COLOR;
+                cf.Base.crTextColor = ui::pal().text;
+                send(h, EM_SETCHARFORMAT, 0 /* SCF_DEFAULT */, &cf as *const _ as isize);
+            }
             // リンクは自前で範囲を管理し、マウス操作(EN_MSGFILTER)から判定する。
             // RichEdit の URL 自動検出は、URL の形をしていない表示名のリンク属性を消してしまうので使わない
             send(h, EM_AUTOURLDETECT, 0, 0);
@@ -763,7 +773,6 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         list_box: RECT::default(),
         pane: RECT::default(),
         status_top: 0,
-        white: CreateSolidBrush(ui::WHITE),
         warns: init.warns,
         cfg: init.cfg,
         cfg_path: init.cfg_path,
@@ -930,12 +939,12 @@ unsafe fn paint(hwnd: HWND, st: &State) {
     let hdc = BeginPaint(hwnd, &mut ps);
     let mut rc = RECT::default();
     let _ = GetClientRect(hwnd, &mut rc);
-    ui::fill(hdc, &rc, ui::WHITE);
-    ui::fill(hdc, &RECT { left: 0, top: st.status_top, right: rc.right, bottom: st.status_top + 1 }, ui::BORDER);
+    ui::fill(hdc, &rc, ui::pal().bg);
+    ui::fill(hdc, &RECT { left: 0, top: st.status_top, right: rc.right, bottom: st.status_top + 1 }, ui::pal().border);
     let r = scale(12, st.dpi);
-    ui::round_box(hdc, &st.list_box, ui::WHITE, ui::BORDER, r);
-    ui::round_box(hdc, &st.pane, ui::WHITE, ui::BORDER, r);
-    ui::fill(hdc, &RECT { left: st.list_box.left + 1, top: st.list_sep, right: st.list_box.right - 1, bottom: st.list_sep + 1 }, ui::HAIRLINE);
+    ui::round_box(hdc, &st.list_box, ui::pal().bg, ui::pal().border, r);
+    ui::round_box(hdc, &st.pane, ui::pal().bg, ui::pal().border, r);
+    ui::fill(hdc, &RECT { left: st.list_box.left + 1, top: st.list_sep, right: st.list_box.right - 1, bottom: st.list_sep + 1 }, ui::pal().hairline);
     ui::paint_fields(hdc, &st.fields, st.dpi);
     let _ = EndPaint(hwnd, &ps);
 }
@@ -945,16 +954,18 @@ unsafe fn paint(hwnd: HWND, st: &State) {
 unsafe fn draw_row(st: &State, hdc: HDC, row: usize) {
     let mut rc = RECT::default(); // left = LVIR_BOUNDS(0)
     send(st.list, LVM_GETITEMRECT_, row, &mut rc as *mut _ as isize);
+    // 行は、欄の左端から描く(環境によって、行の左端が 2 ピクセルずれて返ることがあり、選択の印が消え残るため)
+    rc.left = 0;
     let Some(&idx) = st.matches.get(row) else { return };
     let e = &st.entries[idx as usize];
     let s = |v: i32| scale(v, st.dpi);
     let selected = send(st.list, LVM_GETITEMSTATE_, row, LVIS_SELECTED.0 as isize).0 as u32 & LVIS_SELECTED.0 != 0;
 
-    ui::fill(hdc, &rc, if selected { ui::ACCENT_SOFT } else { ui::WHITE });
+    ui::fill(hdc, &rc, if selected { ui::pal().accent_soft } else { ui::pal().bg });
     if selected {
-        ui::fill(hdc, &RECT { left: rc.left, top: rc.top + s(6), right: rc.left + s(4), bottom: rc.bottom - s(6) }, ui::ACCENT);
+        ui::fill(hdc, &RECT { left: rc.left, top: rc.top + s(6), right: rc.left + s(4), bottom: rc.bottom - s(6) }, ui::pal().accent);
     }
-    ui::fill(hdc, &RECT { left: rc.left + s(14), top: rc.bottom - 1, right: rc.right, bottom: rc.bottom }, ui::HAIRLINE);
+    ui::fill(hdc, &RECT { left: rc.left + s(14), top: rc.bottom - 1, right: rc.right, bottom: rc.bottom }, ui::pal().hairline);
 
     let (x0, x1) = (rc.left + s(16), rc.right - s(12));
     let (y1, y2) = (rc.top + s(9), rc.top + s(33));
@@ -965,13 +976,13 @@ unsafe fn draw_row(st: &State, hdc: HDC, row: usize) {
     let tags_w = if tags.is_empty() { 0 } else { ui::text_width(hdc, &tags).min((x1 - x0) * 45 / 100) };
     if tags_w > 0 {
         let r = RECT { left: x1 - tags_w, top: y1 + s(3), right: x1, bottom: y2 };
-        ui::draw_marked(hdc, &tags, &core::mark_ranges(&tags, &st.marks.2), &r, ui::MUTED, ui::MARK);
+        ui::draw_marked(hdc, &tags, &core::mark_ranges(&tags, &st.marks.2), &r, ui::pal().muted, ui::pal().mark);
     }
     let dict = if st.dicts.len() > 1 { st.dicts.get(e.dict).map_or("", |d| d.name.as_str()) } else { "" };
     let dict_w = if dict.is_empty() { 0 } else { ui::text_width(hdc, dict).min((x1 - x0) * 40 / 100) };
     if dict_w > 0 {
         let r = RECT { left: x1 - dict_w, top: y2, right: x1, bottom: rc.bottom };
-        ui::draw_marked(hdc, dict, &[], &r, ui::MUTED, ui::MARK);
+        ui::draw_marked(hdc, dict, &[], &r, ui::pal().muted, ui::pal().mark);
     }
 
     // 2行目: 意味の抜粋
@@ -979,13 +990,13 @@ unsafe fn draw_row(st: &State, hdc: HDC, row: usize) {
     let head: String = e.meaning.chars().take(240).collect();
     let snippet: String = core::body_links(&head).0.chars().map(|c| if c == '\r' || c == '\n' { ' ' } else { c }).collect();
     let r2 = RECT { left: x0, top: y2, right: x1 - dict_w - if dict_w > 0 { s(10) } else { 0 }, bottom: rc.bottom };
-    ui::draw_marked(hdc, &snippet, &core::mark_ranges(&snippet, &st.marks.1), &r2, ui::MUTED, ui::MARK);
+    ui::draw_marked(hdc, &snippet, &core::mark_ranges(&snippet, &st.marks.1), &r2, ui::pal().muted, ui::pal().mark);
 
     // しおり付きは、タグの左に ★
     let star_w = if st.bm_map.contains_key(&(e.dict, e.id)) {
         let sw = ui::text_width(hdc, "★");
         let sx = x1 - tags_w - if tags_w > 0 { s(8) } else { 0 } - sw;
-        ui::draw_marked(hdc, "★", &[], &RECT { left: sx, top: y1 + s(3), right: sx + sw, bottom: y2 }, ui::STAR, ui::MARK);
+        ui::draw_marked(hdc, "★", &[], &RECT { left: sx, top: y1 + s(3), right: sx + sw, bottom: y2 }, ui::pal().star, ui::pal().mark);
         sw + s(8)
     } else {
         0
@@ -994,14 +1005,14 @@ unsafe fn draw_row(st: &State, hdc: HDC, row: usize) {
     // 1行目: 見出し語
     SelectObject(hdc, st.fonts.heading);
     let r1 = RECT { left: x0, top: y1, right: x1 - tags_w - star_w - if tags_w > 0 { s(10) } else { 0 }, bottom: y2 };
-    ui::draw_marked(hdc, &e.word, &core::mark_ranges(&e.word, &st.marks.0), &r1, ui::TEXT, ui::MARK);
+    ui::draw_marked(hdc, &e.word, &core::mark_ranges(&e.word, &st.marks.0), &r1, ui::pal().text, ui::pal().mark);
     // 見出し語の右に、読みを小さく添える(かなの種類を区別せずに強調)
     if !e.reading.is_empty() {
         let word_w = ui::text_width(hdc, &e.word);
         SelectObject(hdc, st.fonts.small);
         let rr = RECT { left: r1.left + word_w + s(10), top: y1 + s(3), right: r1.right, bottom: y2 };
         if rr.right - rr.left > s(24) {
-            ui::draw_marked(hdc, &e.reading, &reading_marks(&e.reading, &st.marks.0), &rr, ui::MUTED, ui::MARK);
+            ui::draw_marked(hdc, &e.reading, &reading_marks(&e.reading, &st.marks.0), &rr, ui::pal().muted, ui::pal().mark);
         }
     }
     SelectObject(hdc, old);
@@ -1219,14 +1230,22 @@ unsafe fn rich_format(rich: HWND, range: (usize, usize), pt: Option<i32>, bold: 
     send(rich, EM_SETCHARFORMAT, SCF_SELECTION as usize, &cf as *const _ as isize);
 }
 
-/// 範囲をリンク(クリックで EN_LINK が届く)にする
+/// 範囲を、リンクの見た目にする(クリックは、自前の表 `State::links` で判定する)。
+/// 明るい配色では、RichEdit のリンクの書式(青い文字に下線)を使う。
+/// 暗い配色では、その青が暗い地の上で読みにくいので、色と下線を自分で付ける
 unsafe fn rich_link(rich: HWND, range: (usize, usize)) {
     let cr = CHARRANGE { cpMin: range.0 as i32, cpMax: range.1 as i32 };
     send(rich, EM_EXSETSEL, 0, &cr as *const _ as isize);
     let mut cf = CHARFORMAT2W::default();
     cf.Base.cbSize = std::mem::size_of::<CHARFORMAT2W>() as u32;
-    cf.Base.dwMask = CFM_LINK;
-    cf.Base.dwEffects = CFE_LINK;
+    if ui::pal().dark {
+        cf.Base.dwMask = CFM_COLOR | CFM_UNDERLINE;
+        cf.Base.dwEffects = CFE_UNDERLINE;
+        cf.Base.crTextColor = ui::pal().accent;
+    } else {
+        cf.Base.dwMask = CFM_LINK;
+        cf.Base.dwEffects = CFE_LINK;
+    }
     send(rich, EM_SETCHARFORMAT, SCF_SELECTION as usize, &cf as *const _ as isize);
 }
 
@@ -1301,26 +1320,26 @@ unsafe fn render(
     }
     send(st.rich, WM_SETREDRAW, 0, 0);
     set_text(st.rich, &text.replace('\n', "\r\n"));
-    rich_format(st.rich, r_title, Some(20), true, ui::TEXT);
-    rich_format(st.rich, r_reading, Some(11), false, ui::MUTED);
+    rich_format(st.rich, r_title, Some(20), true, ui::pal().text);
+    rich_format(st.rich, r_reading, Some(11), false, ui::pal().muted);
     for (a, b) in reading_marks(reading, &st.marks.0) {
-        rich_format(st.rich, (r_reading.0 + a, r_reading.0 + b), None, false, ui::MARK);
+        rich_format(st.rich, (r_reading.0 + a, r_reading.0 + b), None, false, ui::pal().mark);
     }
-    rich_format(st.rich, r_meta, Some(9), false, ui::MUTED);
-    rich_format(st.rich, r_gap, Some(6), false, ui::MUTED); // 見出し部分と意味の間の空行は小さく
-    rich_format(st.rich, r_body, Some(12), false, ui::TEXT);
-    rich_format(st.rich, r_gap2, Some(8), false, ui::MUTED);
-    rich_format(st.rich, r_head, Some(9), true, ui::MUTED);
+    rich_format(st.rich, r_meta, Some(9), false, ui::pal().muted);
+    rich_format(st.rich, r_gap, Some(6), false, ui::pal().muted); // 見出し部分と意味の間の空行は小さく
+    rich_format(st.rich, r_body, Some(12), false, ui::pal().text);
+    rich_format(st.rich, r_gap2, Some(8), false, ui::pal().muted);
+    rich_format(st.rich, r_head, Some(9), true, ui::pal().muted);
     for (i, (bullet, name)) in r_links.iter().enumerate() {
-        rich_format(st.rich, *bullet, Some(10), false, ui::MUTED);
-        rich_format(st.rich, *name, Some(10), false, ui::ACCENT);
+        rich_format(st.rich, *bullet, Some(10), false, ui::pal().muted);
+        rich_format(st.rich, *name, Some(10), false, ui::pal().accent);
         rich_link(st.rich, *name);
         store.push((name.0 as i32, name.1 as i32, links[i].1.clone()));
     }
     // 意味の文中のリンク([[語]] と URL)
     for (a, b, target) in body_links {
         let r = (r_body.0 + a, r_body.0 + b);
-        rich_format(st.rich, r, None, false, ui::ACCENT);
+        rich_format(st.rich, r, None, false, ui::pal().accent);
         rich_link(st.rich, r);
         store.push((r.0 as i32, r.1 as i32, target.clone()));
     }
@@ -1331,13 +1350,13 @@ unsafe fn render(
         store.push((r.0 as i32, r.1 as i32, target.clone()));
     }
     for &(a, b) in title_marks {
-        rich_format(st.rich, (r_title.0 + a, r_title.0 + b), None, true, ui::MARK);
+        rich_format(st.rich, (r_title.0 + a, r_title.0 + b), None, true, ui::pal().mark);
     }
     for &(a, b) in meta_marks {
-        rich_format(st.rich, (r_meta.0 + a, r_meta.0 + b), None, false, ui::MARK);
+        rich_format(st.rich, (r_meta.0 + a, r_meta.0 + b), None, false, ui::pal().mark);
     }
     for &(a, b) in body_marks {
-        rich_format(st.rich, (r_body.0 + a, r_body.0 + b), None, true, ui::MARK);
+        rich_format(st.rich, (r_body.0 + a, r_body.0 + b), None, true, ui::pal().mark);
     }
     let cr = CHARRANGE { cpMin: 0, cpMax: 0 };
     send(st.rich, EM_EXSETSEL, 0, &cr as *const _ as isize);
@@ -1454,15 +1473,8 @@ unsafe fn decode_dib(pic: &Pic, w: i32, h: i32) -> Option<Vec<u8>> {
     scaler.Initialize(&conv, w as u32, h as u32, WICBitmapInterpolationModeFant).ok()?;
     let mut pixels = vec![0u8; w as usize * h as usize * 4];
     scaler.CopyPixels(std::ptr::null(), w as u32 * 4, &mut pixels).ok()?;
-    let bg = ui::WHITE.0;
+    let bg = ui::pal().bg.0;
     pics::dib_from_pbgra(&pixels, w as usize, h as usize, ((bg & 0xFF) as u8, ((bg >> 8) & 0xFF) as u8, ((bg >> 16) & 0xFF) as u8))
-}
-
-/// Wine(Linux などで Windows のアプリを動かす仕組み)の上で動いているか
-unsafe fn on_wine() -> bool {
-    use std::sync::OnceLock;
-    static WINE: OnceLock<bool> = OnceLock::new();
-    *WINE.get_or_init(|| GetModuleHandleW(w!("ntdll.dll")).map_or(false, |m| GetProcAddress(m, windows::core::s!("wine_get_version")).is_some()))
 }
 
 /// 選択範囲を、画像に置き換える(画像を DIB に変換して、RTF の形で渡す方法)。
@@ -1472,7 +1484,7 @@ unsafe fn insert_image_rtf(rich: HWND, pic: &Pic, w: i32, h: i32, dpi: i32) -> b
     // RTF の `\dibitmap` は「情報ヘッダ(40 バイト)のすぐ後ろに画素」という並び。
     // Wine の RichEdit は、ヘッダを 44 バイトとして読む(色の表が1つあるものとして数える)ので、
     // Wine の上では 4 バイト空けておく。空けないと、色が1バイトぶんずれて表示される
-    if on_wine() {
+    if ui::on_wine() {
         dib.splice(40..40, [0u8; 4]);
     }
     let tw = |px: i32| px as i64 * 1440 / dpi.max(1) as i64;
@@ -1802,7 +1814,7 @@ unsafe fn do_tags(hwnd: HWND, st: &mut State) {
     let checked: Vec<String> = tags.iter().filter(|(t, _)| current.contains(&core::fold(t))).map(|(t, _)| t.clone()).collect();
     let mut dlg = TagsDlg {
         title: "タグの一覧".into(),
-        note: "チェックを入れたタグの、すべてが付いた語に絞り込みます。\n名前の変更と削除は、タグを選んで(青く表示して)から押します。".into(),
+        note: "チェックを入れたタグの、すべてが付いた語に絞り込みます。\n名前の変更と削除は、タグの行を選んでから押します。".into(),
         tags,
         checked,
         manage: true,
@@ -2359,10 +2371,19 @@ unsafe fn set_undo(hwnd: HWND, st: &mut State, op: Option<UndoOp>) {
     st.undo = op.filter(|o| o.parts.iter().any(|p| !p.1.is_empty()));
     let text = match &st.undo {
         // SysLink は <a> を記号として読むので、語の中の < > は全角にしておく
-        Some(o) => format!("<a>元に戻す</a>({})", o.label.replace('<', "＜").replace('>', "＞")),
+        Some(o) => {
+            let label = o.label.replace('<', "＜").replace('>', "＞");
+            if ui::pal().dark {
+                // 暗い配色では、全体をリンクにする(リンクでない部分の文字の色は、部品まかせで、暗い地の上で読めないことがある)
+                format!("<a>元に戻す({label})</a>")
+            } else {
+                format!("<a>元に戻す</a>({label})")
+            }
+        }
         None => String::new(),
     };
     set_text(st.undo_link, &text);
+    ui::dark_link(st.undo_link);
     let mut ideal = SIZE::default();
     send(st.undo_link, LM_GETIDEALSIZE, scale(400, st.dpi) as usize, &mut ideal as *mut _ as isize);
     st.undo_w = ideal.cx;
@@ -2826,15 +2847,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORBTN => {
-            let hdc = HDC(wparam.0 as *mut c_void);
             let id = GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize;
-            match state(hwnd) {
-                Some(st) => match id {
-                    ID_STATUS | ID_HINT | ID_UNDO => ui::ctl_color(hdc, ui::MUTED, ui::WHITE, st.white),
-                    _ => ui::ctl_color(hdc, ui::TEXT, ui::WHITE, st.white),
-                },
-                None => DefWindowProcW(hwnd, msg, wparam, lparam),
-            }
+            let color = if matches!(id, ID_STATUS | ID_HINT | ID_UNDO) { ui::pal().muted } else { ui::pal().text };
+            ui::ctl_color(hwnd, msg, wparam, lparam, color)
         }
         WM_DRAWITEM => {
             let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
@@ -2848,7 +2863,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     ID_BM => Btn::Toggle(dis.itemState.0 & 0x4 == 0 && get_text(st.btn_bm).starts_with('★')),
                     _ => Btn::Secondary,
                 };
-                ui::draw_button(dis, kind, st.fonts.base, ui::WHITE, st.dpi);
+                ui::draw_button(dis, kind, st.fonts.base, ui::pal().bg, st.dpi);
             }
             LRESULT(1)
         }
@@ -3047,10 +3062,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 } else if hdr.code == LVN_ITEMCHANGED {
                     let nm = &*(lparam.0 as *const NMLISTVIEW);
                     if (nm.uOldState ^ nm.uNewState) & LVIS_SELECTED.0 != 0 {
+                        // 行の左端まで描き直す(部品が描き直す範囲が、行の左端の 2 ピクセルを含まない環境があり、
+                        // 選択の印が消え残るため)。iItem が -1 のときは、すべての行
+                        if nm.iItem >= 0 {
+                            let mut rc = RECT::default();
+                            send(st.list, LVM_GETITEMRECT_, nm.iItem as usize, &mut rc as *mut _ as isize);
+                            rc.left = 0;
+                            let _ = InvalidateRect(st.list, Some(&rc), false);
+                        } else {
+                            let _ = InvalidateRect(st.list, None, false);
+                        }
                         update_detail(st);
                     }
                 } else if hdr.code == LVN_ODSTATECHANGED {
                     // 仮想リストでは、範囲選択(Shift+クリック / Ctrl+A)はこの通知で届く
+                    let _ = InvalidateRect(st.list, None, false);
                     update_detail(st);
                 } else if hdr.code == NM_DBLCLK {
                     do_edit(hwnd, st);
@@ -3160,7 +3186,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if !p.is_null() {
                 let st = Box::from_raw(p);
                 st.fonts.destroy();
-                let _ = DeleteObject(st.white);
             }
             PostQuitMessage(0);
             LRESULT(0)

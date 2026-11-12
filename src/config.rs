@@ -69,6 +69,46 @@ impl Sort {
     }
 }
 
+/// 画面の配色
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Theme {
+    /// 明るい配色(既定)
+    Light,
+    /// 暗い配色
+    Dark,
+    /// Windows の設定(アプリの色)に合わせる
+    System,
+}
+
+impl Theme {
+    pub fn key(self) -> &'static str {
+        match self {
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+            Theme::System => "system",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Theme> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "light" => Some(Theme::Light),
+            "dark" => Some(Theme::Dark),
+            "system" => Some(Theme::System),
+            _ => None,
+        }
+    }
+
+    /// 設定の画面に表示する名前
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Light => "明るい",
+            Theme::Dark => "暗い",
+            Theme::System => "Windows の設定に合わせる",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// None ならホットキー無効
@@ -80,6 +120,8 @@ pub struct Config {
     /// 共用フォルダでの運用(この設定ファイルを複数人で使う)。
     /// 個人ごとの情報を設定の場所に書き込まないよう、しおりを無効にし、並び順も保存しない
     pub shared: bool,
+    /// 画面の配色(変更は、次に起動したときから反映する)
+    pub theme: Theme,
     pub dicts: Vec<DictConf>,
 }
 
@@ -91,6 +133,7 @@ impl Config {
             sort: Sort::Word,
             title: String::new(),
             shared: false,
+            theme: Theme::Light,
             dicts: vec![DictConf { name: "メイン".into(), path: base.join("dictionary.db"), readonly: false }],
         }
     }
@@ -111,6 +154,8 @@ title =\r\n\
 ; 共用フォルダで運用する(この設定ファイルを複数人で使う)ときは true。\r\n\
 ; しおりが無効になり、並び順の変更も保存されなくなります\r\n\
 shared = false\r\n\
+; 画面の配色: light(明るい)/ dark(暗い)/ system(Windows の設定に合わせる)。次に起動したときから反映されます\r\n\
+theme = light\r\n\
 \r\n\
 ; 辞書の定義。[dictionary.任意のID] を必要なだけ書きます。先頭が既定の登録先です。\r\n\
 ; path は相対パスなら、この設定ファイルのあるフォルダ基準。%APPDATA% などの環境変数も使えます。\r\n\
@@ -209,6 +254,10 @@ pub fn to_ini(cfg: &Config, base: &Path) -> String {
     s.push_str(&format!("sort = {}\r\n", cfg.sort.key()));
     s.push_str(&format!("title = {}\r\n", cfg.title));
     s.push_str(&format!("shared = {}\r\n", cfg.shared));
+    // 既定(明るい)のときは書かない(この設定を知らない古い版が、同じ設定ファイルを読んでも警告を出さないように)
+    if cfg.theme != Theme::Light {
+        s.push_str(&format!("theme = {}\r\n", cfg.theme.key()));
+    }
     for (i, d) in cfg.dicts.iter().enumerate() {
         let path = match d.path.parent() {
             Some(p) if p == base => d.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
@@ -348,6 +397,10 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
                     Some(b) => cfg.shared = b,
                     None => warns.push(format!("設定: {}行目 shared は true / false", n + 1)),
                 },
+                "theme" => match Theme::from_key(v) {
+                    Some(t) => cfg.theme = t,
+                    None => warns.push(format!("設定: {}行目 theme は light / dark / system", n + 1)),
+                },
                 "timing_log" => {} // 廃止した設定(古い設定ファイルに残っていても無視する)
                 _ => warns.push(format!("設定: {}行目 未知のキー {}", n + 1, k)),
             }
@@ -430,6 +483,7 @@ mod tests {
             sort: Sort::UpdatedDesc,
             title: "社内 用語集".into(),
             shared: true,
+            theme: Theme::System,
             dicts: vec![
                 DictConf { name: "メイン".into(), path: base.join("dictionary.db"), readonly: false },
                 DictConf { name: "参照 用".into(), path: PathBuf::from("/other/dir/ref.db"), readonly: true },
@@ -442,6 +496,7 @@ mod tests {
         assert_eq!(back.sort, Sort::UpdatedDesc);
         assert_eq!(back.title, "社内 用語集");
         assert!(back.shared);
+        assert_eq!(back.theme, Theme::System);
         assert_eq!(back.dicts, cfg.dicts);
         // ホットキー無し
         let none = Config { hotkey: None, ..cfg };
@@ -465,6 +520,31 @@ mod tests {
         let (c, w) = parse("[general]\ntitle = 営業部 用語集\nshared = yes\n", Path::new("/b"), &env);
         assert!(w.is_empty());
         assert_eq!((c.title.as_str(), c.shared), ("営業部 用語集", true));
+    }
+
+    #[test]
+    fn themes() {
+        let base = Path::new("/b");
+        // 既定は明るい配色。既定のときは、設定ファイルに書かない(古い版が読んでも、警告が出ないように)
+        let c = Config::default_for(base);
+        assert_eq!(c.theme, Theme::Light);
+        assert!(!to_ini(&c, base).contains("theme"));
+        assert_eq!(parse(&default_ini(), base, &env).0.theme, Theme::Light);
+        assert!(parse(&default_ini(), base, &env).1.is_empty());
+        // 書いた値を読める(大文字・小文字は区別しない)
+        for (text, want) in [("dark", Theme::Dark), ("System", Theme::System), (" LIGHT ", Theme::Light)] {
+            let (c, w) = parse(&format!("[general]\ntheme = {text}\n"), base, &env);
+            assert!(w.is_empty(), "{w:?}");
+            assert_eq!(c.theme, want);
+        }
+        let dark = Config { theme: Theme::Dark, ..c };
+        assert!(to_ini(&dark, base).contains("theme = dark\r\n"));
+        assert_eq!(parse(&to_ini(&dark, base), base, &env).0.theme, Theme::Dark);
+        // 知らない値は、警告を出して既定のまま
+        let (c, w) = parse("[general]\ntheme = blue\n", base, &env);
+        assert_eq!(c.theme, Theme::Light);
+        assert!(w.iter().any(|x| x.contains("theme")));
+        assert_eq!((Theme::Dark.key(), Theme::from_key("x")), ("dark", None));
     }
 
     #[test]
