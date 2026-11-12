@@ -2,7 +2,7 @@
 
 use crate::config::{self, Config, DictConf, Hotkey};
 use crate::undo::Undo;
-use crate::{core, import, json_io, license, safe};
+use crate::{core, import, json_io, license, pics, safe};
 use crate::ui::{self, *};
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -233,6 +233,8 @@ pub struct EntryDlg {
     pub open_existing: Option<(usize, i64)>,
     /// すでに使われているタグと語数(「選ぶ…」で一覧から選べるようにする)
     pub all_tags: Vec<(String, usize)>,
+    /// 辞書ファイルのパス(辞書の添字で引く)。「画像を追加…」で、画像をコピーする先を決める
+    pub dict_paths: Vec<PathBuf>,
     pub ok: bool,
 }
 
@@ -247,6 +249,7 @@ const E_READING: usize = 308;
 const E_DUP: usize = 309; // 同じ見出し語があるときの知らせ
 const E_DUPLINK: usize = 310; // 「その語を表示」
 const E_TAGPICK: usize = 311; // タグを一覧から選ぶ
+const E_ADDPIC: usize = 312; // 「画像を追加…」
 
 struct EntryCtl {
     data: *mut EntryDlg,
@@ -262,6 +265,8 @@ struct EntryCtl {
     dup: HWND,
     dup_link: HWND,
     fields: Vec<(RECT, HWND)>,
+    /// 「画像を追加…」で選んだ画像: (元のファイル, 意味の欄に書いたパス)。コピーは、保存を押したときに行う
+    pending_pics: Vec<(PathBuf, String)>,
 }
 
 /// 見出し語の欄の下に出す、重複の知らせの行の高さ
@@ -349,7 +354,30 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             button(hwnd, "選ぶ…", E_TAGPICK, (s(m + fw - pick_w), s(y + 22), s(pick_w), s(CTL_H)), true);
             y += 66;
 
-            label(hwnd, "意味", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
+            label(hwnd, "意味(リンクは [表示名](開く先)、画像は ![説明](パス) と書けます)", (s(m), s(y), s(fw - 130), s(20)), fonts.small, 0);
+            // 画像を選んで、意味の欄に書き方を入れる(画像のコピーは、保存のとき)
+            let pic_t = wide("<a>画像を追加…</a>");
+            let add_pic = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("SysLink"),
+                PCWSTR(pic_t.as_ptr()),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                s(m + fw - 124),
+                s(y),
+                s(124),
+                s(20),
+                hwnd,
+                HMENU(E_ADDPIC as *mut c_void),
+                hinst,
+                None,
+            )
+            .unwrap_or_default();
+            send(add_pic, WM_SETFONT, fonts.small.0 as usize, 1);
+            let mut ideal = SIZE::default();
+            send(add_pic, LM_GETIDEALSIZE, s(124) as usize, &mut ideal as *mut _ as isize);
+            if ideal.cx > 0 && ideal.cx <= s(124) {
+                let _ = MoveWindow(add_pic, s(m + fw) - ideal.cx, s(y), ideal.cx, s(20), false);
+            }
             let meaning = ui::field(hwnd, E_MEANING, (s(m), s(y + 22), s(fw), s(150)), dpi, true, &mut fields, fonts.base);
             y += 22 + 150 + 12;
             label(hwnd, "参照先(任意。1行に1つ。「表示名 | URL」と書くと表示名を付けられます)", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
@@ -397,7 +425,7 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             set_text(meaning, &d.meaning.replace("\r\n", "\n").replace('\n', "\r\n"));
             let _ = SetWindowTextW(hwnd, PCWSTR(wide(&d.title).as_ptr()));
 
-            let c = Box::new(EntryCtl { data, fonts, dpi, word, reading, tags, meaning, link, combo, err, dup, dup_link, fields });
+            let c = Box::new(EntryCtl { data, fonts, dpi, word, reading, tags, meaning, link, combo, err, dup, dup_link, fields, pending_pics: Vec::new() });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(c) as isize);
             update_dup(&*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const EntryCtl));
             let _ = SetFocus(word);
@@ -491,6 +519,27 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                     } else if !confirm_same_word(hwnd, c, &word) {
                         let _ = SetFocus(c.word);
                     } else {
+                        // 「画像を追加…」で選んだ画像を、辞書の画像のフォルダへコピーする。
+                        // 同じ名前の別の画像があったときは番号が付くので、意味の欄のパスもそれに合わせる
+                        let mut meaning = meaning;
+                        if let Some(dict) = current_target(c).and_then(|t| d.dict_paths.get(t)) {
+                            for (src, token) in &c.pending_pics {
+                                if !meaning.contains(&format!("({token})")) {
+                                    continue; // 書いた行を消していたら、コピーしない
+                                }
+                                match pics::place(src, dict) {
+                                    Ok(rel) => {
+                                        if rel != *token {
+                                            meaning = meaning.replace(&format!("({token})"), &format!("({rel})"));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        set_text(c.err, &format!("画像をコピーできませんでした({}): {e}", src.display()));
+                                        return LRESULT(0);
+                                    }
+                                }
+                            }
+                        }
                         d.word = word;
                         d.reading = get_text(c.reading).trim().to_string();
                         d.meaning = meaning;
@@ -514,8 +563,12 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             LRESULT(0)
         }
         WM_NOTIFY => {
-            // 「その語を表示」: 登録をやめて、すでにある語を表示する
             let hdr = &*(lparam.0 as *const NMHDR);
+            if !ctl.is_null() && hdr.idFrom == E_ADDPIC && (hdr.code == NM_CLICK || hdr.code == NM_RETURN) {
+                add_picture(hwnd, &mut *ctl);
+                return LRESULT(0);
+            }
+            // 「その語を表示」: 登録をやめて、すでにある語を表示する
             if !ctl.is_null() && hdr.idFrom == E_DUPLINK && (hdr.code == NM_CLICK || hdr.code == NM_RETURN) {
                 let c = &mut *ctl;
                 let key = core::fold(get_text(c.word).trim());
@@ -553,6 +606,51 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// 「画像を追加…」: 画像を選んでもらい、意味の欄のカーソルの位置に `![](パス)` を入れる。
+/// パスは、辞書と同じフォルダの `<辞書のファイル名>_pic` の中の、予定の名前。実際のコピーは、保存を押したときに行う
+/// (キャンセルしたときに、ファイルを残さないため)
+unsafe fn add_picture(hwnd: HWND, c: &mut EntryCtl) {
+    let d = &*c.data;
+    let Some(dict) = current_target(c).and_then(|t| d.dict_paths.get(t)) else { return };
+    let mut buf = [0u16; 1024];
+    let filter: Vec<u16> = "画像 (*.png;*.jpg;*.jpeg;*.gif;*.bmp)\0*.png;*.jpg;*.jpeg;*.gif;*.bmp\0すべてのファイル\0*.*\0\0".encode_utf16().collect();
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(buf.as_mut_ptr()),
+        nMaxFile: buf.len() as u32,
+        lpstrTitle: w!("追加する画像を選択"),
+        Flags: OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY,
+        ..Default::default()
+    };
+    if !GetOpenFileNameW(&mut ofn).as_bool() {
+        return;
+    }
+    let len = buf.iter().position(|&ch| ch == 0).unwrap_or(0);
+    let src = PathBuf::from(String::from_utf16_lossy(&buf[..len]));
+    // 表示できる画像かを、先に確かめる
+    let size = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+    if size > pics::MAX_BYTES {
+        set_text(c.err, &format!("画像が大きすぎます({} MB まで)", pics::MAX_BYTES / 1024 / 1024));
+        return;
+    }
+    if std::fs::read(&src).ok().and_then(|b| pics::probe(&b)).is_none() {
+        set_text(c.err, "この形式の画像は表示できません(PNG・JPEG・GIF・BMP に対応しています)");
+        return;
+    }
+    set_text(c.err, "");
+    let token = pics::planned_path(&src, dict);
+    // カーソルの位置に入れ、説明を書けるように、カーソルを [ ] の間に置く
+    let (mut a, mut b) = (0u32, 0u32);
+    send(c.meaning, EM_GETSEL, &mut a as *mut _ as usize, &mut b as *mut _ as isize);
+    let text = wide(&format!("![]({token})"));
+    send(c.meaning, EM_REPLACESEL, 1, text.as_ptr() as isize);
+    send(c.meaning, EM_SETSEL, a as usize + 2, a as isize + 2);
+    let _ = SetFocus(c.meaning);
+    c.pending_pics.push((src, token));
 }
 
 /// 同じ見出し語の語がある辞書と件数を、知らせの文にする
