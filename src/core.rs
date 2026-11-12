@@ -19,9 +19,8 @@ pub struct Entry {
     pub updated_at: i64,
     /// 参照先。1行に1つ。「表示名 | URL」の形式で表示名を付けられる。無ければ空
     pub link: String,
-    // 検索用の小文字化済み文字列
+    // 検索用に文字をそろえたもの(`fold`)
     word_lc: String,
-    /// 読みを小文字化し、カタカナをひらがなにそろえたもの
     reading_norm: String,
     meaning_lc: String,
     tags_lc: String,
@@ -29,9 +28,9 @@ pub struct Entry {
 
 impl Entry {
     pub fn new(id: i64, word: String, meaning: String, tags: String, updated_at: i64) -> Self {
-        let (word_lc, meaning_lc) = (word.to_lowercase(), meaning.to_lowercase());
+        let (word_lc, meaning_lc) = (fold(&word), fold(&meaning));
         // タグは「#a #b」の形で持つ。「#a」で検索するとタグの先頭に一致し、「a」ならタグの途中にも一致する
-        let tags_lc = hash_tags(&tags.to_lowercase());
+        let tags_lc = hash_tags(&fold(&tags));
         Entry { dict: 0, id, word, reading: String::new(), meaning, tags, updated_at, link: String::new(), word_lc, reading_norm: String::new(), meaning_lc, tags_lc }
     }
 
@@ -46,15 +45,124 @@ impl Entry {
     }
 
     pub fn with_reading(mut self, reading: String) -> Self {
-        self.reading_norm = to_hiragana(&reading.to_lowercase());
+        self.reading_norm = fold(&reading);
         self.reading = reading;
         self
     }
+
+    /// 見出し語を、検索用にそろえたもの(同じ見出し語かどうかの判定に使う)
+    pub fn word_norm(&self) -> &str {
+        &self.word_lc
+    }
 }
 
-/// カタカナをひらがなにそろえる(読みの検索で、かなの種類を区別しないため)。文字数は変わらない
-pub fn to_hiragana(s: &str) -> String {
-    s.chars().map(|c| if ('\u{30A1}'..='\u{30F6}').contains(&c) { char::from_u32(c as u32 - 0x60).unwrap_or(c) } else { c }).collect()
+// ---- 文字をそろえる ---------------------------------------------------------
+//
+// 検索では、次の違いを区別しない。語の側(見出し語・読み・意味・タグ)と検索語の両方を
+// `fold` でそろえてから比べる。
+// - 英字の大文字と小文字
+// - 全角の英数字・記号と半角(全角スペースも)
+// - 半角カタカナと全角
+// - カタカナとひらがな
+// 濁点・半濁点が別の文字になっている表記(半角カタカナの「ｶﾞ」、結合文字)は、前の字と1文字に合成する。
+// 長音や小さい字の違い(「サーバ」と「サーバー」)はそろえない。
+
+/// 半角カタカナ(U+FF61〜U+FF9F)に対応する全角の字
+const HALF_KANA: [char; 63] = [
+    '。', '「', '」', '、', '・', 'ヲ', 'ァ', 'ィ', 'ゥ', 'ェ', 'ォ', 'ャ', 'ュ', 'ョ', 'ッ', 'ー', 'ア', 'イ', 'ウ', 'エ', 'オ', 'カ', 'キ', 'ク', 'ケ', 'コ',
+    'サ', 'シ', 'ス', 'セ', 'ソ', 'タ', 'チ', 'ツ', 'テ', 'ト', 'ナ', 'ニ', 'ヌ', 'ネ', 'ノ', 'ハ', 'ヒ', 'フ', 'ヘ', 'ホ', 'マ', 'ミ', 'ム', 'メ', 'モ', 'ヤ',
+    'ユ', 'ヨ', 'ラ', 'リ', 'ル', 'レ', 'ロ', 'ワ', 'ン', '゛', '゜',
+];
+
+/// 1文字をそろえる(濁点の合成は `fold_step` で行う)
+fn fold_char(c: char) -> char {
+    let c = match c {
+        '\u{3000}' => ' ',
+        '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+        '\u{FF61}'..='\u{FF9F}' => HALF_KANA[(c as u32 - 0xFF61) as usize],
+        _ => c,
+    };
+    match c {
+        // カタカナ → ひらがな(ァ〜ヶ、ヽ ヾ)
+        '\u{30A1}'..='\u{30F6}' | '\u{30FD}' | '\u{30FE}' => char::from_u32(c as u32 - 0x60).unwrap_or(c),
+        _ => c.to_lowercase().next().unwrap_or(c),
+    }
+}
+
+/// 濁点(`semi` なら半濁点)を付けた字。付けられない字なら None
+fn voiced(base: char, semi: bool) -> Option<char> {
+    let b = base as u32;
+    if semi {
+        matches!(base, 'は' | 'ひ' | 'ふ' | 'へ' | 'ほ').then(|| char::from_u32(b + 2)).flatten()
+    } else {
+        match base {
+            'か' | 'き' | 'く' | 'け' | 'こ' | 'さ' | 'し' | 'す' | 'せ' | 'そ' | 'た' | 'ち' | 'つ' | 'て' | 'と' | 'は' | 'ひ' | 'ふ' | 'へ' | 'ほ' => {
+                char::from_u32(b + 1)
+            }
+            'う' => Some('ゔ'),
+            'ゝ' => Some('ゞ'),
+            _ => None,
+        }
+    }
+}
+
+/// そろえた結果の1文字。`Merge` は、直前に出した字と合成して置き換える
+enum Folded {
+    Push(char),
+    Merge(char),
+}
+
+/// `prev`(直前に出した字)の次に `c` が来たときの結果
+fn fold_step(prev: Option<char>, c: char) -> Folded {
+    let semi = matches!(c, '\u{FF9F}' | '\u{309A}' | '\u{309C}');
+    if semi || matches!(c, '\u{FF9E}' | '\u{3099}' | '\u{309B}') {
+        if let Some(v) = prev.and_then(|p| voiced(p, semi)) {
+            return Folded::Merge(v);
+        }
+    }
+    Folded::Push(fold_char(c))
+}
+
+/// 検索用に文字をそろえる(上の説明を参照)
+pub fn fold(s: &str) -> String {
+    if s.is_ascii() {
+        return s.to_ascii_lowercase();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut prev = None;
+    for c in s.chars() {
+        let f = match fold_step(prev, c) {
+            Folded::Push(f) => f,
+            Folded::Merge(f) => {
+                out.pop();
+                f
+            }
+        };
+        out.push(f);
+        prev = Some(f);
+    }
+    out
+}
+
+/// `fold` と同じ結果を、1文字ごとに「元の文字列での UTF-16 の範囲 (開始, 終了)」付きで返す。
+/// 合成で文字数が変わっても、強調表示の位置を元の文字列の上で求められるようにするため。
+fn fold_spans(s: &str) -> Vec<(char, usize, usize)> {
+    let mut out: Vec<(char, usize, usize)> = Vec::with_capacity(s.len());
+    let mut pos = 0;
+    for c in s.chars() {
+        let end = pos + c.len_utf16();
+        match fold_step(out.last().map(|x| x.0), c) {
+            Folded::Push(f) => out.push((f, pos, end)),
+            Folded::Merge(f) => {
+                if let Some(last) = out.last_mut() {
+                    last.0 = f;
+                    last.2 = end;
+                }
+            }
+        }
+        pos = end;
+    }
+    out
 }
 
 /// 表示・検索用に、各タグの頭に # を付ける("a b" → "#a #b")
@@ -227,10 +335,14 @@ pub fn sort_entries(entries: &mut [Entry]) {
     // - それ以外(日本語)は、読みがあれば読み、無ければ見出し語
     // カタカナはひらがなと同じ扱いにして、読みの無いカタカナ語も五十音の中に並べる。
     // 読みの無い漢字の語は、文字コードの関係でかなの後ろに並ぶ。
-    fn key(e: &Entry) -> impl Iterator<Item = char> + '_ {
+    // (word_lc / reading_norm は `fold` 済みなので、カタカナはすでにひらがなになっている)
+    fn key(e: &Entry) -> &str {
         let ascii_head = e.word_lc.starts_with(|c: char| c.is_ascii_alphanumeric());
-        let k = if ascii_head || e.reading_norm.is_empty() { &e.word_lc } else { &e.reading_norm };
-        k.chars().map(|c| if ('\u{30A1}'..='\u{30F6}').contains(&c) { char::from_u32(c as u32 - 0x60).unwrap_or(c) } else { c })
+        if ascii_head || e.reading_norm.is_empty() {
+            &e.word_lc
+        } else {
+            &e.reading_norm
+        }
     }
     entries.sort_unstable_by(|a, b| key(a).cmp(key(b)).then_with(|| a.word_lc.cmp(&b.word_lc)).then(a.dict.cmp(&b.dict)).then(a.id.cmp(&b.id)));
 }
@@ -244,27 +356,27 @@ fn is_term(t: &str) -> bool {
     t.chars().any(|c| c != '#' && c != '*')
 }
 
-/// 検索語1つ。`*` を含む語はワイルドカード(`*` は任意の文字列)。
-enum Term<'a> {
+/// 検索語1つ(`fold` 済み)。`*` を含む語はワイルドカード(`*` は任意の文字列)。
+enum Term {
     /// 部分一致
-    Plain(&'a str),
+    Plain(String),
     /// `*` で区切った断片と、先頭・末尾が固定かどうか(`app*` は先頭固定、`*ing` は末尾固定)
-    Glob { parts: Vec<&'a str>, start: bool, end: bool },
+    Glob { parts: Vec<String>, start: bool, end: bool },
 }
 
-impl<'a> Term<'a> {
-    fn new(t: &'a str) -> Term<'a> {
+impl Term {
+    fn new(t: &str) -> Term {
         if t.contains('*') {
-            Term::Glob { parts: t.split('*').filter(|p| !p.is_empty()).collect(), start: !t.starts_with('*'), end: !t.ends_with('*') }
+            Term::Glob { parts: t.split('*').filter(|p| !p.is_empty()).map(str::to_owned).collect(), start: !t.starts_with('*'), end: !t.ends_with('*') }
         } else {
-            Term::Plain(t)
+            Term::Plain(t.to_owned())
         }
     }
 
-    /// 文字列全体に対して照合する(見出し語・タグ用)。Plain は部分一致
+    /// 文字列全体に対して照合する(見出し語・読み・タグ用)。Plain は部分一致
     fn matches_whole(&self, text: &str) -> bool {
         match self {
-            Term::Plain(t) => text.contains(t),
+            Term::Plain(t) => text.contains(t.as_str()),
             Term::Glob { parts, start, end } => glob(text, parts, *start, *end),
         }
     }
@@ -272,7 +384,7 @@ impl<'a> Term<'a> {
     /// 文章の中から探す(意味用)。ワイルドカードは「断片がこの順に現れる」
     fn matches_within(&self, text: &str) -> bool {
         match self {
-            Term::Plain(t) => text.contains(t),
+            Term::Plain(t) => text.contains(t.as_str()),
             Term::Glob { parts, .. } => glob(text, parts, false, false),
         }
     }
@@ -280,7 +392,7 @@ impl<'a> Term<'a> {
     /// タグ(「#a #b」形式)のどれか1つに一致するか
     fn matches_tags(&self, tags_lc: &str) -> bool {
         match self {
-            Term::Plain(t) => tags_lc.contains(t),
+            Term::Plain(t) => tags_lc.contains(t.as_str()),
             Term::Glob { parts, start, end } => {
                 // 「#」から書かれていれば # 込みで、そうでなければ # を除いたタグ名と照合する
                 let with_hash = *start && parts.first().map_or(false, |p| p.starts_with('#'));
@@ -289,16 +401,29 @@ impl<'a> Term<'a> {
         }
     }
 
+    /// 見出し語・読み・意味・タグのどれかに一致するか(全体検索用)
     fn matches_any(&self, e: &Entry) -> bool {
-        self.matches_whole(&e.word_lc) || self.matches_within(&e.meaning_lc) || self.matches_tags(&e.tags_lc)
+        self.matches_whole(&e.word_lc) || self.matches_whole(&e.reading_norm) || self.matches_within(&e.meaning_lc) || self.matches_tags(&e.tags_lc)
+    }
+
+    /// 強調表示する断片。ワイルドカードの語は、`*` で区切った断片をそれぞれ強調する
+    /// (英数字1文字だけの断片は、あちこちが赤くなって読みにくいので強調しない)
+    fn pieces(&self) -> Vec<String> {
+        match self {
+            Term::Plain(t) => vec![t.clone()],
+            Term::Glob { parts, .. } => {
+                parts.iter().filter(|p| is_term(p)).filter(|p| !(p.chars().count() == 1 && p.chars().all(|c| c.is_ascii_alphanumeric()))).cloned().collect()
+            }
+        }
     }
 }
 
 /// `parts` が `text` の中にこの順で(重ならずに)現れるか。start / end が真なら先頭 / 末尾に固定する
-fn glob(text: &str, parts: &[&str], start: bool, end: bool) -> bool {
+fn glob(text: &str, parts: &[String], start: bool, end: bool) -> bool {
     let mut rest = text;
     let last = parts.len().saturating_sub(1);
     for (i, p) in parts.iter().enumerate() {
+        let p = p.as_str();
         if i == 0 && start {
             match rest.strip_prefix(p) {
                 Some(r) => rest = r,
@@ -319,6 +444,82 @@ fn glob(text: &str, parts: &[&str], start: bool, end: bool) -> bool {
     true
 }
 
+/// 検索条件の1節。選択肢(`alts`)のどれかに一致すればよい。`neg` なら、どれにも一致しないこと。
+/// 節どうしは AND。
+///
+/// | 入力 | 節 |
+/// |---|---|
+/// | `a b` | [a] と [b] |
+/// | `a|b`、`a OR b`、`a | b` | [a か b] |
+/// | `-a` | [a でない] |
+/// | `-a|b` | [a でも b でもない] |
+struct Clause {
+    neg: bool,
+    alts: Vec<Term>,
+}
+
+impl Clause {
+    fn hit(&self, f: impl Fn(&Term) -> bool) -> bool {
+        self.alts.iter().any(f) != self.neg
+    }
+}
+
+/// 「OR」は、大文字で書かれたときだけ記号として扱う(小文字の or は普通の検索語)
+fn is_or_word(raw: &str) -> bool {
+    raw == "OR" || raw == "ＯＲ"
+}
+
+/// 入力欄1つぶんを節の列にする。`tag_field` はタグ欄(カンマ・読点でも区切る)。
+/// `-` や `|` だけ、`a|` のような入力途中の形は、その部分を無視する。
+fn parse_clauses(input: &str, tag_field: bool) -> Vec<Clause> {
+    let tokens: Vec<&str> = if tag_field { split_tags(input).collect() } else { input.split_whitespace().collect() };
+    let mut out: Vec<Clause> = Vec::new();
+    let mut join = false; // 次の語を、前の節の選択肢に加える(直前に OR や | があった)
+    for raw in tokens {
+        if is_or_word(raw) {
+            join = !out.is_empty();
+            continue;
+        }
+        let t = fold(raw);
+        let (neg, body) = match t.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, t.as_str()),
+        };
+        if body.starts_with('|') && !neg && !out.is_empty() {
+            join = true;
+        }
+        let alts: Vec<Term> = body.split('|').filter(|a| is_term(a)).map(Term::new).collect();
+        if alts.is_empty() {
+            continue; // 「-」「|」「#」「*」だけ(入力の途中)
+        }
+        let ends = body.ends_with('|');
+        match out.last_mut() {
+            Some(last) if join && !neg && !last.neg => last.alts.extend(alts),
+            _ => out.push(Clause { neg, alts }),
+        }
+        join = ends && !neg;
+    }
+    out
+}
+
+/// 検索条件を、欄ごとの節の列にしたもの
+struct Parsed {
+    all: Vec<Clause>,
+    word: Vec<Clause>,
+    meaning: Vec<Clause>,
+    tag: Vec<Clause>,
+}
+
+impl Parsed {
+    fn new(q: &Query) -> Parsed {
+        Parsed { all: parse_clauses(&q.all, false), word: parse_clauses(&q.word, false), meaning: parse_clauses(&q.meaning, false), tag: parse_clauses(&q.tag, true) }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.all.is_empty() && self.word.is_empty() && self.meaning.is_empty() && self.tag.is_empty()
+    }
+}
+
 /// タグの区切り(空白・全角空白・カンマ・読点)を単一スペースに正規化し、重複を除く
 pub fn normalize_tags(input: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
@@ -331,20 +532,28 @@ pub fn normalize_tags(input: &str) -> String {
     out.join(" ")
 }
 
-/// 条件に合うエントリの添字を返す(大文字小文字無視・部分一致)。
+/// 条件に合うエントリの添字を返す(`fold` でそろえて比べる。部分一致)。
 /// 並び: 見出し語の完全一致 > 前方一致 > 見出し語に含む > その他(同順位は元の順)。
 pub fn filter(entries: &[Entry], q: &Query) -> Vec<u32> {
     filter_in(entries, q, None)
 }
 
+/// 入力欄の内容に、文字を足すと一致範囲が広がることのある記法(ワイルドカード・OR・除外)が含まれるか
+fn may_widen(s: &str) -> bool {
+    let f = fold(s);
+    f.contains('*') || f.contains('|') || split_tags(&f).any(|t| t.starts_with('-')) || s.split_whitespace().any(is_or_word)
+}
+
 /// `new` が `prev` の条件を絞り込むだけ(= `prev` のヒットの部分集合になる)か。
 /// 入力欄に文字を追加していくときに成り立つ。
 pub fn narrows(prev: &Query, new: &Query) -> bool {
-    // ワイルドカードは文字を足すと一致範囲が広がることがある(例: 「a*b」→「a*bc」)ので対象外
-    if [&new.all, &new.word, &new.meaning, &new.tag].iter().any(|s| s.contains('*')) {
+    // ワイルドカードは文字を足すと一致範囲が広がることがある(例: 「a*b」→「a*bc」)。
+    // OR は選択肢が増え、除外は「-a」→「-ab」で除外が減る。どれも対象外
+    if [&new.all, &new.word, &new.meaning, &new.tag].iter().any(|s| may_widen(s)) {
         return false;
     }
-    let ext = |p: &str, n: &str| n.to_lowercase().starts_with(&p.to_lowercase());
+    // そろえた後の文字で比べる(「ｶ」に濁点を足した「ｶﾞ」は「が」で、「か」の絞り込みではない)
+    let ext = |p: &str, n: &str| fold(n).starts_with(&fold(p));
     prev.dicts == new.dicts
         && ext(&prev.all, &new.all)
         && ext(&prev.word, &new.word)
@@ -354,34 +563,20 @@ pub fn narrows(prev: &Query, new: &Query) -> bool {
 
 /// `filter` と同じ。`candidates`(昇順の添字)を渡すと、その中だけを調べる。
 pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Vec<u32> {
-    let all_l = q.all.to_lowercase();
-    let word_l = q.word.to_lowercase();
-    let meaning_l = q.meaning.to_lowercase();
-    let tag_l = q.tag.to_lowercase();
-    let all_t: Vec<Term> = all_l.split_whitespace().filter(|t| is_term(t)).map(Term::new).collect();
-    let word_t: Vec<Term> = word_l.split_whitespace().filter(|t| is_term(t)).map(Term::new).collect();
-    let meaning_t: Vec<Term> = meaning_l.split_whitespace().filter(|t| is_term(t)).map(Term::new).collect();
-    let tag_t: Vec<Term> = split_tags(&tag_l).filter(|t| is_term(t)).map(Term::new).collect();
-
-    let no_terms = all_t.is_empty() && word_t.is_empty() && meaning_t.is_empty() && tag_t.is_empty();
+    let p = Parsed::new(q);
     let dict_ok = |e: &Entry| q.dicts.as_ref().map_or(true, |m| m.get(e.dict).copied().unwrap_or(false));
-    if no_terms {
+    if p.is_empty() {
         return match candidates {
             Some(c) => c.iter().copied().filter(|&i| dict_ok(&entries[i as usize])).collect(),
             None => (0..entries.len() as u32).filter(|&i| dict_ok(&entries[i as usize])).collect(),
         };
     }
 
-    // 順位付けの基準: 見出し語欄があればその先頭の語、なければ全体検索の先頭の語
-    // 読みとの照合用: 検索語のカタカナをひらがなにそろえたもの(all_t / word_t と同じ並び)
-    let (all_h, word_h) = (to_hiragana(&all_l), to_hiragana(&word_l));
-    let all_r: Vec<Term> = all_h.split_whitespace().filter(|t| is_term(t)).map(Term::new).collect();
-    let word_r: Vec<Term> = word_h.split_whitespace().filter(|t| is_term(t)).map(Term::new).collect();
-    let first: Option<&Term> = word_t.first().or(all_t.first());
-    let first_r: Option<&Term> = word_r.first().or(all_r.first());
-    let key: String = if !word_t.is_empty() { word_l.split_whitespace().collect::<Vec<_>>().join(" ") } else { all_l.split_whitespace().collect::<Vec<_>>().join(" ") };
-
-    let key_h = to_hiragana(&key);
+    // 順位付けの基準: 見出し語欄があればその先頭の節、なければ全体検索の先頭の節(除外の節は使わない)
+    let first: Option<&Clause> = p.word.iter().find(|c| !c.neg).or_else(|| p.all.iter().find(|c| !c.neg));
+    // 完全一致の判定に使う、欄全体の文字列(語の間の空白は1つにそろえる)
+    let key_src = if !p.word.is_empty() { &q.word } else { &q.all };
+    let key: String = fold(key_src).split_whitespace().collect::<Vec<_>>().join(" ");
 
     let mut hits: Vec<(u8, u32)> = Vec::new();
     let all_idx: Vec<u32>;
@@ -398,33 +593,43 @@ pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Ve
             continue;
         }
         // 全体検索と見出し語欄は、読みにも当てる
-        let ok = all_t.iter().zip(&all_r).all(|(t, r)| t.matches_any(e) || r.matches_whole(&e.reading_norm))
-            && word_t.iter().zip(&word_r).all(|(t, r)| t.matches_whole(&e.word_lc) || r.matches_whole(&e.reading_norm))
-            && meaning_t.iter().all(|t| t.matches_within(&e.meaning_lc))
-            && tag_t.iter().all(|t| t.matches_tags(&e.tags_lc));
+        let ok = p.all.iter().all(|c| c.hit(|t| t.matches_any(e)))
+            && p.word.iter().all(|c| c.hit(|t| t.matches_whole(&e.word_lc) || t.matches_whole(&e.reading_norm)))
+            && p.meaning.iter().all(|c| c.hit(|t| t.matches_within(&e.meaning_lc)))
+            && p.tag.iter().all(|c| c.hit(|t| t.matches_tags(&e.tags_lc)));
         if ok {
             // 見出し語/読みの完全一致 > 前方一致(ワイルドカードは一致) > 含む > その他
-            let rank = match (first, first_r) {
-                (Some(Term::Plain(f)), Some(Term::Plain(fr))) => {
-                    let rd = &e.reading_norm;
-                    if e.word_lc == key || (!rd.is_empty() && *rd == key_h) {
-                        0
-                    } else if e.word_lc.starts_with(f) || rd.starts_with(fr) {
-                        1
-                    } else if e.word_lc.contains(f) || rd.contains(fr) {
-                        2
-                    } else {
-                        3
-                    }
-                }
-                (Some(g), Some(gr)) => {
-                    if g.matches_whole(&e.word_lc) || gr.matches_whole(&e.reading_norm) {
-                        1
-                    } else {
-                        3
-                    }
-                }
-                _ => 3,
+            let rd = &e.reading_norm;
+            let rank = match first {
+                None => 3,
+                Some(_) if e.word_lc == key || (!rd.is_empty() && *rd == key) => 0,
+                // 選択肢が複数あるときは、いちばん良い順位を使う
+                Some(c) => c
+                    .alts
+                    .iter()
+                    .map(|t| match t {
+                        Term::Plain(f) => {
+                            let f = f.as_str();
+                            if c.alts.len() > 1 && (e.word_lc == f || (!rd.is_empty() && rd == f)) {
+                                0
+                            } else if e.word_lc.starts_with(f) || rd.starts_with(f) {
+                                1
+                            } else if e.word_lc.contains(f) || rd.contains(f) {
+                                2
+                            } else {
+                                3
+                            }
+                        }
+                        g => {
+                            if g.matches_whole(&e.word_lc) || g.matches_whole(rd) {
+                                1
+                            } else {
+                                3
+                            }
+                        }
+                    })
+                    .min()
+                    .unwrap_or(3),
             };
             hits.push((rank, i));
         }
@@ -434,57 +639,41 @@ pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Ve
 }
 
 impl Query {
-    /// 強調表示する語(小文字)。(見出し語用, 意味用, タグ用)
+    /// 強調表示する語(`fold` 済み)。(見出し語用, 意味用, タグ用)。除外の語は含めない
     pub fn mark_terms(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
-        // ワイルドカードの語は、`*` で区切った断片をそれぞれ強調する
-        // (英数字1文字だけの断片は、あちこちが赤くなって読みにくいので強調しない)
-        let pieces = |t: &str| {
-            let glob = t.contains('*');
-            t.split('*')
-                .filter(|p| is_term(p))
-                .filter(|p| !(glob && p.chars().count() == 1 && p.chars().all(|c| c.is_ascii_alphanumeric())))
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        };
-        let ws = |s: &str| s.to_lowercase().split_whitespace().filter(|t| is_term(t)).flat_map(pieces).collect::<Vec<_>>();
-        let all = ws(&self.all);
+        let p = Parsed::new(self);
+        let pieces = |cs: &[Clause]| cs.iter().filter(|c| !c.neg).flat_map(|c| c.alts.iter()).flat_map(|t| t.pieces()).collect::<Vec<_>>();
+        let all = pieces(&p.all);
         let mut word = all.clone();
-        word.extend(ws(&self.word));
+        word.extend(pieces(&p.word));
         let mut meaning = all.clone();
-        meaning.extend(ws(&self.meaning));
+        meaning.extend(pieces(&p.meaning));
         let mut tag = all;
-        tag.extend(split_tags(&self.tag.to_lowercase()).filter(|t| is_term(t)).flat_map(pieces));
+        tag.extend(pieces(&p.tag));
         (word, meaning, tag)
     }
 }
 
-/// `text` の中で `terms`(小文字)に一致する範囲を、UTF-16 単位の (開始, 終了) で返す。
-/// 大文字小文字は無視。重なる範囲はまとめる。
+/// `text` の中で `terms` に一致する範囲を、UTF-16 単位の (開始, 終了) で返す。
+/// 検索と同じく `fold` でそろえて比べる。重なる範囲はまとめる。
 pub fn mark_ranges(text: &str, terms: &[String]) -> Vec<(usize, usize)> {
     if terms.is_empty() || text.is_empty() {
         return Vec::new();
     }
-    let low = |c: char| c.to_lowercase().next().unwrap_or(c);
-    let chars: Vec<char> = text.chars().map(low).collect();
-    // 各文字の UTF-16 上の開始位置
-    let mut pos16 = Vec::with_capacity(chars.len() + 1);
-    let mut p = 0;
-    for c in text.chars() {
-        pos16.push(p);
-        p += c.len_utf16();
-    }
-    pos16.push(p);
+    // そろえた各文字と、元の文字列での位置
+    let spans = fold_spans(text);
+    let chars: Vec<char> = spans.iter().map(|s| s.0).collect();
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for t in terms {
-        let tc: Vec<char> = t.chars().map(low).collect();
+        let tc: Vec<char> = fold(t).chars().collect();
         if tc.is_empty() || tc.len() > chars.len() {
             continue;
         }
         let mut i = 0;
         while i + tc.len() <= chars.len() {
             if chars[i..i + tc.len()] == tc[..] {
-                ranges.push((pos16[i], pos16[i + tc.len()]));
+                ranges.push((spans[i].1, spans[i + tc.len() - 1].2));
                 i += tc.len();
             } else {
                 i += 1;
@@ -829,7 +1018,7 @@ mod tests {
         let ids = |v: Vec<u32>| v.into_iter().map(|i| e[i as usize].id).collect::<Vec<_>>();
         // 読みで引ける。ひらがなでもカタカナでも同じ
         assert_eq!(ids(filter(&e, &q("りんご"))), vec![1, 4]); // 読みの完全一致が先、意味に含む apple が後
-        assert_eq!(ids(filter(&e, &q("リンゴ"))), vec![1]); // 意味の「りんご」は表記どおりなので一致しない
+        assert_eq!(ids(filter(&e, &q("リンゴ"))), vec![1, 4]); // 意味の「りんご」にも、カタカナで一致する
         assert_eq!(ids(filter(&e, &q("いちご"))), vec![3, 2]); // 完全一致 > 前方一致
         assert_eq!(ids(filter(&e, &q("えすきゅー"))), vec![5]);
         // 見出し語欄(絞り込み)も読みに当たる。ワイルドカードも使える
@@ -837,7 +1026,7 @@ mod tests {
         assert_eq!(ids(filter(&e, &Query { word: "りん".into(), ..Default::default() })), vec![1]);
         // 意味欄は読みを見ない
         assert!(filter(&e, &Query { meaning: "いちごいちえ".into(), ..Default::default() }).is_empty());
-        assert_eq!(to_hiragana("リンゴ ヴァ ABC 漢字"), "りんご ゔぁ ABC 漢字");
+        assert_eq!(fold("リンゴ ヴァ ABC 漢字"), "りんご ゔぁ abc 漢字");
 
         // 並び全体: 数字 → 英字(読みがあっても見出し語で並べる)→ かな(読み、または読みの無いかな・カタカナ語)→ 読みの無い漢字
         let mut v = vec![
@@ -853,6 +1042,158 @@ mod tests {
         sort_entries(&mut v);
         let words: Vec<&str> = v.iter().map(|x| x.word.as_str()).collect();
         assert_eq!(words, vec!["5W1H", "API", "Apple", "zebra", "アジェンダ", "いろは", "稟議", "辞書"]);
+    }
+
+    #[test]
+    fn fold_rules() {
+        // 大文字・小文字、全角・半角(英数字・記号・スペース)
+        assert_eq!(fold("ＡＰＩ　Ｖ２＃＊｜－"), "api v2#*|-");
+        // 半角カタカナ → 全角 → ひらがな。濁点・半濁点は前の字と合成する
+        assert_eq!(fold("ｻｰﾊﾞ ﾊﾟｿｺﾝ ｳﾞｧ"), "さーば ぱそこん ゔぁ");
+        assert_eq!(fold("ｶﾞｷﾞｸﾞｹﾞｺﾞ ﾊﾟﾋﾟﾌﾟﾍﾟﾎﾟ ﾂﾞ"), "がぎぐげご ぱぴぷぺぽ づ");
+        // 濁点が結合文字(か + U+3099)になっている表記も合成する
+        assert_eq!(fold("か\u{3099}き\u{3099} は\u{309A}"), "がぎ ぱ");
+        // 合成できない位置の濁点は、そのまま残す
+        assert_eq!(fold("ﾞa ｱﾞ"), "゛a あ゛");
+        // カタカナ → ひらがな(長音はそのまま)
+        assert_eq!(fold("サーバー ヽヾ"), "さーばー ゝゞ");
+        // 長音や小さい字の違いはそろえない
+        assert_ne!(fold("サーバ"), fold("サーバー"));
+        assert_eq!(fold("Straße Ünïcode"), "straße ünïcode");
+    }
+
+    #[test]
+    fn width_and_kana_insensitive_search() {
+        let e = vec![
+            Entry::new(1, "ＡＰＩ".into(), "外部から機能を呼び出す窓口".into(), "ＩＴ".into(), 0),
+            Entry::new(2, "サーバ".into(), "ｻｰﾋﾞｽを提供するコンピュータ".into(), "it".into(), 0),
+            Entry::new(3, "りんご".into(), "赤い果物".into(), "果物".into(), 0),
+            Entry::new(4, "ｶﾞｲﾄﾞ".into(), "案内。ガイドブック".into(), "".into(), 0),
+        ];
+        // 全角で登録した語を半角で、半角で登録した語を全角で引ける
+        assert_eq!(filter(&e, &q("api")), vec![0]);
+        assert_eq!(filter(&e, &q("ＡＰＩ")), vec![0]);
+        assert_eq!(filter(&e, &q("ｻｰﾊﾞ")), vec![1]);
+        assert_eq!(filter(&e, &q("さーば")), vec![1]);
+        assert_eq!(filter(&e, &q("サービス")), vec![1]); // 意味の半角カタカナ
+        assert_eq!(filter(&e, &q("リンゴ")), vec![2]); // 見出し語のひらがな
+        assert_eq!(filter(&e, &q("ガイド")), vec![3]);
+        assert_eq!(filter(&e, &q("がいど")), vec![3]);
+        assert_eq!(filter(&e, &q("カイド")), Vec::<u32>::new()); // 濁点の有無は区別する
+        // タグと記号(全角の # と *)
+        assert_eq!(filter(&e, &q("＃ｉｔ")), vec![0, 1]);
+        assert_eq!(filter(&e, &Query { tag: "IT".into(), ..Default::default() }), vec![0, 1]);
+        assert_eq!(filter(&e, &Query { word: "ａｐ＊".into(), ..Default::default() }), vec![0]);
+        // 全角スペースも語の区切り
+        assert_eq!(filter(&e, &q("ｻｰﾊﾞ　コンピュータ")), vec![1]);
+        // 順位: そろえた後で完全一致する語が先
+        let e2 = vec![
+            Entry::new(1, "アップルパイ".into(), "".into(), "".into(), 0),
+            Entry::new(2, "ｱｯﾌﾟﾙ".into(), "".into(), "".into(), 0),
+        ];
+        assert_eq!(filter(&e2, &q("あっぷる")), vec![1, 0]);
+
+        // 強調表示の位置は、元の文字列の上で求める。「ｶﾞ」(2文字)は「が」1文字ぶんとして扱う
+        let t = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(mark_ranges("ｶﾞｲﾄﾞ", &t(&["がい"])), vec![(0, 3)]);
+        assert_eq!(mark_ranges("xｶﾞｲﾄﾞ", &t(&["いど"])), vec![(3, 6)]);
+        assert_eq!(mark_ranges("ＡＰＩ api", &t(&["api"])), vec![(0, 3), (4, 7)]);
+        assert_eq!(mark_ranges("りんごとリンゴ", &t(&["りんご"])), vec![(0, 3), (4, 7)]);
+        let (w, _, _) = q("ＡＰＩ ｶﾞｲﾄﾞ").mark_terms();
+        assert_eq!(w, t(&["api", "がいど"]));
+
+        // 絞り込みの再利用は、そろえた後の文字で判定する
+        assert!(narrows(&q("ａｐ"), &q("api")));
+        assert!(narrows(&q("ｶ"), &q("ｶｲ")));
+        assert!(!narrows(&q("ｶ"), &q("ｶﾞ"))); // 「か」に濁点が付いて「が」になった。「か」の結果の部分集合ではない
+        assert_eq!(filter_in(&e, &q("ｶﾞ"), None), vec![3]);
+
+        // 並び順: 全角の英数字は英数字として、半角カタカナはかなとして並ぶ
+        let mut v = vec![
+            Entry::new(1, "ｻｰﾊﾞ".into(), "".into(), "".into(), 0),
+            Entry::new(2, "ＡＰＩ".into(), "".into(), "".into(), 0),
+            Entry::new(3, "かぎ".into(), "".into(), "".into(), 0),
+            Entry::new(4, "zip".into(), "".into(), "".into(), 0),
+        ];
+        sort_entries(&mut v);
+        assert_eq!(v.iter().map(|x| x.id).collect::<Vec<_>>(), vec![2, 4, 3, 1]);
+    }
+
+    #[test]
+    fn or_and_exclude_search() {
+        let e = vec![
+            Entry::new(1, "apple".into(), "りんご。赤い果物".into(), "fruit red".into(), 0),
+            Entry::new(2, "banana".into(), "バナナ。黄色い果物".into(), "fruit yellow".into(), 0),
+            Entry::new(3, "carrot".into(), "にんじん。赤い野菜".into(), "vegetable".into(), 0),
+            Entry::new(4, "orange".into(), "みかんの仲間。果物".into(), "fruit".into(), 0),
+        ];
+        // OR: | でつなぐ、または大文字の OR
+        assert_eq!(filter(&e, &q("apple|banana")), vec![0, 1]);
+        assert_eq!(filter(&e, &q("apple OR banana")), vec![0, 1]);
+        assert_eq!(filter(&e, &q("apple | banana")), vec![0, 1]);
+        assert_eq!(filter(&e, &q("apple |banana")), vec![0, 1]);
+        assert_eq!(filter(&e, &q("apple| banana")), vec![0, 1]);
+        assert_eq!(filter(&e, &q("apple｜banana")), vec![0, 1]); // 全角の ｜
+        assert_eq!(filter(&e, &q("apple ＯＲ banana OR carrot")), vec![0, 1, 2]);
+        // 小文字の or は普通の検索語(orange の見出し語に含まれる)
+        assert_eq!(filter(&e, &q("or")), vec![3]);
+        assert_eq!(filter(&e, &q("apple or")), Vec::<u32>::new());
+        // OR と AND の組み合わせ: (apple か carrot) かつ 赤い
+        assert_eq!(filter(&e, &q("apple|carrot|banana 赤い")), vec![0, 2]);
+        // 除外
+        assert_eq!(filter(&e, &q("果物 -赤い")), vec![1, 3]);
+        assert_eq!(filter(&e, &q("-果物")), vec![2]); // 除外だけでもよい
+        assert_eq!(filter(&e, &q("果物 －赤い")), vec![1, 3]); // 全角の －
+        assert_eq!(filter(&e, &q("-#fruit")), vec![2]); // タグの除外
+        assert_eq!(filter(&e, &q("#fruit -#red -#yellow")), vec![3]);
+        assert_eq!(filter(&e, &q("-a*")), vec![1, 2, 3]); // ワイルドカードの除外(見出し語が a で始まる語と、意味に a… を含む語)
+        assert_eq!(filter(&e, &q("-apple|banana")), vec![2, 3]); // どちらでもない
+        // 入力の途中の形は、その部分を無視する
+        assert_eq!(filter(&e, &q("apple -")), vec![0]);
+        assert_eq!(filter(&e, &q("apple |")), vec![0]);
+        assert_eq!(filter(&e, &q("apple|")), vec![0]);
+        assert_eq!(filter(&e, &q("apple OR")), vec![0]);
+        assert_eq!(filter(&e, &q("| apple")), vec![0]);
+        assert_eq!(filter(&e, &q("OR apple")), vec![0]);
+        assert_eq!(filter(&e, &q("-")).len(), 4);
+        assert_eq!(filter(&e, &q("|")).len(), 4);
+        assert_eq!(filter(&e, &q("-#")).len(), 4);
+        // 語の途中の - は、ただの文字
+        let h = vec![Entry::new(1, "e-mail".into(), "電子メール".into(), "".into(), 0), Entry::new(2, "-fno-rtti".into(), "コンパイラの指定".into(), "".into(), 0)];
+        assert_eq!(filter(&h, &q("e-mail")), vec![0]);
+        assert_eq!(filter(&h, &q("fno-rtti")), vec![1]); // - で始まる語は、- を外して引く
+        // 絞り込みの各欄でも同じ
+        assert_eq!(filter(&e, &Query { word: "apple|orange".into(), ..Default::default() }), vec![0, 3]);
+        assert_eq!(filter(&e, &Query { meaning: "果物 -バナナ".into(), ..Default::default() }), vec![0, 3]);
+        assert_eq!(filter(&e, &Query { tag: "fruit,-red".into(), ..Default::default() }), vec![1, 3]);
+        assert_eq!(filter(&e, &Query { tag: "red|yellow".into(), ..Default::default() }), vec![0, 1]);
+        // 順位: 選択肢のどれかに完全一致する語が先。除外の語は順位に使わない
+        let r = vec![
+            Entry::new(1, "pineapple".into(), "".into(), "".into(), 0),
+            Entry::new(2, "banana".into(), "".into(), "".into(), 0),
+            Entry::new(3, "apple".into(), "".into(), "".into(), 0),
+        ];
+        assert_eq!(filter(&r, &q("apple|banana")), vec![1, 2, 0]);
+        assert_eq!(filter(&r, &q("-banana apple")), vec![2, 0]);
+        // 強調表示: 選択肢はすべて、除外の語は対象外
+        let (w, m, _) = q("apple|banana -carrot").mark_terms();
+        assert_eq!(w, vec!["apple".to_string(), "banana".to_string()]);
+        assert_eq!(m, w);
+        // 絞り込みの再利用はしない(結果が広がることがあるため)
+        assert!(!narrows(&q("果物 -赤"), &q("果物 -赤い"))); // 除外が減って、結果が増える
+        assert!(!narrows(&q("apple"), &q("apple|")));
+        assert!(!narrows(&q("apple|b"), &q("apple|ba")));
+        assert!(!narrows(&q("apple O"), &q("apple OR"))); // 「o」を含む語だけ → apple すべて
+        assert!(narrows(&q("apple OR"), &q("apple ORa"))); // OR が普通の語に変わると、絞り込みになる
+        assert!(!narrows(&q("a"), &Query { all: "a".into(), tag: "x,-y".into(), ..Default::default() }));
+        for (a, b) in [("果物 -赤", "果物 -赤い"), ("apple O", "apple OR"), ("apple OR", "apple ORa"), ("apple", "apple|")] {
+            // narrows が真のときは、前の結果の中だけを調べても全体を調べたのと同じになる
+            if narrows(&q(a), &q(b)) {
+                let mut cand = filter(&e, &q(a));
+                cand.sort_unstable();
+                assert_eq!(filter_in(&e, &q(b), Some(&cand)), filter(&e, &q(b)), "{a} → {b}");
+            }
+        }
     }
 
     #[test]
