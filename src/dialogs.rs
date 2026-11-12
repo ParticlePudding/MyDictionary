@@ -58,7 +58,7 @@ unsafe fn register_classes() {
                 lpfnWndProc: Some(proc),
                 hInstance: hinst.into(),
                 hCursor: LoadCursorW(None, IDC_ARROW).unwrap(),
-                hbrBackground: CreateSolidBrush(WHITE),
+                hbrBackground: CreateSolidBrush(pal().bg),
                 lpszClassName: name,
                 hIcon: ui::app_icon(),
                 ..Default::default()
@@ -84,6 +84,7 @@ unsafe fn run_modal(owner: HWND, class: PCWSTR, title: &str, client_w: i32, clie
     let hinst = GetModuleHandleW(None).unwrap();
     let hwnd = CreateWindowExW(WS_EX_DLGMODALFRAME, class, PCWSTR(t.as_ptr()), style, x, y, ww, wh, owner, None, hinst, Some(param));
     let Ok(hwnd) = hwnd else { return };
+    ui::apply_dark(hwnd);
 
     let _ = EnableWindow(owner, false);
     let _ = ShowWindow(hwnd, SW_SHOW);
@@ -195,13 +196,6 @@ unsafe fn checkbox(parent: HWND, text: &str, id: usize, (x, y, w, h): (i32, i32,
     send(hwnd, WM_SETFONT, fnt.0 as usize, 1);
     send(hwnd, BM_SETCHECK_, checked as usize, 0);
     hwnd
-}
-
-fn white_brush() -> HBRUSH {
-    // クラスの背景ブラシと同じ色。ダイアログの存続中だけ使うので都度作らず static で保持
-    use std::sync::OnceLock;
-    static B: OnceLock<usize> = OnceLock::new();
-    HBRUSH(*B.get_or_init(|| unsafe { CreateSolidBrush(WHITE).0 as usize }) as *mut c_void)
 }
 
 // ============================================================================
@@ -441,28 +435,27 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
-        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
-            let hdc = HDC(wparam.0 as *mut c_void);
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
             let is_err = !ctl.is_null() && HWND(lparam.0 as *mut c_void) == (*ctl).err;
             let id = GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize;
             let is_hint = id == E_HINT;
             let color = if is_err {
-                DANGER
+                pal().danger
             } else if id == E_DUP {
-                WARN
+                pal().warn
             } else if is_hint || msg == WM_CTLCOLORSTATIC {
-                MUTED
+                pal().muted
             } else {
-                TEXT
+                pal().text
             };
-            let color = if msg == WM_CTLCOLOREDIT { TEXT } else { color };
-            ui::ctl_color(hdc, color, WHITE, white_brush())
+            let color = if msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORLISTBOX { pal().text } else { color };
+            ui::ctl_color(hwnd, msg, wparam, lparam, color)
         }
         WM_DRAWITEM => {
             let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
             if !ctl.is_null() {
                 let kind = if dis.CtlID as usize == ID_OK { Btn::Primary } else { Btn::Secondary };
-                ui::draw_button(dis, kind, (*ctl).fonts.base, WHITE, (*ctl).dpi);
+                ui::draw_button(dis, kind, (*ctl).fonts.base, pal().bg, (*ctl).dpi);
             }
             LRESULT(1)
         }
@@ -755,6 +748,7 @@ const S_HOTKEY: usize = 401;
 const S_TRAY: usize = 403;
 const S_TITLE: usize = 405;
 const S_SHARED: usize = 406;
+const S_THEME: usize = 407;
 const S_LIST: usize = 410;
 const S_ADD: usize = 411;
 const S_DEL: usize = 412;
@@ -789,6 +783,11 @@ struct SettingsCtl {
     orig_hotkey: Option<Hotkey>,
     /// 保存/キャンセルの上に引く区切り線の位置
     footer_line: i32,
+}
+
+/// 配色のボタンに表示する文字
+fn theme_text(t: config::Theme) -> String {
+    format!("{}  ▼", t.label())
 }
 
 fn to_hk_ctrl(h: &Hotkey) -> isize {
@@ -938,7 +937,7 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             // --- 全般 ---
             let mut y = 20;
             label(hwnd, "全般", (s(m), s(y), s(fw), s(24)), fonts.heading, 0);
-            y += 34;
+            y += 30;
             label(hwnd, "呼び出しホットキー", (s(m), s(y + 8), s(180), s(24)), fonts.base, 0);
             let hotkey = CreateWindowExW(
                 WS_EX_CLIENTEDGE,
@@ -959,30 +958,29 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             send(hotkey, HKM_SETRULES, 0x3, 0x6); // 修飾キー無し/Shiftのみは不可(代替: Ctrl+Alt)
             send(hotkey, HKM_SETHOTKEY, d.cfg.hotkey.as_ref().map_or(0, to_hk_ctrl) as usize, 0);
             y += 40;
-            label(
-                hwnd,
-                "枠を選んでキーを押します。BackSpace で無効。Win キーを使う場合は設定ファイルで指定します。",
-                (s(m + 190), s(y), s(fw - 190), s(36)),
-                fonts.small,
-                S_MUTED,
-            );
-            y += 46;
+            label(hwnd, "枠を選んでキーを押します。BackSpace で無効。Win キーを使う場合は設定ファイルで指定します。", (s(m), s(y), s(fw), s(20)), fonts.small, S_MUTED);
+            y += 26;
 label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(24)), fonts.base, 0);
             let title = ui::field(hwnd, S_TITLE, (s(m + 190), s(y), s(fw - 190), s(CTL_H)), dpi, false, &mut fields, fonts.base);
             let cue = wide("例: 社内用語集(空なら MyDictionary と表示します)");
             send(title, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
             set_text(title, &d.cfg.title);
             y += 46;
+            // 配色: ボタンを押すと、選ぶメニューが出る(変更は、次に起動したときから)
+            label(hwnd, "配色", (s(m), s(y + 8), s(180), s(24)), fonts.base, 0);
+            button(hwnd, &theme_text(d.cfg.theme), S_THEME, (s(m + 190), s(y), s(224), s(CTL_H)), true);
+            label(hwnd, "次回の起動から変わります", (s(m + 190 + 236), s(y + 9), s(fw - 190 - 236), s(20)), fonts.small, S_MUTED);
+            y += 44;
             let tray = checkbox(hwnd, "閉じるボタンや Esc で終了せず、トレイに隠して常駐する", S_TRAY, (s(m), s(y), s(fw), s(26)), fonts.base, d.cfg.close_to_tray);
-            y += 30;
+            y += 28;
             let shared = checkbox(hwnd, "共用フォルダで運用する(この設定を複数人で使う。しおりは無効、並び順は保存しない)", S_SHARED, (s(m), s(y), s(fw), s(26)), fonts.base, d.cfg.shared);
-            y += 34;
+            y += 30;
             let section_line = s(y);
-            y += 10;
+            y += 8;
 
             // --- 辞書 ---
             label(hwnd, "辞書", (s(m), s(y), s(fw), s(24)), fonts.heading, 0);
-            y += 32;
+            y += 28;
             let list = CreateWindowExW(
                 WS_EX_CLIENTEDGE,
                 w!("SysListView32"),
@@ -1032,10 +1030,10 @@ label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(2
             y += 46;
 
             let err = label(hwnd, "", (s(m), s(y), s(fw), s(22)), fonts.small, S_ERR);
-            y += 28;
+            y += 24;
             // ここから下は、画面全体(全般・辞書の両方)の保存/キャンセル。区切り線で分ける
             let footer_line = s(y);
-            y += 16;
+            y += 12;
             // 左下に、アプリの版と、いま使っている設定ファイルの場所(個人の設定か、共用の設定かが分かるように)。
             // その下に、ライセンス情報を開くリンク
             let info = format!("{} {}  設定: {}", ui::APP_NAME, ui::APP_VERSION, d.cfg_path.display());
@@ -1112,21 +1110,20 @@ label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(2
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
                 let s = |v: i32| scale(v, c.dpi);
-                ui::fill(hdc, &RECT { left: s(24), top: c.section_line, right: rc.right - s(24), bottom: c.section_line + 1 }, BORDER);
-                ui::fill(hdc, &RECT { left: 0, top: c.footer_line, right: rc.right, bottom: c.footer_line + 1 }, BORDER);
+                ui::fill(hdc, &RECT { left: s(24), top: c.section_line, right: rc.right - s(24), bottom: c.section_line + 1 }, pal().border);
+                ui::fill(hdc, &RECT { left: 0, top: c.footer_line, right: rc.right, bottom: c.footer_line + 1 }, pal().border);
             }
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
-            let hdc = HDC(wparam.0 as *mut c_void);
             let id = GetDlgCtrlID(HWND(lparam.0 as *mut c_void));
             let color = match id as usize {
-                S_ERR => DANGER,
-                S_MUTED => MUTED,
-                _ => TEXT,
+                S_ERR => pal().danger,
+                S_MUTED => pal().muted,
+                _ => pal().text,
             };
-            ui::ctl_color(hdc, color, WHITE, white_brush())
+            ui::ctl_color(hwnd, msg, wparam, lparam, color)
         }
         WM_DRAWITEM => {
             let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
@@ -1136,7 +1133,7 @@ label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(2
                     S_DEL => Btn::Danger,
                     _ => Btn::Secondary,
                 };
-                ui::draw_button(dis, kind, (*ctl).fonts.base, WHITE, (*ctl).dpi);
+                ui::draw_button(dis, kind, (*ctl).fonts.base, pal().bg, (*ctl).dpi);
             }
             LRESULT(1)
         }
@@ -1178,6 +1175,27 @@ label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(2
                         let t = get_text(c.path);
                         d.cfg.dicts[r].path = PathBuf::from(&t);
                         lv_set_cell(c.list, r, 1, &t);
+                    }
+                }
+                (S_THEME, _) => {
+                    // ボタンのすぐ下に、3つの中から選ぶメニューを出す
+                    let btn = HWND(lparam.0 as *mut c_void);
+                    let mut rc = RECT::default();
+                    let _ = GetWindowRect(btn, &mut rc);
+                    if let Ok(menu) = CreatePopupMenu() {
+                        let all = [config::Theme::Light, config::Theme::Dark, config::Theme::System];
+                        for (i, t) in all.iter().enumerate() {
+                            let text = wide(t.label());
+                            let checked = if *t == d.cfg.theme { MF_CHECKED } else { MF_UNCHECKED };
+                            let _ = AppendMenuW(menu, MF_STRING | checked, i + 1, PCWSTR(text.as_ptr()));
+                        }
+                        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTBUTTON, rc.left, rc.bottom, 0, hwnd, None).0 as usize;
+                        let _ = DestroyMenu(menu);
+                        if let Some(t) = cmd.checked_sub(1).and_then(|i| all.get(i)) {
+                            d.cfg.theme = *t;
+                            set_text(btn, &theme_text(*t));
+                            let _ = InvalidateRect(btn, None, true);
+                        }
                     }
                 }
                 (S_RO, _) => {
@@ -1383,23 +1401,22 @@ unsafe extern "system" fn license_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
                 ui::paint_fields(hdc, &c.fields, c.dpi);
                 let mut rc = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rc);
-                ui::fill(hdc, &RECT { left: 0, top: c.footer_line, right: rc.right, bottom: c.footer_line + 1 }, BORDER);
+                ui::fill(hdc, &RECT { left: 0, top: c.footer_line, right: rc.right, bottom: c.footer_line + 1 }, pal().border);
             }
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
             // 読み取り専用の EDIT も WM_CTLCOLORSTATIC で来る。背景は白のまま
-            let hdc = HDC(wparam.0 as *mut c_void);
             let id = GetDlgCtrlID(HWND(lparam.0 as *mut c_void));
-            let color = if id as usize == S_MUTED { MUTED } else { TEXT };
-            ui::ctl_color(hdc, color, WHITE, white_brush())
+            let color = if id as usize == S_MUTED { pal().muted } else { pal().text };
+            ui::ctl_color(hwnd, msg, wparam, lparam, color)
         }
         WM_DRAWITEM => {
             let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
             if !ctl.is_null() {
                 let kind = if dis.CtlID as usize == ID_CANCEL { Btn::Primary } else { Btn::Secondary };
-                ui::draw_button(dis, kind, (*ctl).fonts.base, WHITE, (*ctl).dpi);
+                ui::draw_button(dis, kind, (*ctl).fonts.base, pal().bg, (*ctl).dpi);
             }
             LRESULT(1)
         }
@@ -1752,15 +1769,14 @@ unsafe extern "system" fn select_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             LRESULT(0)
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-            let hdc = HDC(wparam.0 as *mut c_void);
-            let color = if GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize == D_ERR { DANGER } else { TEXT };
-            ui::ctl_color(hdc, color, WHITE, white_brush())
+            let color = if GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize == D_ERR { pal().danger } else { pal().text };
+            ui::ctl_color(hwnd, msg, wparam, lparam, color)
         }
         WM_DRAWITEM => {
             let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
             if !ctl.is_null() {
                 let kind = if dis.CtlID as usize == ID_OK { Btn::Primary } else { Btn::Secondary };
-                ui::draw_button(dis, kind, (*ctl).fonts.base, WHITE, (*ctl).dpi);
+                ui::draw_button(dis, kind, (*ctl).fonts.base, pal().bg, (*ctl).dpi);
             }
             LRESULT(1)
         }
@@ -1999,7 +2015,7 @@ unsafe fn tags_fill(c: &mut TagsCtl) {
     });
 }
 
-/// 一覧で選んでいる(青く表示されている)タグの、`data.tags` の添字
+/// 一覧で選んでいる行のタグの、`data.tags` の添字
 unsafe fn tags_selected(c: &TagsCtl) -> Option<usize> {
     let row = send(c.list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize).0;
     if row < 0 {
@@ -2085,13 +2101,12 @@ unsafe extern "system" fn tags_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             LRESULT(0)
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
-            let hdc = HDC(wparam.0 as *mut c_void);
             let color = match GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize {
-                T_ERR => DANGER,
-                T_NOTE => MUTED,
-                _ => TEXT,
+                T_ERR => pal().danger,
+                T_NOTE => pal().muted,
+                _ => pal().text,
             };
-            ui::ctl_color(hdc, color, WHITE, white_brush())
+            ui::ctl_color(hwnd, msg, wparam, lparam, color)
         }
         WM_DRAWITEM => {
             let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
@@ -2101,7 +2116,7 @@ unsafe extern "system" fn tags_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
                     T_DELETE => Btn::Danger,
                     _ => Btn::Secondary,
                 };
-                ui::draw_button(dis, kind, (*ctl).fonts.base, WHITE, (*ctl).dpi);
+                ui::draw_button(dis, kind, (*ctl).fonts.base, pal().bg, (*ctl).dpi);
             }
             LRESULT(1)
         }
@@ -2259,15 +2274,14 @@ unsafe extern "system" fn prompt_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpar
             LRESULT(0)
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
-            let hdc = HDC(wparam.0 as *mut c_void);
-            let color = if GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize == P_LABEL { MUTED } else { TEXT };
-            ui::ctl_color(hdc, color, WHITE, white_brush())
+            let color = if GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize == P_LABEL { pal().muted } else { pal().text };
+            ui::ctl_color(hwnd, msg, wparam, lparam, color)
         }
         WM_DRAWITEM => {
             let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
             if !ctl.is_null() {
                 let kind = if dis.CtlID as usize == ID_OK { Btn::Primary } else { Btn::Secondary };
-                ui::draw_button(dis, kind, (*ctl).fonts.base, WHITE, (*ctl).dpi);
+                ui::draw_button(dis, kind, (*ctl).fonts.base, pal().bg, (*ctl).dpi);
             }
             LRESULT(1)
         }
