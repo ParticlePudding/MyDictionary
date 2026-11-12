@@ -212,11 +212,44 @@ pub fn has_column(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
 
 /// 古い版で作った辞書に、後から増えた列を追加する。書き込みの直前に呼ぶ。
 /// 列を足すだけなので、古い版のアプリからも引き続き読み書きできる。
+/// あわせて、この辞書に書き込んだことのある、いちばん新しいアプリの版を記録する(`stored_version`)。
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     for col in ["link", "reading"] {
         if !has_column(conn, col)? {
             conn.execute_batch(&format!("ALTER TABLE words ADD COLUMN {col} TEXT NOT NULL DEFAULT ''"))?;
         }
+    }
+    stamp_version(conn, app_version_num())
+}
+
+/// このアプリの版を、整数にしたもの(2.03 → 203)。Cargo のパッケージの版 `2.0.3` から作る
+pub fn app_version_num() -> i64 {
+    version_num(env!("CARGO_PKG_VERSION"))
+}
+
+/// `major.minor.patch` → `major * 100 + minor * 10 + patch`(画面に出す版 `2.03` の、小数点を除いた数と同じ)
+fn version_num(cargo: &str) -> i64 {
+    let mut it = cargo.split('.').map(|p| p.trim().parse::<i64>().unwrap_or(0));
+    let (major, minor, patch) = (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0));
+    major * 100 + minor * 10 + patch
+}
+
+/// 版の整数を、画面に出す形にする(203 → "2.03")
+pub fn version_label(n: i64) -> String {
+    format!("{}.{:02}", n / 100, n % 100)
+}
+
+/// 辞書に記録されている「この辞書に書き込んだことのある、いちばん新しいアプリの版」(`app_version_num` の形)。
+/// 記録の無い辞書(この機能より前の版だけが書いた辞書)は 0。
+/// SQLite にもとからある整数の欄 `user_version` を使う(表や列は増やさない。古い版のアプリは、この欄を見ないし変えない)。
+pub fn stored_version(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0))
+}
+
+/// 記録されている版より `mine` が新しければ、記録を更新する(古ければ、何もしない)
+fn stamp_version(conn: &Connection, mine: i64) -> rusqlite::Result<()> {
+    if stored_version(conn)? < mine {
+        conn.execute_batch(&format!("PRAGMA user_version = {mine}"))?;
     }
     Ok(())
 }
@@ -364,10 +397,26 @@ enum Term {
     Plain(String),
     /// `*` で区切った断片と、先頭・末尾が固定かどうか(`app*` は先頭固定、`*ing` は末尾固定)
     Glob { parts: Vec<String>, start: bool, end: bool },
+    /// タグが、この名前そのものであること(`#"it"`。タグ欄では `"it"` でもよい)。
+    /// `#it` は「it で始まるタグ」なので、`item` などにも一致する。タグの一覧やタグのクリックから検索するときに使う
+    TagExact(String),
 }
 
 impl Term {
-    fn new(t: &str) -> Term {
+    /// `tag_field` はタグ欄の語(`#` が無くても、`"…"` をタグの完全一致として扱う)
+    fn new(t: &str, tag_field: bool) -> Term {
+        let (hash, body) = match t.strip_prefix('#') {
+            Some(b) => (true, b),
+            None => (false, t),
+        };
+        if (hash || tag_field) && body.starts_with('"') {
+            let inner = &body[1..];
+            return match inner.strip_suffix('"') {
+                Some(name) if !name.is_empty() && !name.contains('"') => Term::TagExact(name.to_owned()),
+                // 閉じる前(入力の途中)は、引用符を外した語として扱う
+                _ => Term::new(&format!("{}{}", if hash { "#" } else { "" }, inner.trim_end_matches('"')), tag_field),
+            };
+        }
         if t.contains('*') {
             Term::Glob { parts: t.split('*').filter(|p| !p.is_empty()).map(str::to_owned).collect(), start: !t.starts_with('*'), end: !t.ends_with('*') }
         } else {
@@ -380,6 +429,7 @@ impl Term {
         match self {
             Term::Plain(t) => text.contains(t.as_str()),
             Term::Glob { parts, start, end } => glob(text, parts, *start, *end),
+            Term::TagExact(_) => false,
         }
     }
 
@@ -388,6 +438,7 @@ impl Term {
         match self {
             Term::Plain(t) => text.contains(t.as_str()),
             Term::Glob { parts, .. } => glob(text, parts, false, false),
+            Term::TagExact(_) => false,
         }
     }
 
@@ -400,6 +451,7 @@ impl Term {
                 let with_hash = *start && parts.first().map_or(false, |p| p.starts_with('#'));
                 tags_lc.split(' ').any(|tag| glob(if with_hash { tag } else { tag.trim_start_matches('#') }, parts, *start, *end))
             }
+            Term::TagExact(name) => tags_lc.split(' ').any(|tag| tag.strip_prefix('#') == Some(name.as_str())),
         }
     }
 
@@ -413,6 +465,7 @@ impl Term {
     fn pieces(&self) -> Vec<String> {
         match self {
             Term::Plain(t) => vec![t.clone()],
+            Term::TagExact(name) => vec![format!("#{name}")],
             Term::Glob { parts, .. } => {
                 parts.iter().filter(|p| is_term(p)).filter(|p| !(p.chars().count() == 1 && p.chars().all(|c| c.is_ascii_alphanumeric()))).cloned().collect()
             }
@@ -490,7 +543,7 @@ fn parse_clauses(input: &str, tag_field: bool) -> Vec<Clause> {
         if body.starts_with('|') && !neg && !out.is_empty() {
             join = true;
         }
-        let alts: Vec<Term> = body.split('|').filter(|a| is_term(a)).map(Term::new).collect();
+        let alts: Vec<Term> = body.split('|').filter(|a| is_term(a)).map(|a| Term::new(a, tag_field)).collect();
         if alts.is_empty() {
             continue; // 「-」「|」「#」「*」だけ(入力の途中)
         }
@@ -532,6 +585,25 @@ pub fn normalize_tags(input: &str) -> String {
         }
     }
     out.join(" ")
+}
+
+/// 使われているタグと、その語数。書き方の違うタグ(`IT` と `it`)は別々に数える。
+/// 並びは、そろえた名前の順(書き方の違うタグが隣り合う)
+pub fn tag_counts<'a>(entries: impl Iterator<Item = &'a Entry>) -> Vec<(String, usize)> {
+    let mut map: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for e in entries {
+        for t in e.tags.split(' ').filter(|t| !t.is_empty()) {
+            *map.entry(t).or_default() += 1;
+        }
+    }
+    let mut v: Vec<(String, usize)> = map.into_iter().map(|(t, n)| (t.to_string(), n)).collect();
+    v.sort_by(|a, b| fold(&a.0).cmp(&fold(&b.0)).then_with(|| a.0.cmp(&b.0)));
+    v
+}
+
+/// タグ `tag` の語だけを出すための検索語(`#"tag"`。タグの完全一致)
+pub fn tag_query(tag: &str) -> String {
+    format!("#\"{}\"", tag.trim().trim_start_matches('#'))
 }
 
 /// 見出し語 `word` の語を一覧に出すための、検索欄の文字列。
@@ -1222,6 +1294,80 @@ mod tests {
                 assert_eq!(filter_in(&e, &q(b), Some(&cand)), filter(&e, &q(b)), "{a} → {b}");
             }
         }
+    }
+
+    #[test]
+    fn exact_tag_search_and_tag_list() {
+        let e = vec![
+            Entry::new(1, "a".into(), "x".into(), "IT 略語".into(), 0),
+            Entry::new(2, "b".into(), "x".into(), "item".into(), 0),
+            Entry::new(3, "c".into(), "x".into(), "it".into(), 0),
+            Entry::new(4, "d".into(), "#\"it\" と書いた意味".into(), "".into(), 0),
+        ];
+        // #it は「it で始まるタグ」。#"it" は、タグが it そのもの(大文字・小文字などは区別しない)
+        assert_eq!(filter(&e, &q("#it")), vec![0, 1, 2]);
+        assert_eq!(filter(&e, &q("#\"it\"")), vec![0, 2]); // 意味に同じ文字があっても、タグだけを見る
+        assert_eq!(filter(&e, &q("＃＂ＩＴ＂")), vec![0, 2]); // 全角でもよい
+        assert_eq!(filter(&e, &q(&tag_query("IT"))), vec![0, 2]);
+        assert_eq!(tag_query("#略語"), "#\"略語\"");
+        assert_eq!(filter(&e, &q("#\"it\" #\"略語\"")), vec![0]);
+        assert_eq!(filter(&e, &q("-#\"it\"")), vec![1, 3]);
+        assert_eq!(filter(&e, &q("#\"it\"|#\"item\"")), vec![0, 1, 2]);
+        // タグ欄では、# が無くてもよい
+        assert_eq!(filter(&e, &Query { tag: "\"it\"".into(), ..Default::default() }), vec![0, 2]);
+        assert_eq!(filter(&e, &Query { tag: "#\"it\" \"略語\"".into(), ..Default::default() }), vec![0]);
+        assert_eq!(filter(&e, &Query { tag: "it".into(), ..Default::default() }), vec![0, 1, 2]); // 引用符なしは、これまでどおり部分一致
+        // 入力の途中(閉じる前)は、引用符の無い語と同じ。1文字ずつ足しても、全件を調べた場合と同じ結果になる
+        assert_eq!(filter(&e, &q("#\"it")), vec![0, 1, 2]);
+        assert_eq!(filter(&e, &q("#\"")).len(), 4);
+        let steps = ["#", "#\"", "#\"i", "#\"it", "#\"it\"", "#\"it\" ", "#\"it\" #\"略"];
+        let mut prev = Query::default();
+        let mut hits: Vec<u32> = (0..e.len() as u32).collect();
+        for s in steps {
+            let cur = q(s);
+            if narrows(&prev, &cur) {
+                let mut cand = hits.clone();
+                cand.sort_unstable();
+                assert_eq!(filter_in(&e, &cur, Some(&cand)), filter(&e, &cur), "{s}");
+            }
+            hits = filter(&e, &cur);
+            prev = cur;
+        }
+        // 強調表示: タグの表示(#IT #略語)の中の、# を含む範囲
+        let (_, _, tg) = q("#\"it\"").mark_terms();
+        assert_eq!(mark_ranges(&hash_tags("IT 略語"), &tg), vec![(0, 3)]);
+
+        // タグの一覧: 書き方の違うタグは別々に数え、隣り合うように並べる
+        assert_eq!(tag_counts(e.iter()), vec![("IT".to_string(), 1), ("it".to_string(), 1), ("item".to_string(), 1), ("略語".to_string(), 1)]);
+        assert!(tag_counts(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn version_stamp() {
+        assert_eq!(version_num("2.0.3"), 203);
+        assert_eq!(version_num("2.1.0"), 210);
+        assert_eq!(version_num("3.0"), 300);
+        assert_eq!(version_label(203), "2.03");
+        assert_eq!(version_label(210), "2.10");
+
+        let dir = std::env::temp_dir().join(format!("MyDictionary-ver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("d.db");
+        let c = open(&path).unwrap();
+        assert_eq!(stored_version(&c).unwrap(), 0); // 記録の無い辞書
+        // 書き込みの前の移行で、自分の版が記録される
+        migrate(&c).unwrap();
+        assert_eq!(stored_version(&c).unwrap(), app_version_num());
+        // 新しい版が書いた辞書を、古い版が書いても、記録は下がらない
+        stamp_version(&c, 999).unwrap();
+        migrate(&c).unwrap();
+        assert_eq!(stored_version(&c).unwrap(), 999);
+        stamp_version(&c, 150).unwrap();
+        assert_eq!(stored_version(&c).unwrap(), 999);
+        drop(c);
+        // 参照専用で開いても読める
+        assert_eq!(stored_version(&open_ro(&path).unwrap()).unwrap(), 999);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

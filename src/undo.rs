@@ -88,6 +88,35 @@ pub fn delete_with_snapshots(conn: &Connection, ids: &[i64]) -> rusqlite::Result
     Ok(out)
 }
 
+/// タグ `from` を、すべての語で `to` に付け替える(`to` が None なら外す)。
+/// 付け替え先のタグがすでに付いている語では、1つにまとまる(統合)。
+/// 書き換えた語の (変える前の内容, 書き込んだ後の更新日時) を返す(元に戻すための記録になる)。
+/// タグは、書いたとおりの文字で比べる(`IT` と `it` は別のタグ。書き方の違いをそろえるのに使えるように)。
+/// 内容を変えるので、更新日時も必ず変える(編集の衝突を、更新日時で検知しているため)。
+/// トランザクションは呼び出し側で管理する。
+pub fn retag(conn: &Connection, from: &str, to: Option<&str>) -> rusqlite::Result<Vec<(Snapshot, i64)>> {
+    let ids: Vec<i64> = {
+        // 候補を大まかに絞ってから(LIKE)、タグ1つずつを正確に比べる
+        let mut st = conn.prepare("SELECT id, tags FROM words WHERE instr(' ' || tags || ' ', ' ' || ?1 || ' ') > 0")?;
+        let v = st.query_map(params![from], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<_>>()?;
+        v
+    };
+    let now = crate::core::now_unix();
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(before) = read(conn, id)? else { continue };
+        let replaced: Vec<&str> = before.tags.split(' ').filter(|t| !t.is_empty()).filter_map(|t| if t == from { to } else { Some(t) }).collect();
+        let tags = crate::core::normalize_tags(&replaced.join(" "));
+        if tags == before.tags {
+            continue;
+        }
+        let ts = now.max(before.updated_at + 1);
+        conn.execute("UPDATE words SET tags = ?1, updated_at = ?2 WHERE id = ?3", params![tags, ts, id])?;
+        out.push((before, ts));
+    }
+    Ok(out)
+}
+
 /// 記録した操作を元に戻す。トランザクションは呼び出し側で管理する。
 pub fn revert(conn: &Connection, u: &Undo) -> rusqlite::Result<Reverted> {
     let mut r = Reverted::default();
@@ -218,6 +247,43 @@ mod tests {
         core::delete_ids(&conn, &[e.id]).unwrap();
         let u = Undo { inserted: vec![(e.id, e.updated_at)], ..Default::default() };
         assert_eq!(revert(&conn, &u).unwrap(), Reverted { done: 0, skipped: 1 });
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retag_renames_merges_and_removes() {
+        let (conn, dir) = open("retag");
+        let mk = |w: &str, tags: &str, ts: i64| core::insert_entry(&conn, &Fields { word: w.into(), meaning: "m".into(), tags: tags.into(), ..Default::default() }, Some(ts)).unwrap();
+        let a = mk("a", "it 略語", 100);
+        let b = mk("b", "IT it", 200); // 付け替え先がすでに付いている → 1つにまとまる
+        let c = mk("c", "item", 300); // 別のタグ(it で始まるだけ)は変えない
+        let d = mk("d", "IT", 400);
+        let before = all(&conn);
+
+        // 名前の変更(書き方をそろえる): it → IT
+        let changed = retag(&conn, "it", Some("IT")).unwrap();
+        assert_eq!(changed.len(), 2);
+        let now = all(&conn);
+        let tags = |id: i64| now.iter().find(|s| s.id == id).unwrap().tags.clone();
+        assert_eq!((tags(a.id).as_str(), tags(b.id).as_str(), tags(c.id).as_str(), tags(d.id).as_str()), ("IT 略語", "IT", "item", "IT"));
+        // 書き換えた語は、更新日時が変わる。変えていない語は、そのまま
+        assert!(now.iter().find(|s| s.id == a.id).unwrap().updated_at > 100);
+        assert_eq!(now.iter().find(|s| s.id == d.id).unwrap().updated_at, 400);
+        // もう一度行っても、変わらない
+        assert!(retag(&conn, "it", Some("IT")).unwrap().is_empty());
+
+        // 元に戻す
+        let u = Undo { updated: changed, ..Default::default() };
+        assert_eq!(revert(&conn, &u).unwrap(), Reverted { done: 2, skipped: 0 });
+        assert_eq!(all(&conn), before);
+
+        // 削除: タグを外す
+        let changed = retag(&conn, "IT", None).unwrap();
+        assert_eq!(changed.len(), 2);
+        let now = all(&conn);
+        let tags = |id: i64| now.iter().find(|s| s.id == id).unwrap().tags.clone();
+        assert_eq!((tags(a.id).as_str(), tags(b.id).as_str(), tags(d.id).as_str()), ("it 略語", "it", ""));
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }

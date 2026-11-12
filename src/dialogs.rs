@@ -1,4 +1,4 @@
-//! モーダルダイアログ: 登録/編集、設定、ライセンス情報。
+//! モーダルダイアログ: 登録/編集、設定、ライセンス情報、タグの一覧。
 
 use crate::config::{self, Config, DictConf, Hotkey};
 use crate::undo::Undo;
@@ -34,6 +34,10 @@ const LVM_SETITEMTEXTW_: u32 = 0x1074;
 const HKM_SETHOTKEY: u32 = 0x0401;
 const HKM_GETHOTKEY: u32 = 0x0402;
 const HKM_SETRULES: u32 = 0x0403;
+/// 既定のボタンをたずねるメッセージ(DM_GETDEFID)と、その答えの印(DC_HASDEFID)。
+/// 答えておくと、1行の入力欄で Enter を押したときに、そのボタンが押されたことになる
+const DM_GETDEFID_: u32 = 0x0400;
+const DC_HASDEFID_: isize = 0x534B;
 
 static REGISTER: Once = Once::new();
 
@@ -45,6 +49,8 @@ unsafe fn register_classes() {
             (w!("MyDictionarySettings"), settings_proc),
             (w!("MyDictionarySelect"), select_proc),
             (w!("MyDictionaryLicense"), license_proc),
+            (w!("MyDictionaryTags"), tags_proc),
+            (w!("MyDictionaryPrompt"), prompt_proc),
         ] {
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -225,6 +231,8 @@ pub struct EntryDlg {
     pub orig_word: String,
     /// 「その語を表示」が押された: 表示する語 (辞書の添字, id)。このとき `ok` は false
     pub open_existing: Option<(usize, i64)>,
+    /// すでに使われているタグと語数(「選ぶ…」で一覧から選べるようにする)
+    pub all_tags: Vec<(String, usize)>,
     pub ok: bool,
 }
 
@@ -238,6 +246,7 @@ const E_LINK: usize = 307;
 const E_READING: usize = 308;
 const E_DUP: usize = 309; // 同じ見出し語があるときの知らせ
 const E_DUPLINK: usize = 310; // 「その語を表示」
+const E_TAGPICK: usize = 311; // タグを一覧から選ぶ
 
 struct EntryCtl {
     data: *mut EntryDlg,
@@ -334,7 +343,10 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             let reading = ui::field(hwnd, E_READING, (s(m), s(y + 22), s(fw), s(CTL_H)), dpi, false, &mut fields, fonts.base);
             y += 66;
             label(hwnd, "タグ(スペースまたはカンマ区切り・任意)", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
-            let tags = ui::field(hwnd, E_TAGS, (s(m), s(y + 22), s(fw), s(CTL_H)), dpi, false, &mut fields, fonts.base);
+            // タグの欄の右に、すでにあるタグから選ぶボタン
+            let pick_w = 84;
+            let tags = ui::field(hwnd, E_TAGS, (s(m), s(y + 22), s(fw - pick_w - 8), s(CTL_H)), dpi, false, &mut fields, fonts.base);
+            button(hwnd, "選ぶ…", E_TAGPICK, (s(m + fw - pick_w), s(y + 22), s(pick_w), s(CTL_H)), true);
             y += 66;
 
             label(hwnd, "意味", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
@@ -444,6 +456,27 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                             update_dup(c);
                         }
                     }
+                }
+                (E_TAGPICK, _) => {
+                    // すでにあるタグの一覧から選ぶ。欄に書いてある、一覧に無いタグ(新しいタグ)は残す
+                    let d = &*c.data;
+                    let current: Vec<String> = core::normalize_tags(&get_text(c.tags)).split(' ').filter(|t| !t.is_empty()).map(str::to_owned).collect();
+                    let mut dlg = TagsDlg {
+                        title: "タグを選ぶ".into(),
+                        note: "この語に付けるタグに、チェックを入れてください。\n新しいタグは、タグの欄に直接入力します。".into(),
+                        tags: d.all_tags.clone(),
+                        checked: current.clone(),
+                        manage: false,
+                        action: None,
+                        ok: false,
+                    };
+                    if tags_dialog(hwnd, &mut dlg) {
+                        let known = |t: &String| d.all_tags.iter().any(|(k, _)| k == t);
+                        let mut out: Vec<String> = current.iter().filter(|t| !known(t) || dlg.checked.contains(t)).cloned().collect();
+                        out.extend(dlg.checked.iter().filter(|t| !current.contains(t)).cloned());
+                        set_text(c.tags, &out.join(" "));
+                    }
+                    let _ = SetFocus(c.tags);
                 }
                 (ID_OK, _) => {
                     let d = &mut *c.data;
@@ -1787,5 +1820,401 @@ unsafe fn export_dict(owner: HWND, dict: &DictConf) {
         Err(e) => {
             msg_box(owner, &format!("書き出せませんでした。\n\n{e}"), "エクスポート", MB_OK | MB_ICONERROR);
         }
+    }
+}
+
+// ============================================================================
+// タグの一覧
+// ============================================================================
+
+/// タグの一覧の画面で選ばれた、タグの一括変更
+pub enum TagAction {
+    /// 名前の変更(`to` がすでにあるタグなら、そのタグにまとめる)
+    Rename { from: String, to: String },
+    /// 削除(語からタグを外す。語そのものは消さない)
+    Delete { tag: String },
+}
+
+pub struct TagsDlg {
+    pub title: String,
+    /// 一覧の上に出す説明
+    pub note: String,
+    /// (タグ, 語数)。表示する順
+    pub tags: Vec<(String, usize)>,
+    /// 入: はじめにチェックを入れるタグ / 出: OK のときにチェックされていたタグ(`tags` の順)
+    pub checked: Vec<String>,
+    /// 名前の変更・削除のボタンを出す
+    pub manage: bool,
+    /// 出: 名前の変更・削除が選ばれた(このとき `ok` は false)
+    pub action: Option<TagAction>,
+    pub ok: bool,
+}
+
+const T_FILTER: usize = 701;
+const T_LIST: usize = 702;
+const T_RENAME: usize = 703;
+const T_DELETE: usize = 704;
+const T_ERR: usize = 705;
+const T_NOTE: usize = 706;
+const TAGS_W: i32 = 460;
+const TAGS_H: i32 = 540;
+
+struct TagsCtl {
+    data: *mut TagsDlg,
+    fonts: Fonts,
+    dpi: i32,
+    filter: HWND,
+    list: HWND,
+    err: HWND,
+    fields: Vec<(RECT, HWND)>,
+    /// `data.tags` と同じ並びの、チェックの状態
+    checks: Vec<bool>,
+    /// 一覧の行 → `data.tags` の添字(絞り込みで、一部だけを表示しているため)
+    rows: Vec<usize>,
+}
+
+/// タグの一覧を表示する。OK なら true(結果は `data.checked`)。
+/// 名前の変更・削除が選ばれたときは false を返し、`data.action` に内容が入る
+pub unsafe fn tags_dialog(owner: HWND, data: &mut TagsDlg) -> bool {
+    data.ok = false;
+    data.action = None;
+    let title = data.title.clone();
+    run_modal(owner, w!("MyDictionaryTags"), &title, TAGS_W, TAGS_H, data as *mut TagsDlg as *const c_void);
+    data.ok
+}
+
+/// 絞り込みの欄に合うタグだけを、一覧に並べ直す
+unsafe fn tags_fill(c: &mut TagsCtl) {
+    let d = &*c.data;
+    let key = core::fold(get_text(c.filter).trim());
+    c.rows = (0..d.tags.len()).filter(|&i| key.is_empty() || core::fold(&d.tags[i].0).contains(&key)).collect();
+    let (list, rows, checks) = (c.list, &c.rows, &c.checks);
+    ui::quiet(|| {
+        send(list, LVM_DELETEALLITEMS_, 0, 0);
+        for (row, &i) in rows.iter().enumerate() {
+            let mut t = wide(&d.tags[i].0);
+            let item = LVITEMW { mask: LVIF_TEXT, iItem: row as i32, pszText: PWSTR(t.as_mut_ptr()), ..Default::default() };
+            send(list, LVM_INSERTITEMW, 0, &item as *const _ as isize);
+            lv_set_cell(list, row, 1, &format!("{} 語", d.tags[i].1));
+            set_check(list, row, checks[i]);
+        }
+    });
+}
+
+/// 一覧で選んでいる(青く表示されている)タグの、`data.tags` の添字
+unsafe fn tags_selected(c: &TagsCtl) -> Option<usize> {
+    let row = send(c.list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as isize).0;
+    if row < 0 {
+        None
+    } else {
+        c.rows.get(row as usize).copied()
+    }
+}
+
+unsafe extern "system" fn tags_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let ctl = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TagsCtl;
+    match msg {
+        WM_CREATE => {
+            let cs = &*(lparam.0 as *const CREATESTRUCTW);
+            let data = cs.lpCreateParams as *mut TagsDlg;
+            let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+            let s = |v: i32| scale(v, dpi);
+            let fonts = Fonts::new(dpi);
+            let d = &*data;
+            let (m, fw) = (20, TAGS_W - 40);
+            let hinst = GetModuleHandleW(None).unwrap();
+            let mut fields = Vec::new();
+            let mut y = 16;
+            label(hwnd, &d.note, (s(m), s(y), s(fw), s(38)), fonts.small, T_NOTE);
+            y += 44;
+            let filter = ui::field(hwnd, T_FILTER, (s(m), s(y), s(fw), s(CTL_H)), dpi, false, &mut fields, fonts.base);
+            let cue = wide("タグの名前で絞り込む");
+            send(filter, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
+            y += CTL_H + 10;
+            let list_h = TAGS_H - y - (if d.manage { CTL_H + 10 } else { 0 }) - 24 - CTL_H - 20 - 10;
+            let list = CreateWindowExW(
+                WS_EX_CLIENTEDGE,
+                w!("SysListView32"),
+                PCWSTR::null(),
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | LVS_REPORT as u32 | LVS_SINGLESEL as u32 | LVS_SHOWSELALWAYS as u32),
+                s(m),
+                s(y),
+                s(fw),
+                s(list_h),
+                hwnd,
+                HMENU(T_LIST as *mut c_void),
+                hinst,
+                None,
+            )
+            .unwrap();
+            send(list, WM_SETFONT, fonts.base.0 as usize, 1);
+            send(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, (LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as isize);
+            let _ = SetWindowTheme(list, w!("Explorer"), PCWSTR::null());
+            for (i, (t, wd)) in [("タグ", fw - 130), ("語数", 96)].iter().enumerate() {
+                let mut tt = wide(t);
+                let col = LVCOLUMNW { mask: LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM, cx: s(*wd), pszText: PWSTR(tt.as_mut_ptr()), iSubItem: i as i32, ..Default::default() };
+                send(list, LVM_INSERTCOLUMNW, i, &col as *const _ as isize);
+            }
+            y += list_h + 10;
+            if d.manage {
+                button(hwnd, "名前の変更…", T_RENAME, (s(m), s(y), s(BTN_W + 16), s(CTL_H)), true);
+                button(hwnd, "削除", T_DELETE, (s(m + BTN_W + 26), s(y), s(BTN_W), s(CTL_H)), true);
+                y += CTL_H + 10;
+            }
+            let err = label(hwnd, "", (s(m), s(y), s(fw), s(20)), fonts.small, T_ERR);
+            y += 24;
+            button(hwnd, "OK", ID_OK, (s(m + fw - 2 * BTN_W - 10), s(y), s(BTN_W), s(CTL_H)), true);
+            button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
+
+            let checks: Vec<bool> = d.tags.iter().map(|(t, _)| d.checked.contains(t)).collect();
+            let c = Box::new(TagsCtl { data, fonts, dpi, filter, list, err, fields, checks, rows: Vec::new() });
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(c) as isize);
+            let c = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TagsCtl);
+            tags_fill(c);
+            if d.tags.is_empty() {
+                set_text(c.err, "タグは、まだ1つもありません");
+            }
+            let _ = SetFocus(filter);
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if !ctl.is_null() {
+                ui::paint_fields(hdc, &(*ctl).fields, (*ctl).dpi);
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
+            let hdc = HDC(wparam.0 as *mut c_void);
+            let color = match GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize {
+                T_ERR => DANGER,
+                T_NOTE => MUTED,
+                _ => TEXT,
+            };
+            ui::ctl_color(hdc, color, WHITE, white_brush())
+        }
+        WM_DRAWITEM => {
+            let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
+            if !ctl.is_null() {
+                let kind = match dis.CtlID as usize {
+                    ID_OK => Btn::Primary,
+                    T_DELETE => Btn::Danger,
+                    _ => Btn::Secondary,
+                };
+                ui::draw_button(dis, kind, (*ctl).fonts.base, WHITE, (*ctl).dpi);
+            }
+            LRESULT(1)
+        }
+        WM_NOTIFY => {
+            // チェックの付け外しを控える(絞り込みで行を並べ直しても、状態を保てるように)
+            let hdr = &*(lparam.0 as *const NMHDR);
+            if !ctl.is_null() && hdr.idFrom == T_LIST && hdr.code == LVN_ITEMCHANGED && !ui::is_busy() {
+                let nm = &*(lparam.0 as *const NMLISTVIEW);
+                let c = &mut *ctl;
+                if (nm.uOldState ^ nm.uNewState) & 0xF000 != 0 && nm.iItem >= 0 {
+                    if let Some(&i) = c.rows.get(nm.iItem as usize) {
+                        c.checks[i] = get_check(c.list, nm.iItem as usize);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        WM_COMMAND => {
+            let id = wparam.0 & 0xFFFF;
+            let code = wparam.0 >> 16;
+            if ctl.is_null() {
+                return LRESULT(0);
+            }
+            let c = &mut *ctl;
+            let d = &mut *c.data;
+            match (id, code) {
+                (T_FILTER, EN_SETFOCUS_ | EN_KILLFOCUS_) => {
+                    ui::invalidate_field(hwnd, &c.fields, c.filter);
+                }
+                (T_FILTER, EN_CHANGE_) if !ui::is_busy() => {
+                    tags_fill(c);
+                    set_text(c.err, "");
+                }
+                (T_RENAME, _) => match tags_selected(c) {
+                    None => set_text(c.err, "名前を変えるタグを、一覧で選んでください"),
+                    Some(i) => {
+                        let from = d.tags[i].0.clone();
+                        let label = format!("タグ「{from}」の新しい名前を入力してください。\nすでにあるタグの名前にすると、そのタグにまとめられます。");
+                        if let Some(input) = prompt_dialog(hwnd, "タグの名前の変更", &label, &from) {
+                            let to = core::normalize_tags(&input);
+                            if to.is_empty() || to.contains(' ') {
+                                set_text(c.err, "タグの名前は、空白や区切りを含まない1語で入力してください");
+                            } else if to == from {
+                                set_text(c.err, "名前が変わっていません");
+                            } else {
+                                d.action = Some(TagAction::Rename { from, to });
+                                let _ = DestroyWindow(hwnd);
+                            }
+                        }
+                    }
+                },
+                (T_DELETE, _) => match tags_selected(c) {
+                    None => set_text(c.err, "削除するタグを、一覧で選んでください"),
+                    Some(i) => {
+                        let (tag, n) = d.tags[i].clone();
+                        let text = format!("タグ「{tag}」を、{n} 語から外しますか?\n\n語そのものは消えません。直後なら「元に戻す」で取り消せます。");
+                        if msg_box(hwnd, &text, "タグの削除", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES {
+                            d.action = Some(TagAction::Delete { tag });
+                            let _ = DestroyWindow(hwnd);
+                        }
+                    }
+                },
+                (ID_OK, _) => {
+                    d.checked = d.tags.iter().zip(&c.checks).filter(|(_, &on)| on).map(|(t, _)| t.0.clone()).collect();
+                    d.ok = true;
+                    let _ = DestroyWindow(hwnd);
+                }
+                (ID_CANCEL, _) => {
+                    let _ = DestroyWindow(hwnd);
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        // Enter = OK(絞り込みの欄で Enter を押すと、そのまま確定する)
+        DM_GETDEFID_ => LRESULT((DC_HASDEFID_ << 16) | ID_OK as isize),
+        WM_NEXTDLGCTL => {
+            ui::next_dlg_ctl(hwnd, wparam, lparam);
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            if !ctl.is_null() {
+                let c = Box::from_raw(ctl);
+                c.fonts.destroy();
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// ============================================================================
+// 1行の入力(タグの名前の変更など)
+// ============================================================================
+
+struct PromptDlg {
+    label: String,
+    text: String,
+    ok: bool,
+}
+
+const P_TEXT: usize = 801;
+const P_LABEL: usize = 802;
+
+struct PromptCtl {
+    data: *mut PromptDlg,
+    fonts: Fonts,
+    dpi: i32,
+    text: HWND,
+    fields: Vec<(RECT, HWND)>,
+}
+
+/// 1行の文字を入力してもらう。OK なら、入力された文字(前後の空白は除く)
+unsafe fn prompt_dialog(owner: HWND, title: &str, label: &str, initial: &str) -> Option<String> {
+    let mut data = PromptDlg { label: label.to_string(), text: initial.to_string(), ok: false };
+    run_modal(owner, w!("MyDictionaryPrompt"), title, 460, 196, &mut data as *mut PromptDlg as *const c_void);
+    data.ok.then(|| data.text.trim().to_string())
+}
+
+unsafe extern "system" fn prompt_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let ctl = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut PromptCtl;
+    match msg {
+        WM_CREATE => {
+            let cs = &*(lparam.0 as *const CREATESTRUCTW);
+            let data = cs.lpCreateParams as *mut PromptDlg;
+            let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+            let s = |v: i32| scale(v, dpi);
+            let fonts = Fonts::new(dpi);
+            let d = &*data;
+            let (m, fw) = (20, 460 - 40);
+            let mut fields = Vec::new();
+            label(hwnd, &d.label, (s(m), s(18), s(fw), s(44)), fonts.small, P_LABEL);
+            let text = ui::field(hwnd, P_TEXT, (s(m), s(70), s(fw), s(CTL_H)), dpi, false, &mut fields, fonts.base);
+            set_text(text, &d.text);
+            button(hwnd, "OK", ID_OK, (s(m + fw - 2 * BTN_W - 10), s(140), s(BTN_W), s(CTL_H)), true);
+            button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - BTN_W), s(140), s(BTN_W), s(CTL_H)), true);
+            let c = Box::new(PromptCtl { data, fonts, dpi, text, fields });
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(c) as isize);
+            let _ = SetFocus(text);
+            send(text, EM_SETSEL, 0, -1);
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if !ctl.is_null() {
+                ui::paint_fields(hdc, &(*ctl).fields, (*ctl).dpi);
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
+            let hdc = HDC(wparam.0 as *mut c_void);
+            let color = if GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize == P_LABEL { MUTED } else { TEXT };
+            ui::ctl_color(hdc, color, WHITE, white_brush())
+        }
+        WM_DRAWITEM => {
+            let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
+            if !ctl.is_null() {
+                let kind = if dis.CtlID as usize == ID_OK { Btn::Primary } else { Btn::Secondary };
+                ui::draw_button(dis, kind, (*ctl).fonts.base, WHITE, (*ctl).dpi);
+            }
+            LRESULT(1)
+        }
+        WM_COMMAND => {
+            let id = wparam.0 & 0xFFFF;
+            let code = wparam.0 >> 16;
+            if ctl.is_null() {
+                return LRESULT(0);
+            }
+            let c = &mut *ctl;
+            match (id, code) {
+                (P_TEXT, EN_SETFOCUS_ | EN_KILLFOCUS_) => {
+                    ui::invalidate_field(hwnd, &c.fields, c.text);
+                }
+                (ID_OK, _) => {
+                    let d = &mut *c.data;
+                    d.text = get_text(c.text);
+                    d.ok = true;
+                    let _ = DestroyWindow(hwnd);
+                }
+                (ID_CANCEL, _) => {
+                    let _ = DestroyWindow(hwnd);
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        // Enter = OK
+        DM_GETDEFID_ => LRESULT((DC_HASDEFID_ << 16) | ID_OK as isize),
+        WM_NEXTDLGCTL => {
+            ui::next_dlg_ctl(hwnd, wparam, lparam);
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            if !ctl.is_null() {
+                let c = Box::from_raw(ctl);
+                c.fonts.destroy();
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }

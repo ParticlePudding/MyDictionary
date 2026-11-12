@@ -8,12 +8,12 @@
 use crate::bookmarks::{Bookmark, Bookmarks};
 use crate::config::{self, Config, Sort};
 use crate::core::{self, Entry, Query};
-use crate::dialogs::{self, EntryDlg, SelectDlg, SettingsDlg};
+use crate::dialogs::{self, EntryDlg, SelectDlg, SettingsDlg, TagAction, TagsDlg};
 use crate::safe::{self, WriteError};
 use crate::undo::{self, Snapshot, Undo};
 use crate::ui::{self, quiet, scale, Btn, Fonts, BTN_W, CTL_H};
 use crate::ui::{get_text, send, set_text, wide};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -53,6 +53,9 @@ const ID_BACK: usize = 124; // リンクで移動する前の状態に戻る(Alt
 /// 戻れる回数の上限
 const BACK_MAX: usize = 50;
 const ID_UNDO: usize = 125; // 下段の「元に戻す」のリンク
+const ID_TAGS: usize = 126; // 絞り込みのタグ欄の横の「一覧…」
+/// 本文のタグのリンクを表す開く先の接頭辞(例: `tag:IT`)。クリックすると、そのタグで検索する
+const TAG_SCHEME: &str = "tag:";
 const HOTKEY_ID: i32 = 1;
 const WM_APP_LOADED: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
@@ -104,6 +107,8 @@ struct LoadedDict {
     error: Option<String>,
     corrupt: bool,
     stamp: Stamp,
+    /// 辞書に記録されている、いちばん新しいアプリの版(`core::stored_version`。読めなければ 0)
+    version: i64,
 }
 
 struct Loaded {
@@ -166,6 +171,8 @@ struct State {
     /// 下段の左端の「元に戻す」(元に戻せる操作があるときだけ表示)
     undo_link: HWND,
     undo_w: i32,
+    /// 下段を、幅いっぱいに使っているか(操作の結果などの案内を出している間は、右のキー操作の案内を隠す)
+    status_wide: Cell<bool>,
 
     fonts: Fonts,
     dpi: i32,
@@ -205,6 +212,10 @@ struct State {
     back: Vec<View>,
     /// 直前の操作を元に戻すための記録
     undo: Option<UndoOp>,
+    /// 「新しい版のアプリでも使われている」と知らせた辞書(同じ知らせを繰り返さない)
+    warned_version: HashSet<PathBuf>,
+    /// 絞り込みのタグ欄の横の「一覧…」
+    btn_tags: HWND,
 
     /// しおり(各自の設定フォルダに保存)
     bookmarks: Bookmarks,
@@ -500,18 +511,18 @@ unsafe fn start_load(hwnd: HWND, st: &mut State, keep: bool) {
         let mut dicts = Vec::new();
         for (i, (path, ro)) in specs.iter().enumerate() {
             let stamp = safe::file_stamp(path); // 読む前に取る(読んでいる間の変更を見逃さない)
-            let r = if *ro { core::open_ro(path) } else { core::open(path) }.and_then(|c| core::load_all(&c));
+            let r = if *ro { core::open_ro(path) } else { core::open(path) }.and_then(|c| Ok((core::load_all(&c)?, core::stored_version(&c).unwrap_or(0))));
             match r {
-                Ok(mut v) => {
+                Ok((mut v, version)) => {
                     for e in &mut v {
                         e.dict = i;
                     }
                     entries.append(&mut v);
                     // 新規作成された場合は作成後の状態を記録する
                     let stamp = stamp.or_else(|| safe::file_stamp(path));
-                    dicts.push(LoadedDict { error: None, corrupt: false, stamp });
+                    dicts.push(LoadedDict { error: None, corrupt: false, stamp, version });
                 }
-                Err(e) => dicts.push(LoadedDict { corrupt: safe::is_corrupt(&e), error: Some(e.to_string()), stamp }),
+                Err(e) => dicts.push(LoadedDict { corrupt: safe::is_corrupt(&e), error: Some(e.to_string()), stamp, version: 0 }),
             }
         }
         core::sort_entries(&mut entries);
@@ -619,6 +630,8 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         let _ = ShowWindow(h, SW_HIDE);
         h
     };
+    let btn_tags = owner_button(hwnd, ID_TAGS, "一覧…");
+    let _ = ShowWindow(btn_tags, SW_HIDE);
     let qw = adv_edit(ID_QW, "見出し語・読みで絞り込み");
     let qm = adv_edit(ID_QM, "意味で絞り込み");
     let qt = adv_edit(ID_QT, "タグで絞り込み(複数はスペース区切りで AND)");
@@ -691,6 +704,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         hint,
         undo_link,
         undo_w: 0,
+        status_wide: Cell::new(false),
         fonts,
         dpi,
         fields,
@@ -719,6 +733,8 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         hover_link: None,
         back: Vec::new(),
         undo: None,
+        warned_version: HashSet::new(),
+        btn_tags,
         bookmarks: if init_shared { Bookmarks::default() } else { Bookmarks::load(&bm_path) },
         bm_path,
         bm_map: HashMap::new(),
@@ -775,29 +791,26 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
 
     // --- 絞り込み(列ごと) ---
     let adv_cmd = if st.advanced { SW_SHOW } else { SW_HIDE };
-    for h in [st.qw, st.qm, st.qt] {
+    for h in [st.qw, st.qm, st.qt, st.btn_tags] {
         let _ = ShowWindow(h, adv_cmd);
     }
     if st.advanced {
         let fh = s(CTL_H);
         let cw = (w - 2 * gap) / 3;
+        // タグ欄の右に、タグの一覧を開くボタン
+        let tw = s(84);
+        let (tx, tag_w) = (m + 2 * (cw + gap), w - 2 * (cw + gap));
         ui::place_field(st.qw, (m, top, cw, fh), dpi, false, &mut st.fields);
         ui::place_field(st.qm, (m + cw + gap, top, cw, fh), dpi, false, &mut st.fields);
-        ui::place_field(st.qt, (m + 2 * (cw + gap), top, w - 2 * (cw + gap), fh), dpi, false, &mut st.fields);
+        ui::place_field(st.qt, (tx, top, tag_w - tw - gap, fh), dpi, false, &mut st.fields);
+        let _ = MoveWindow(st.btn_tags, tx + tag_w - tw, top, tw, fh, true);
         top += fh + s(12);
     }
 
     // --- 下端: ステータス(左)とキー操作の案内(右) ---
     let status_h = s(30);
     st.status_top = rc.bottom - status_h;
-    let hint_w = (w * 62 / 100).min(s(600));
-    // 左端に「元に戻す」(元に戻せる操作があるときだけ)、その右に件数と操作の結果
-    let undo_w = if st.undo.is_some() { st.undo_w.min(w - hint_w - gap - s(80)).max(0) } else { 0 };
-    let _ = ShowWindow(st.undo_link, if undo_w > 0 { SW_SHOW } else { SW_HIDE });
-    let _ = MoveWindow(st.undo_link, m, st.status_top + s(6), undo_w, s(20), true);
-    let sx = m + undo_w + if undo_w > 0 { s(14) } else { 0 };
-    let _ = MoveWindow(st.status, sx, st.status_top + s(6), (m + w - hint_w - gap - sx).max(0), s(20), true);
-    let _ = MoveWindow(st.hint, m + w - hint_w, st.status_top + s(6), hint_w, s(20), true);
+    layout_status(st);
     let bottom = st.status_top - s(12);
     let h = (bottom - top).max(s(80));
 
@@ -832,6 +845,26 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
     let _ = MoveWindow(st.btn_bm, ix, btn_y, bw, btn_h, true);
     // 絞り込み欄の出し入れで残像が出ないよう、背景ごと描き直す
     let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+}
+
+/// 下段の配置: 左端に「元に戻す」(元に戻せる操作があるときだけ)、その右に件数と操作の結果、右端にキー操作の案内。
+/// 操作の結果などの案内を出している間(`status_wide`)は、キー操作の案内を隠して、幅いっぱいに表示する
+unsafe fn layout_status(st: &State) {
+    let mut rc = RECT::default();
+    let _ = GetClientRect(GetParent(st.status).unwrap_or_default(), &mut rc);
+    let s = |v: i32| scale(v, st.dpi);
+    let (m, gap) = (s(16), s(8));
+    let w = rc.right - 2 * m;
+    let wide = st.status_wide.get();
+    let hint_w = if wide { 0 } else { (w * 62 / 100).min(s(600)) };
+    let y = st.status_top + s(6);
+    let undo_w = if st.undo.is_some() { st.undo_w.min(w - hint_w - gap - s(80)).max(0) } else { 0 };
+    let _ = ShowWindow(st.undo_link, if undo_w > 0 { SW_SHOW } else { SW_HIDE });
+    let _ = MoveWindow(st.undo_link, m, y, undo_w, s(20), true);
+    let sx = m + undo_w + if undo_w > 0 { s(14) } else { 0 };
+    let _ = MoveWindow(st.status, sx, y, (m + w - hint_w - if wide { 0 } else { gap } - sx).max(0), s(20), true);
+    let _ = ShowWindow(st.hint, if wide { SW_HIDE } else { SW_SHOW });
+    let _ = MoveWindow(st.hint, m + w - hint_w, y, hint_w, s(20), true);
 }
 
 unsafe fn paint(hwnd: HWND, st: &State) {
@@ -1026,6 +1059,9 @@ unsafe fn refresh(st: &mut State) {
 
 /// リンクの開く先を、左下に表示するための文字列にする
 fn link_label(target: &str) -> String {
+    if let Some(tag) = target.strip_prefix(TAG_SCHEME) {
+        return format!("クリックすると、タグ「{tag}」の語を表示します");
+    }
     match target.strip_prefix(core::WORD_SCHEME) {
         Some(word) => format!("リンク先: この辞書の「{}」", word.trim()),
         None => format!("リンク先: {target}"),
@@ -1041,16 +1077,21 @@ unsafe fn set_hover_link(st: &mut State, target: Option<String>) {
 }
 
 unsafe fn update_status(st: &State) {
-    // リンクの上にマウスがある間は、開く先を表示する(クリックする前に確かめられるように)
-    if let Some(target) = &st.hover_link {
-        set_text(st.status, &link_label(target));
-        return;
-    }
     let errs: Vec<String> = st
         .dicts
         .iter()
         .filter_map(|d| d.error.as_ref().map(|e| format!("辞書「{}」を読み込めません: {}", d.name, e)))
         .collect();
+    // 案内(リンクの開く先、操作の結果、エラー)を出している間は、下段を幅いっぱいに使う
+    let wide = st.hover_link.is_some() || st.notice.is_some() || !errs.is_empty();
+    if st.status_wide.replace(wide) != wide {
+        layout_status(st);
+    }
+    // リンクの上にマウスがある間は、開く先を表示する(クリックする前に確かめられるように)
+    if let Some(target) = &st.hover_link {
+        set_text(st.status, &link_label(target));
+        return;
+    }
     let text = if !st.loaded {
         "読み込み中…".to_string()
     } else if st.bm_view {
@@ -1140,6 +1181,7 @@ unsafe fn render(
     body_links: &[(usize, usize, String)],
     links: &[(String, String)],
     title_marks: &[(usize, usize)], meta_marks: &[(usize, usize)], body_marks: &[(usize, usize)],
+    meta_links: &[(usize, usize, String)],
 ) {
     let body = body.replace("\r\n", "\n");
     // 文字位置は UTF-16 単位で数える。RichEdit 内部では改行は1文字なので、'\n' = 1 のままでよい
@@ -1216,6 +1258,12 @@ unsafe fn render(
         rich_link(st.rich, r);
         store.push((r.0 as i32, r.1 as i32, target.clone()));
     }
+    // 補足の行のリンク(タグ。クリックすると、そのタグで検索する)
+    for (a, b, target) in meta_links {
+        let r = (r_meta.0 + a, r_meta.0 + b);
+        rich_link(st.rich, r);
+        store.push((r.0 as i32, r.1 as i32, target.clone()));
+    }
     for &(a, b) in title_marks {
         rich_format(st.rich, (r_title.0 + a, r_title.0 + b), None, true, ui::MARK);
     }
@@ -1251,7 +1299,7 @@ unsafe fn update_detail(st: &State) {
             } else {
                 m
             };
-            render(st, t, "", m, "", &[], &[], &[], &[], &[]);
+            render(st, t, "", m, "", &[], &[], &[], &[], &[], &[]);
         }
         1 => {
             let e = &st.entries[sel[0]];
@@ -1269,6 +1317,14 @@ unsafe fn update_detail(st: &State) {
             let (body, body_links) = core::body_links(&e.meaning.replace("\r\n", "\n"));
             // タグは meta の先頭にあるので、強調位置はそのまま使える
             let meta_marks = if tags.is_empty() { Vec::new() } else { core::mark_ranges(&tags, &st.marks.2) };
+            // タグ1つずつをリンクにする(「#a #b」の中の位置。UTF-16 単位)
+            let mut meta_links: Vec<(usize, usize, String)> = Vec::new();
+            let mut pos = 0;
+            for t in tags.split(' ').filter(|t| !t.is_empty()) {
+                let n = len16(t);
+                meta_links.push((pos, pos + n, format!("{TAG_SCHEME}{}", t.trim_start_matches('#'))));
+                pos += n + 1;
+            }
             render(
                 st,
                 &e.word,
@@ -1280,9 +1336,10 @@ unsafe fn update_detail(st: &State) {
                 &core::mark_ranges(&e.word, &st.marks.0),
                 &meta_marks,
                 &core::mark_ranges(&body, &st.marks.1),
+                &meta_links,
             );
         }
-        n => render(st, &format!("{n} 件を選択中"), "", "Delete キーまたは「削除」でまとめて削除できます。", "", &[], &[], &[], &[], &[]),
+        n => render(st, &format!("{n} 件を選択中"), "", "Delete キーまたは「削除」でまとめて削除できます。", "", &[], &[], &[], &[], &[], &[]),
     }
     let marked = sel.len() == 1 && st.bm_map.contains_key(&(st.entries[sel[0]].dict, st.entries[sel[0]].id));
     set_text(st.btn_bm, if marked { "★ しおり" } else { "☆ しおり" });
@@ -1304,6 +1361,10 @@ unsafe fn update_detail(st: &State) {
 unsafe fn open_link(hwnd: HWND, st: &mut State, link: &str) {
     let link = link.trim().trim_matches('"').to_string();
     if link.is_empty() {
+        return;
+    }
+    if let Some(tag) = link.strip_prefix(TAG_SCHEME) {
+        search_tag(st, tag);
         return;
     }
     match core::link_kind(&link) {
@@ -1375,6 +1436,129 @@ unsafe fn jump_to_word(st: &mut State, word: &str) {
             notice(st, &format!("「{word}」へ移動しました(Alt+← で戻る)"));
         }
         None => notice(st, &format!("「{word}」は登録されていません(Ctrl+N で登録できます。Alt+← で戻る)")),
+    }
+}
+
+/// タグ `tag` が付いた語だけを表示する(本文のタグをクリックしたとき)。Alt+← で、前の表示に戻れる
+unsafe fn search_tag(st: &mut State, tag: &str) {
+    let from = current_view(st);
+    st.back.push(from);
+    if st.back.len() > BACK_MAX {
+        st.back.remove(0);
+    }
+    if st.bm_view {
+        set_bm_view(st, false);
+    }
+    for h in [st.qw, st.qm, st.qt] {
+        set_text(h, "");
+    }
+    set_text(st.edit, &core::tag_query(tag));
+    refresh(st);
+    notice(st, &format!("タグ「{tag}」の語を表示しました(Alt+← で戻る)"));
+}
+
+/// タグ欄に `"名前"`(タグの完全一致)の形で書かれている名前
+fn quoted_tags(field: &str) -> Vec<String> {
+    field
+        .split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | '、'))
+        .filter_map(|t| {
+            let t = t.trim_start_matches(['#', '＃']);
+            let inner = t.strip_prefix(['"', '＂'])?.strip_suffix(['"', '＂'])?;
+            (!inner.is_empty()).then(|| inner.to_string())
+        })
+        .collect()
+}
+
+/// タグの一覧を開く(絞り込みのタグ欄の横の「一覧…」)。
+/// チェックを入れて OK を押すと、そのタグのすべてが付いた語に絞り込む。名前の変更・削除もここから行う
+unsafe fn do_tags(hwnd: HWND, st: &mut State) {
+    if !st.loaded {
+        notice(st, "データベースの読み込みが完了していません");
+        return;
+    }
+    // 検索する辞書に入っている語のタグ
+    let mask = st.dict_mask.clone();
+    let tags = core::tag_counts(st.entries.iter().filter(|e| mask.get(e.dict).copied().unwrap_or(true)));
+    // タグ欄に、すでに "名前" の形で入っているタグには、チェックを入れておく(書き方の違いは区別しない)
+    let current: Vec<String> = quoted_tags(&get_text(st.qt)).iter().map(|t| core::fold(t)).collect();
+    let checked: Vec<String> = tags.iter().filter(|(t, _)| current.contains(&core::fold(t))).map(|(t, _)| t.clone()).collect();
+    let mut dlg = TagsDlg {
+        title: "タグの一覧".into(),
+        note: "チェックを入れたタグの、すべてが付いた語に絞り込みます。\n名前の変更と削除は、タグを選んで(青く表示して)から押します。".into(),
+        tags,
+        checked,
+        manage: true,
+        action: None,
+        ok: false,
+    };
+    if dialogs::tags_dialog(hwnd, &mut dlg) {
+        // 書き方だけが違うタグ(IT と it)は、検索では同じなので、1つにまとめて入れる
+        let mut seen: Vec<String> = Vec::new();
+        let mut out: Vec<String> = Vec::new();
+        for t in &dlg.checked {
+            let k = core::fold(t);
+            if !seen.contains(&k) {
+                seen.push(k);
+                out.push(format!("\"{t}\""));
+            }
+        }
+        set_text(st.qt, &out.join(" "));
+        refresh(st);
+        let _ = SetFocus(st.qt);
+    } else if let Some(action) = dlg.action.take() {
+        do_retag(hwnd, st, action);
+    }
+}
+
+/// タグの名前の変更・削除を、書き込める辞書のすべての語に行う(検索する辞書に入っているものだけ)。
+/// 直後なら「元に戻す」で取り消せる
+unsafe fn do_retag(hwnd: HWND, st: &mut State, action: TagAction) {
+    // (変える前のタグ, 変えた後のタグ, 「元に戻す」に出す名前)
+    let (from, to, label) = match &action {
+        TagAction::Rename { from, to } => (from.clone(), Some(to.clone()), "タグの名前の変更"),
+        TagAction::Delete { tag } => (tag.clone(), None, "タグの削除"),
+    };
+    let has_tag = |e: &Entry| e.tags.split(' ').any(|t| t == from);
+    let mut parts: Vec<(PathBuf, Undo)> = Vec::new();
+    let (mut changed, mut readonly) = (0usize, 0usize);
+    for d in 0..st.dicts.len() {
+        if !st.dict_mask.get(d).copied().unwrap_or(true) {
+            continue;
+        }
+        if writable(&st.dicts[d]).is_err() {
+            // 参照のみの辞書の語は変えない(件数だけ知らせる)
+            readonly += st.entries.iter().filter(|e| e.dict == d && has_tag(e)).count();
+            continue;
+        }
+        let (r, _) = guarded(st, d, |c| undo::retag(c, &from, to.as_deref()));
+        match r {
+            Ok(list) => {
+                changed += list.len();
+                if !list.is_empty() {
+                    parts.push((st.dicts[d].path.clone(), Undo { updated: list, ..Default::default() }));
+                }
+            }
+            Err(e) => {
+                report_write_error(hwnd, st, d, e);
+                break;
+            }
+        }
+    }
+    if changed > 0 {
+        set_undo(hwnd, st, Some(UndoOp { label: label.to_string(), parts, bookmarks: Vec::new() }));
+        st.warns.push(match &to {
+            Some(to) => format!("タグ「{}」を「{}」に変更しました({changed} 語)", short(&from), short(to)),
+            None => format!("タグ「{}」を {changed} 語から外しました", short(&from)),
+        });
+    } else {
+        st.warns.push("変更した語はありません".to_string());
+    }
+    // 内容を読み直す(結果の案内は、読み終わったときに下段へ出す)
+    remember_selection(st);
+    start_load(hwnd, st, true);
+    if readonly > 0 {
+        let text = format!("参照のみの辞書の {readonly} 語は、変えていません。");
+        message_box(hwnd, &text, "タグの変更", MB_OK | MB_ICONINFORMATION);
     }
 }
 
@@ -1954,6 +2138,7 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
         targets: targets.clone(),
         orig_word: String::new(),
         open_existing: None,
+        all_tags: core::tag_counts(st.entries.iter()),
         ok: false,
     };
     if !dialogs::entry_dialog(hwnd, &mut dlg) {
@@ -2015,6 +2200,7 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
         targets: vec![e.dict],
         orig_word: e.word.clone(),
         open_existing: None,
+        all_tags: core::tag_counts(st.entries.iter()),
         ok: false,
     };
     if !dialogs::entry_dialog(hwnd, &mut dlg) {
@@ -2330,6 +2516,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let mut corrupt: Vec<usize> = Vec::new();
                 for (i, ld) in loaded.dicts.into_iter().enumerate() {
                     if let Some(d) = st.dicts.get_mut(i) {
+                        // 自分より新しい版のアプリが書き込んだ辞書は、起動中に1回だけ知らせる(全員が同じ版を使うため)
+                        if ld.version > core::app_version_num() && st.warned_version.insert(d.path.clone()) {
+                            st.warns.push(format!(
+                                "辞書「{}」は、新しい版({})のアプリでも使われています。アプリを更新してください",
+                                d.name,
+                                core::version_label(ld.version)
+                            ));
+                        }
                         d.error = ld.error;
                         d.stamp = ld.stamp;
                         if ld.corrupt && !d.readonly {
@@ -2399,6 +2593,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 (ID_SETTINGS, BN_CLICKED_) => do_settings(hwnd, st),
                 (ID_BM, BN_CLICKED_) => toggle_bookmark(st),
                 (ID_BACK, BN_CLICKED_) => go_back(hwnd, st),
+                (ID_TAGS, BN_CLICKED_) => do_tags(hwnd, st),
                 (ID_SORT, BN_CLICKED_) => sort_menu(hwnd, st),
                 (ID_BMVIEW, BN_CLICKED_) => {
                     let on = !st.bm_view;
