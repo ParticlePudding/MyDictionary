@@ -3,6 +3,7 @@
 use crate::config::{self, Config, DictConf, Hotkey};
 use crate::{core, import, json_io, license, safe};
 use crate::ui::{self, *};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::Once;
@@ -213,6 +214,16 @@ pub struct EntryDlg {
     pub choices: Vec<String>,
     pub choice: usize,
     pub show_choice: bool,
+    /// 同じ見出し語の語を調べるための索引: そろえた見出し語(`core::fold`)→ (辞書の添字, id)。編集中の語自身は含めない
+    pub same_words: HashMap<String, Vec<(usize, i64)>>,
+    /// 辞書の名前(`same_words` の辞書の添字で引く)
+    pub dict_names: Vec<String>,
+    /// 登録先の候補(`choices` と同じ並び)の、辞書の添字。編集のときは、その語の辞書1つ
+    pub targets: Vec<usize>,
+    /// 編集前の見出し語(新規なら空)。見出し語を変えていないときは、保存時の確認を出さない
+    pub orig_word: String,
+    /// 「その語を表示」が押された: 表示する語 (辞書の添字, id)。このとき `ok` は false
+    pub open_existing: Option<(usize, i64)>,
     pub ok: bool,
 }
 
@@ -224,6 +235,8 @@ const E_ERR: usize = 305;
 const E_HINT: usize = 306;
 const E_LINK: usize = 307;
 const E_READING: usize = 308;
+const E_DUP: usize = 309; // 同じ見出し語があるときの知らせ
+const E_DUPLINK: usize = 310; // 「その語を表示」
 
 struct EntryCtl {
     data: *mut EntryDlg,
@@ -236,12 +249,17 @@ struct EntryCtl {
     link: HWND,
     combo: HWND,
     err: HWND,
+    dup: HWND,
+    dup_link: HWND,
     fields: Vec<(RECT, HWND)>,
 }
 
+/// 見出し語の欄の下に出す、重複の知らせの行の高さ
+const DUP_H: i32 = 18;
+
 fn entry_height(show_choice: bool) -> i32 {
-    // 20 + [見出し語] + [タグ] + [辞書] + [意味] + エラー + ボタン
-    20 + 66 + 66 + 66 + (22 + 150 + 12) + (22 + 76 + 12) + if show_choice { 62 } else { 0 } + 24 + 36 + 20
+    // 20 + [見出し語 + 重複の知らせ] + [読み] + [タグ] + [意味] + [参照先] + [辞書] + エラー + ボタン
+    20 + 66 + DUP_H + 66 + 66 + (22 + 150 + 12) + (22 + 76 + 12) + if show_choice { 62 } else { 0 } + 24 + 36 + 20
 }
 
 /// 登録・編集ダイアログを表示する。保存されたら true(結果は `data` に入る)
@@ -269,7 +287,48 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
 
             label(hwnd, "見出し語", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
             let word = ui::field(hwnd, E_WORD, (s(m), s(y + 22), s(fw), s(CTL_H)), dpi, false, &mut fields, fonts.base);
-            y += 66;
+            // 同じ見出し語の語があるときの知らせと、その語へ移るリンク(欄のすぐ下。無いときは空)
+            let hinst = GetModuleHandleW(None).unwrap();
+            let dup = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                PCWSTR::null(),
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 0x4000 /* SS_ENDELLIPSIS */ | 0x80 /* SS_NOPREFIX */),
+                s(m),
+                s(y + 22 + CTL_H + 4),
+                s(fw - 124),
+                s(DUP_H),
+                hwnd,
+                HMENU(E_DUP as *mut c_void),
+                hinst,
+                None,
+            )
+            .unwrap();
+            send(dup, WM_SETFONT, fonts.small.0 as usize, 1);
+            let link_t = wide("<a>その語を表示</a>");
+            let dup_link = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("SysLink"),
+                PCWSTR(link_t.as_ptr()),
+                WINDOW_STYLE(WS_CHILD.0 | WS_TABSTOP.0),
+                s(m + fw - 120),
+                s(y + 22 + CTL_H + 4),
+                s(120),
+                s(DUP_H),
+                hwnd,
+                HMENU(E_DUPLINK as *mut c_void),
+                hinst,
+                None,
+            )
+            .unwrap_or_default();
+            send(dup_link, WM_SETFONT, fonts.small.0 as usize, 1);
+            // 文字の幅に合わせて、欄の右端にそろえる
+            let mut ideal = SIZE::default();
+            send(dup_link, LM_GETIDEALSIZE, s(120) as usize, &mut ideal as *mut _ as isize);
+            if ideal.cx > 0 && ideal.cx <= s(120) {
+                let _ = MoveWindow(dup_link, s(m + fw) - ideal.cx, s(y + 22 + CTL_H + 4), ideal.cx, s(DUP_H), false);
+            }
+            y += 66 + DUP_H;
             label(hwnd, "読み(任意。ひらがな・カタカナなど。読みでも検索でき、見出し語順の並びにも使われます)", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
             let reading = ui::field(hwnd, E_READING, (s(m), s(y + 22), s(fw), s(CTL_H)), dpi, false, &mut fields, fonts.base);
             y += 66;
@@ -325,8 +384,9 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             set_text(meaning, &d.meaning.replace("\r\n", "\n").replace('\n', "\r\n"));
             let _ = SetWindowTextW(hwnd, PCWSTR(wide(&d.title).as_ptr()));
 
-            let c = Box::new(EntryCtl { data, fonts, dpi, word, reading, tags, meaning, link, combo, err, fields });
+            let c = Box::new(EntryCtl { data, fonts, dpi, word, reading, tags, meaning, link, combo, err, dup, dup_link, fields });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(c) as isize);
+            update_dup(&*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const EntryCtl));
             let _ = SetFocus(word);
             send(word, EM_SETSEL, 0, -1);
             LRESULT(0)
@@ -343,8 +403,17 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
             let hdc = HDC(wparam.0 as *mut c_void);
             let is_err = !ctl.is_null() && HWND(lparam.0 as *mut c_void) == (*ctl).err;
-            let is_hint = GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) == E_HINT as i32;
-            let color = if is_err { DANGER } else if is_hint || msg == WM_CTLCOLORSTATIC { MUTED } else { TEXT };
+            let id = GetDlgCtrlID(HWND(lparam.0 as *mut c_void)) as usize;
+            let is_hint = id == E_HINT;
+            let color = if is_err {
+                DANGER
+            } else if id == E_DUP {
+                WARN
+            } else if is_hint || msg == WM_CTLCOLORSTATIC {
+                MUTED
+            } else {
+                TEXT
+            };
             let color = if msg == WM_CTLCOLOREDIT { TEXT } else { color };
             ui::ctl_color(hdc, color, WHITE, white_brush())
         }
@@ -370,6 +439,9 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 (E_WORD | E_TAGS | E_MEANING, EN_CHANGE_) => {
                     if !ui::is_busy() {
                         set_text(c.err, "");
+                        if id == E_WORD {
+                            update_dup(c);
+                        }
                     }
                 }
                 (ID_OK, _) => {
@@ -382,6 +454,8 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                     } else if meaning.is_empty() {
                         set_text(c.err, "意味を入力してください");
                         let _ = SetFocus(c.meaning);
+                    } else if !confirm_same_word(hwnd, c, &word) {
+                        let _ = SetFocus(c.word);
                     } else {
                         d.word = word;
                         d.reading = get_text(c.reading).trim().to_string();
@@ -405,6 +479,28 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             }
             LRESULT(0)
         }
+        WM_NOTIFY => {
+            // 「その語を表示」: 登録をやめて、すでにある語を表示する
+            let hdr = &*(lparam.0 as *const NMHDR);
+            if !ctl.is_null() && hdr.idFrom == E_DUPLINK && (hdr.code == NM_CLICK || hdr.code == NM_RETURN) {
+                let c = &mut *ctl;
+                let key = core::fold(get_text(c.word).trim());
+                let target = current_target(c);
+                let d = &mut *c.data;
+                // 登録先の辞書にあればその語を、無ければ最初に見つかった語を表示する
+                let pick = d.same_words.get(&key).and_then(|h| h.iter().find(|x| Some(x.0) == target).or(h.first())).copied();
+                if pick.is_some() {
+                    let discard = !entry_modified(c)
+                        || msg_box(hwnd, "入力した内容は保存されません。\nすでにある語を表示しますか?", "確認", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+                    if discard {
+                        d.open_existing = pick;
+                        d.ok = false;
+                        let _ = DestroyWindow(hwnd);
+                    }
+                }
+            }
+            LRESULT(0)
+        }
         WM_NEXTDLGCTL => {
             ui::next_dlg_ctl(hwnd, wparam, lparam);
             LRESULT(0)
@@ -423,6 +519,87 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// 同じ見出し語の語がある辞書と件数を、知らせの文にする
+fn dup_text(hits: &[(usize, i64)], names: &[String]) -> String {
+    let mut per: Vec<(usize, usize)> = Vec::new(); // (辞書の添字, 件数)。見つかった順
+    for (d, _) in hits {
+        match per.iter_mut().find(|p| p.0 == *d) {
+            Some(p) => p.1 += 1,
+            None => per.push((*d, 1)),
+        }
+    }
+    let name = |d: usize| names.get(d).map(String::as_str).unwrap_or("?");
+    if names.len() <= 1 {
+        format!("同じ見出し語の語が、すでに {} 件あります。", hits.len())
+    } else if per.len() == 1 {
+        format!("同じ見出し語の語が、辞書「{}」に {} 件あります。", name(per[0].0), per[0].1)
+    } else {
+        let parts: Vec<String> = per.iter().map(|(d, n)| format!("「{}」に {} 件", name(*d), n)).collect();
+        format!("同じ見出し語の語が、辞書{}あります。", parts.join("、"))
+    }
+}
+
+/// 見出し語の欄の内容に合わせて、重複の知らせを出す / 消す
+unsafe fn update_dup(c: &EntryCtl) {
+    let d = &*c.data;
+    let key = core::fold(get_text(c.word).trim());
+    match d.same_words.get(&key).filter(|h| !key.is_empty() && !h.is_empty()) {
+        Some(hits) => {
+            set_text(c.dup, &dup_text(hits, &d.dict_names));
+            let _ = ShowWindow(c.dup_link, SW_SHOW);
+        }
+        None => {
+            set_text(c.dup, "");
+            let _ = ShowWindow(c.dup_link, SW_HIDE);
+        }
+    }
+}
+
+/// いま選ばれている登録先の辞書(辞書の添字)
+unsafe fn current_target(c: &EntryCtl) -> Option<usize> {
+    let d = &*c.data;
+    let i = if d.show_choice {
+        let sel = send(c.combo, CB_GETCURSEL, 0, 0).0;
+        if sel >= 0 {
+            sel as usize
+        } else {
+            d.choice
+        }
+    } else {
+        d.choice
+    };
+    d.targets.get(i).copied()
+}
+
+/// 見出し語以外の欄が、開いたときから変わっているか
+unsafe fn entry_modified(c: &EntryCtl) -> bool {
+    let d = &*c.data;
+    let norm = |s: &str| s.replace("\r\n", "\n").trim().to_string();
+    norm(&get_text(c.reading)) != norm(&d.reading)
+        || core::normalize_tags(&get_text(c.tags)) != core::normalize_tags(&d.tags)
+        || norm(&get_text(c.meaning)) != norm(&d.meaning)
+        || norm(&get_text(c.link)) != norm(&d.link)
+}
+
+/// 保存の前に、登録先の辞書に同じ見出し語の語があれば確認する。保存してよければ true。
+/// 編集で見出し語を変えていないときは、たずねない(同音異義語を編集するたびに出ないように)
+unsafe fn confirm_same_word(hwnd: HWND, c: &EntryCtl, word: &str) -> bool {
+    let d = &*c.data;
+    let key = core::fold(word);
+    let target = current_target(c);
+    let n = d.same_words.get(&key).map_or(0, |h| h.iter().filter(|x| Some(x.0) == target).count());
+    let unchanged = !d.orig_word.is_empty() && core::fold(d.orig_word.trim()) == key;
+    if n == 0 || unchanged {
+        return true;
+    }
+    let place = match target.and_then(|t| d.dict_names.get(t)) {
+        Some(name) if d.dict_names.len() > 1 => format!("辞書「{name}」に"),
+        _ => String::new(),
+    };
+    let text = format!("同じ見出し語「{word}」の語が、{place}すでに {n} 件あります。\n\n別の語として保存しますか?");
+    msg_box(hwnd, &text, "同じ見出し語があります", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES
 }
 
 // ============================================================================

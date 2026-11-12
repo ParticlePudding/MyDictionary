@@ -229,7 +229,7 @@ pub fn open_ro(path: &Path) -> rusqlite::Result<Connection> {
 }
 
 /// 全件を読み込む。並べ替えは呼び出し側(sort_entries)で行う。
-/// 件数が多いときは、検索用の小文字化を複数スレッドで行う。
+/// 件数が多いときは、検索用に文字をそろえる処理を複数スレッドで行う。
 pub fn load_all(conn: &Connection) -> rusqlite::Result<Vec<Entry>> {
     type Raw = (i64, String, String, String, i64, String, String);
     // 参照専用で開いた古い辞書には link / reading 列が無いことがある(その場合は空として読む)
@@ -530,6 +530,24 @@ pub fn normalize_tags(input: &str) -> String {
         }
     }
     out.join(" ")
+}
+
+/// 見出し語 `word` の語を一覧に出すための、検索欄の文字列。
+/// 見出し語をそのまま検索欄に入れると、記法として解釈されてしまう部分を避ける
+/// (`-` で始まる語は除外に、`OR` は記号になる)。完全一致の語は、呼び出し側で選ぶ。
+pub fn search_text_for(word: &str) -> String {
+    word.split_whitespace()
+        .map(|t| {
+            let t = t.trim_start_matches(['-', '－']);
+            if is_or_word(t) {
+                t.to_lowercase()
+            } else {
+                t.to_string()
+            }
+        })
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 条件に合うエントリの添字を返す(`fold` でそろえて比べる。部分一致)。
@@ -1158,6 +1176,14 @@ mod tests {
         assert_eq!(filter(&e, &q("-")).len(), 4);
         assert_eq!(filter(&e, &q("|")).len(), 4);
         assert_eq!(filter(&e, &q("-#")).len(), 4);
+        // 見出し語から検索欄の文字列を作る(記法として解釈されないようにする)
+        for w in ["-fno-rtti", "OR", "a OR b", "e-mail", "－全角", "x|y"] {
+            let v = vec![Entry::new(1, w.into(), "意味".into(), "".into(), 0), Entry::new(2, "ほかの語".into(), "意味".into(), "".into(), 0)];
+            let hits = filter(&v, &q(&search_text_for(w)));
+            assert!(hits.contains(&0), "{w} → {}", search_text_for(w));
+        }
+        assert_eq!(search_text_for("-fno-rtti"), "fno-rtti");
+        assert_eq!(search_text_for("a OR b"), "a or b");
         // 語の途中の - は、ただの文字
         let h = vec![Entry::new(1, "e-mail".into(), "電子メール".into(), "".into(), 0), Entry::new(2, "-fno-rtti".into(), "コンパイラの指定".into(), "".into(), 0)];
         assert_eq!(filter(&h, &q("e-mail")), vec![0]);

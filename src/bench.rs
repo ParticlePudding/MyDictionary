@@ -73,7 +73,7 @@ pub fn run(n: usize) -> String {
     line(format!("テストデータ作成: {:.0} ms / DBサイズ {:.1} MB", ms(t), size as f64 / 1_048_576.0));
     drop(data);
 
-    // 2) 起動時に相当する処理: DBを開く → 全件読み込み(検索用の小文字化込み) → 並べ替え
+    // 2) 起動時に相当する処理: DBを開く → 全件読み込み(検索用に文字をそろえる処理込み) → 並べ替え
     let t_all = Instant::now();
     let t = Instant::now();
     let conn = core::open(&path).expect("open");

@@ -22,6 +22,8 @@ pub const ACCENT_PRESSED: COLORREF = rgb(0, 80, 160);
 pub const ACCENT_SOFT: COLORREF = rgb(228, 240, 252);
 pub const DANGER: COLORREF = rgb(196, 43, 28);
 pub const DANGER_SOFT: COLORREF = rgb(253, 236, 234);
+/// 注意(エラーではない知らせ)
+pub const WARN: COLORREF = rgb(168, 92, 0);
 /// 検索語の強調表示
 pub const MARK: COLORREF = rgb(214, 32, 32);
 pub const HAIRLINE: COLORREF = rgb(236, 238, 241);
