@@ -48,6 +48,9 @@ const ID_OPENLINK: usize = 119;
 const ID_SORT: usize = 121; // 並び順
 const ID_BMVIEW: usize = 122; // しおりだけ表示
 const ID_BM: usize = 123; // しおりを付ける/外す
+const ID_BACK: usize = 124; // リンクで移動する前の状態に戻る(Alt+←、マウスの戻るボタン)
+/// 戻れる回数の上限
+const BACK_MAX: usize = 50;
 const HOTKEY_ID: i32 = 1;
 const WM_APP_LOADED: u32 = WM_APP + 1;
 const WM_APP_TRAY: u32 = WM_APP + 2;
@@ -104,6 +107,17 @@ struct Loaded {
     gen: u32,
     entries: Vec<Entry>,
     dicts: Vec<LoadedDict>,
+}
+
+/// 検索の状態と、選んでいた語。リンクで別の語へ移動する前に控えておき、Alt+← で戻る
+struct View {
+    all: String,
+    qw: String,
+    qm: String,
+    qt: String,
+    advanced: bool,
+    bm_view: bool,
+    selected: Option<(usize, i64)>,
 }
 
 struct InitData {
@@ -171,6 +185,8 @@ struct State {
 
     /// マウスが乗っているリンクの開く先(左下に表示する)
     hover_link: Option<String>,
+    /// リンクで移動する前の状態(新しいものが後ろ)。起動中だけ持ち、保存はしない
+    back: Vec<View>,
 
     /// しおり(各自の設定フォルダに保存)
     bookmarks: Bookmarks,
@@ -308,6 +324,13 @@ pub fn run() {
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            // Alt+← / マウスの戻るボタン: リンクで移動する前の状態に戻る
+            let back_key = msg.message == WM_SYSKEYDOWN && msg.wParam.0 == VK_LEFT.0 as usize;
+            let back_button = msg.message == WM_XBUTTONUP && (msg.wParam.0 >> 16) & 0xFFFF == 1 /* XBUTTON1 */;
+            if (back_key || back_button) && GetActiveWindow() == hwnd {
+                let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_BACK | BN_CLICKED_ << 16), LPARAM(0));
+                continue;
+            }
             if msg.message == WM_KEYDOWN && GetActiveWindow() == hwnd {
                 let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
                 let vk = msg.wParam.0 as u16;
@@ -444,6 +467,7 @@ unsafe fn start_load(hwnd: HWND, st: &mut State, keep: bool) {
             .map(|d| Dict { name: d.name.clone(), path: d.path.clone(), readonly: d.readonly, error: None, stamp: None })
             .collect();
         st.dict_mask = vec![true; st.dicts.len()];
+        st.back.clear(); // 辞書の添字が変わるので、戻る先は持ち越さない
         update_dict_button(st);
         rebuild_bm_map(st);
         send(st.list, LVM_SETITEMCOUNT, 0, 0);
@@ -671,6 +695,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         pending_select: None,
         asked_restore: HashSet::new(),
         hover_link: None,
+        back: Vec::new(),
         bookmarks: if init_shared { Bookmarks::default() } else { Bookmarks::load(&bm_path) },
         bm_path,
         bm_map: HashMap::new(),
@@ -1281,15 +1306,35 @@ unsafe fn open_link(hwnd: HWND, st: &mut State, link: &str) {
     }
 }
 
-/// リンクから別の語へ移動する。検索欄をその語にして、完全一致する語を選ぶ
+/// いまの検索の状態と、選んでいる語
+unsafe fn current_view(st: &State) -> View {
+    let sel = selected_entries(st);
+    View {
+        all: get_text(st.edit),
+        qw: get_text(st.qw),
+        qm: get_text(st.qm),
+        qt: get_text(st.qt),
+        advanced: st.advanced,
+        bm_view: st.bm_view,
+        selected: if sel.len() == 1 { Some((st.entries[sel[0]].dict, st.entries[sel[0]].id)) } else { None },
+    }
+}
+
+/// リンクから別の語へ移動する。検索欄をその語にして、完全一致する語を選ぶ。
+/// 移動する前の状態は控えておき、Alt+← で戻れるようにする
 unsafe fn jump_to_word(st: &mut State, word: &str) {
+    let from = current_view(st);
+    st.back.push(from);
+    if st.back.len() > BACK_MAX {
+        st.back.remove(0);
+    }
     if st.bm_view {
         set_bm_view(st, false);
     }
     for h in [st.qw, st.qm, st.qt] {
         set_text(h, "");
     }
-    set_text(st.edit, word);
+    set_text(st.edit, &core::search_text_for(word));
     refresh(st);
     // 検索と同じ規則でそろえて、見出し語が一致する語を選ぶ
     let key = core::fold(word.trim());
@@ -1298,10 +1343,70 @@ unsafe fn jump_to_word(st: &mut State, word: &str) {
         Some(r) => {
             select_row(st, Some(r));
             update_detail(st);
-            notice(st, &format!("「{word}」へ移動しました"));
+            notice(st, &format!("「{word}」へ移動しました(Alt+← で戻る)"));
         }
-        None => notice(st, &format!("「{word}」は登録されていません(Ctrl+N で登録できます)")),
+        None => notice(st, &format!("「{word}」は登録されていません(Ctrl+N で登録できます。Alt+← で戻る)")),
     }
+}
+
+/// リンクで移動する前の状態(検索欄・絞り込み・しおり表示・選んでいた語)に戻る
+unsafe fn go_back(hwnd: HWND, st: &mut State) {
+    let Some(v) = st.back.pop() else {
+        notice(st, "戻る先がありません");
+        return;
+    };
+    if !st.loaded {
+        return;
+    }
+    st.hover_link = None;
+    if st.bm_view != v.bm_view {
+        set_bm_view(st, v.bm_view);
+    }
+    if st.advanced != v.advanced {
+        st.advanced = v.advanced;
+        layout(hwnd, st);
+        let _ = InvalidateRect(st.adv, None, false);
+    }
+    for (h, t) in [(st.edit, &v.all), (st.qw, &v.qw), (st.qm, &v.qm), (st.qt, &v.qt)] {
+        set_text(h, t);
+    }
+    refresh(st);
+    if let Some((d, id)) = v.selected {
+        select_entry(st, d, id);
+    }
+    notice(st, "リンクで移動する前の表示に戻りました");
+}
+
+/// 指定の語を表示する(検索欄をその見出し語にして、その語を選ぶ)
+unsafe fn show_entry(st: &mut State, dict: usize, id: i64) {
+    let Some(word) = st.entries.iter().find(|e| e.dict == dict && e.id == id).map(|e| e.word.clone()) else { return };
+    if st.bm_view {
+        set_bm_view(st, false);
+    }
+    // 検索する辞書から外していた場合は、含める
+    if let Some(m) = st.dict_mask.get_mut(dict) {
+        if !*m {
+            *m = true;
+            update_dict_button(st);
+        }
+    }
+    for h in [st.qw, st.qm, st.qt] {
+        set_text(h, "");
+    }
+    set_text(st.edit, &core::search_text_for(&word));
+    refresh(st);
+    select_entry(st, dict, id);
+}
+
+/// 同じ見出し語の語を調べるための索引: そろえた見出し語 → (辞書の添字, id)。`skip` の語(編集中の語)は含めない
+fn same_word_index(st: &State, skip: Option<(usize, i64)>) -> HashMap<String, Vec<(usize, i64)>> {
+    let mut map: HashMap<String, Vec<(usize, i64)>> = HashMap::with_capacity(st.entries.len());
+    for e in &st.entries {
+        if skip != Some((e.dict, e.id)) {
+            map.entry(e.word_norm().to_string()).or_default().push((e.dict, e.id));
+        }
+    }
+    map
 }
 
 // ---- しおり・並び順 ---------------------------------------------------------
@@ -1719,9 +1824,18 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
         choices: targets.iter().map(|&i| st.dicts[i].name.clone()).collect(),
         choice,
         show_choice: targets.len() > 1,
+        same_words: same_word_index(st, None),
+        dict_names: st.dicts.iter().map(|d| d.name.clone()).collect(),
+        targets: targets.clone(),
+        orig_word: String::new(),
+        open_existing: None,
         ok: false,
     };
     if !dialogs::entry_dialog(hwnd, &mut dlg) {
+        // 「その語を表示」: 登録をやめて、すでにある語を表示する
+        if let Some((d, id)) = dlg.open_existing {
+            show_entry(st, d, id);
+        }
         return;
     }
     let d = targets[dlg.choice];
@@ -1765,9 +1879,17 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
         choices: Vec::new(),
         choice: 0,
         show_choice: false,
+        same_words: same_word_index(st, Some((e.dict, e.id))),
+        dict_names: st.dicts.iter().map(|d| d.name.clone()).collect(),
+        targets: vec![e.dict],
+        orig_word: e.word.clone(),
+        open_existing: None,
         ok: false,
     };
     if !dialogs::entry_dialog(hwnd, &mut dlg) {
+        if let Some((d, id)) = dlg.open_existing {
+            show_entry(st, d, id);
+        }
         return;
     }
     // 読み込んだ時点の更新時刻と一致するときだけ更新する(他の人の変更を上書きしない)
@@ -2124,6 +2246,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 (ID_DEL, BN_CLICKED_) => do_delete(hwnd, st),
                 (ID_SETTINGS, BN_CLICKED_) => do_settings(hwnd, st),
                 (ID_BM, BN_CLICKED_) => toggle_bookmark(st),
+                (ID_BACK, BN_CLICKED_) => go_back(hwnd, st),
                 (ID_SORT, BN_CLICKED_) => sort_menu(hwnd, st),
                 (ID_BMVIEW, BN_CLICKED_) => {
                     let on = !st.bm_view;
