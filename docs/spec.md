@@ -29,7 +29,7 @@
 | 保存 | SQLite(`rusqlite` 0.32、`bundled` で静的リンク) |
 | 配布 | 実行ファイル1つ(`MyDictionary.exe`、約1.7MB)。依存は Windows 標準の DLL のみ |
 | ライセンス | MIT |
-| 版 | 2.01(Cargo のパッケージは `mydictionary` 2.0.1) |
+| 版 | 2.02(Cargo のパッケージは `mydictionary` 2.0.2) |
 
 ### 設計の方針
 - **起動を待たせない**: ウィンドウを先に出し、辞書の読み込みは別スレッドで行う。
@@ -49,6 +49,8 @@ app.rc            リソース定義: アイコン、マニフェスト、バー
 assets/app.ico    アイコン(256 / 64 / 48 / 32 / 24 / 16)
 assets/app.png    アイコンの元画像(512 × 512)
 LICENSE           MIT ライセンス
+THIRD-PARTY-NOTICES.txt   使用しているオープンソースソフトウェアのライセンス(tools/third_party_notices.py で作る)
+tools/third_party_notices.py   THIRD-PARTY-NOTICES.txt を作り直すスクリプト
 .github/workflows/release.yml   タグの push で Windows 向けにビルドし、Release を作る
 src/
   main.rs         入口。起動時の指定(--bench)の振り分け
@@ -59,8 +61,9 @@ src/
   json_io.rs      JSON の書き出しと解析                                        ← 画面に依存しない
   bookmarks.rs    しおりの保存と付け外し                                        ← 画面に依存しない
   bench.rs        計測(--bench)                                              ← 画面に依存しない
+  license.rs      ライセンス表示の文面(LICENSE と THIRD-PARTY-NOTICES.txt を埋め込む) ← 画面に依存しない
   ui.rs           色・寸法・フォント、ボタンの描画、入力欄の枠、クリップボード   ← Windows のみ
-  dialogs.rs      モーダル画面(登録/編集、設定、辞書の選択)、取り込み・書き出し ← Windows のみ
+  dialogs.rs      モーダル画面(登録/編集、設定、辞書の選択、ライセンス情報)、取り込み・書き出し ← Windows のみ
   gui.rs          メイン画面、メッセージ処理、各操作                            ← Windows のみ
 sample/
   sample.tsv      サンプル(300語)。アプリの「取り込む…」で取り込める
@@ -77,6 +80,16 @@ docs/             文書
 | `serde_json` | JSON の解析と、文字列のエスケープ |
 | `windows`(Windows のみ) | Win32 API |
 | `embed-resource`(ビルド時) | マニフェストの埋め込み |
+
+### ライセンス表示
+実行ファイルには、依存クレート(と、その依存)のうち実行時にリンクされるもの、Rust の標準ライブラリ、SQLite が含まれる。MIT などのライセンスの条件に従い、それらの著作権表示とライセンスの全文を次の2か所に置く。
+
+- リポジトリ直下の `THIRD-PARTY-NOTICES.txt`(Release にも `LICENSE` と一緒に添付する)
+- アプリの「設定」→ 左下の「ライセンス情報」。`src/license.rs` が `LICENSE` と `THIRD-PARTY-NOTICES.txt` を `include_str!` で埋め込み、読み取り専用の欄に表示する
+
+`THIRD-PARTY-NOTICES.txt` は `python tools/third_party_notices.py` で作る。`cargo tree --target x86_64-pc-windows-msvc -e normal,no-proc-macro` で exe に含まれるクレートを調べ、各クレートの MIT ライセンスの文面を、同じ文面ごとにまとめて書き出す(「MIT OR Apache-2.0」のように選べるものは MIT を選ぶ)。ビルド時だけに使うクレート(`embed-resource` など)と手続きマクロは exe に含まれないので載せない。
+
+依存を更新して Cargo.lock が変わったら、スクリプトで作り直す。作り直し忘れは、`license` の自動テスト(載せたクレートの版が Cargo.lock と合うか)で分かる。
 
 ---
 
@@ -498,6 +511,7 @@ cargo test
 | `safe` | 6 | 通常の書き込みとバックアップ、失敗時に何も変わらないこと、書き込み後の破損からのロールバック、破損した辞書の復元、世代の整理 |
 | `import` | 4 | CSV(引用、見出し行)、TSV、文字コードと区切りの判定、重複の読み飛ばし |
 | `json_io` | 3 | 書き出しと取り込みの往復、ゆるい入力、更新日時の保持 |
+| `license` | 5 | ライセンス表示の全文、主な依存が載っていること、載せた版が Cargo.lock と合うこと、各クレートのライセンス文面、改行の変換 |
 | `bookmarks` | 2 | 付け外し、保存と読み込み |
 
 ### 画面の確認
@@ -510,12 +524,12 @@ cargo test
    - `Cargo.toml` の `version`
    - `app.rc` の `FILEVERSION` / `PRODUCTVERSION` と、`FileVersion` / `ProductVersion`
    - `src/ui.rs` の `APP_VERSION`
-2. `docs/release-notes.md` を、その版の内容に書き換える。
+2. `docs/release-notes.md` を、その版の内容に書き換える。依存を更新したときは、`python tools/third_party_notices.py` で `THIRD-PARTY-NOTICES.txt` も作り直す。
 3. 既定のブランチに反映する。
 4. GitHub の Actions の画面で「release」→「Run workflow」を選び、`tag` に `v2.00` のようなタグ名を入れて実行する
    (`v2.00` のようなタグを push しても、同じ処理が動く)。
 
-GitHub Actions(`.github/workflows/release.yml`)が Windows 上でテストとビルドを行い、タグと Release を作って `MyDictionary.exe` を添付します。
+GitHub Actions(`.github/workflows/release.yml`)が Windows 上でテストとビルドを行い、タグと Release を作って `MyDictionary.exe`・`LICENSE`・`THIRD-PARTY-NOTICES.txt` を添付します。
 `tag` を空にして実行すると、Release は作らず、ビルドした exe を Artifacts に残すだけです(Windows でのビルド確認に使えます)。
 同じタグの Release を作り直したいときは、`replace` にチェックを入れて実行します(古い Release とタグを削除してから作成します)。
 

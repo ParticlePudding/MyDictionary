@@ -1,7 +1,7 @@
-//! モーダルダイアログ: 登録/編集、設定。
+//! モーダルダイアログ: 登録/編集、設定、ライセンス情報。
 
 use crate::config::{self, Config, DictConf, Hotkey};
-use crate::{core, import, json_io, safe};
+use crate::{core, import, json_io, license, safe};
 use crate::ui::{self, *};
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -42,6 +42,7 @@ unsafe fn register_classes() {
             (w!("MyDictionaryEntry"), entry_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT),
             (w!("MyDictionarySettings"), settings_proc),
             (w!("MyDictionarySelect"), select_proc),
+            (w!("MyDictionaryLicense"), license_proc),
         ] {
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -93,6 +94,11 @@ unsafe fn run_modal(owner: HWND, class: PCWSTR, title: &str, client_w: i32, clie
             let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_OK), LPARAM(0));
             continue;
         }
+        // Esc = 閉じる。複数行の欄は Esc を自分で受け取ってしまうため、読み取り専用の欄(ライセンス情報の本文)では補う
+        if msg.message == WM_KEYDOWN && msg.wParam.0 == VK_ESCAPE.0 as usize && is_readonly_multiline(msg.hwnd) {
+            let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_CANCEL), LPARAM(0));
+            continue;
+        }
         if ui::select_all_if_edit(&msg) {
             continue;
         }
@@ -103,6 +109,18 @@ unsafe fn run_modal(owner: HWND, class: PCWSTR, title: &str, client_w: i32, clie
     }
     let _ = EnableWindow(owner, true);
     let _ = SetForegroundWindow(owner);
+}
+
+/// 読み取り専用の複数行 EDIT か
+unsafe fn is_readonly_multiline(h: HWND) -> bool {
+    let mut cls = [0u16; 16];
+    let n = GetClassNameW(h, &mut cls) as usize;
+    if !String::from_utf16_lossy(&cls[..n]).eq_ignore_ascii_case("edit") {
+        return false;
+    }
+    let style = GetWindowLongW(h, GWL_STYLE) as u32;
+    let need = ES_MULTILINE as u32 | ES_READONLY as u32;
+    style & need == need
 }
 
 unsafe fn label(parent: HWND, text: &str, (x, y, w, h): (i32, i32, i32, i32), fnt: HFONT, id: usize) -> HWND {
@@ -439,6 +457,7 @@ const S_IMPORT: usize = 424;
 const S_EXPORT: usize = 425;
 const S_ERR: usize = 430;
 const S_MUTED: usize = 431;
+const S_LICENSE: usize = 432;
 
 struct SettingsCtl {
     data: *mut SettingsDlg,
@@ -706,8 +725,8 @@ label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(2
             // ここから下は、画面全体(全般・辞書の両方)の保存/キャンセル。区切り線で分ける
             let footer_line = s(y);
             y += 16;
-            // 左下に、アプリの名前と版
-            // 左下に、アプリの版と、いま使っている設定ファイルの場所(個人の設定か、共用の設定かが分かるように)
+            // 左下に、アプリの版と、いま使っている設定ファイルの場所(個人の設定か、共用の設定かが分かるように)。
+            // その下に、ライセンス情報を開くリンク
             let info = format!("{} {}  設定: {}", ui::APP_NAME, ui::APP_VERSION, d.cfg_path.display());
             let hinst2 = GetModuleHandleW(None).unwrap();
             let t = wide(&info);
@@ -717,9 +736,9 @@ label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(2
                 PCWSTR(t.as_ptr()),
                 WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | 0x8000 /* SS_PATHELLIPSIS */ | 0x80 /* SS_NOPREFIX */),
                 s(m),
-                s(y + 9),
+                s(y - 1),
                 s(fw - 2 * BTN_W - 30),
-                s(20),
+                s(18),
                 hwnd,
                 HMENU(S_MUTED as *mut c_void),
                 hinst2,
@@ -727,6 +746,23 @@ label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(2
             )
             .unwrap();
             send(info_h, WM_SETFONT, fonts.small.0 as usize, 1);
+            let link_t = wide("<a>ライセンス情報</a>");
+            if let Ok(link) = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("SysLink"),
+                PCWSTR(link_t.as_ptr()),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                s(m),
+                s(y + 18),
+                s(160),
+                s(20),
+                hwnd,
+                HMENU(S_LICENSE as *mut c_void),
+                hinst2,
+                None,
+            ) {
+                send(link, WM_SETFONT, fonts.small.0 as usize, 1);
+            }
             button(hwnd, "保存", ID_OK, (s(m + fw - 2 * BTN_W - 10), s(y), s(BTN_W), s(CTL_H)), true);
             button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
 
@@ -795,6 +831,10 @@ label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(2
         }
         WM_NOTIFY => {
             let hdr = &*(lparam.0 as *const NMHDR);
+            if hdr.idFrom == S_LICENSE && (hdr.code == NM_CLICK || hdr.code == NM_RETURN) {
+                license_dialog(hwnd);
+                return LRESULT(0);
+            }
             if !ctl.is_null() && hdr.idFrom == S_LIST && hdr.code == LVN_ITEMCHANGED && !ui::is_busy() {
                 let nm = &*(lparam.0 as *const NMLISTVIEW);
                 if nm.uNewState & LVIS_SELECTED.0 != 0 {
@@ -950,6 +990,142 @@ label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(2
             if !ctl.is_null() {
                 let c = Box::from_raw(ctl);
                 c.fonts.destroy();
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+// ============================================================================
+// ライセンス情報
+// ============================================================================
+
+const L_TEXT: usize = 601;
+const L_COPY: usize = 602;
+const LICENSE_W: i32 = 680;
+const LICENSE_H: i32 = 600;
+
+struct LicenseCtl {
+    fonts: Fonts,
+    mono: HFONT,
+    dpi: i32,
+    text: HWND,
+    note: HWND,
+    fields: Vec<(RECT, HWND)>,
+    footer_line: i32,
+}
+
+/// ライセンス情報の画面(このアプリのライセンスと、使用しているオープンソースソフトウェアのライセンス)
+pub unsafe fn license_dialog(owner: HWND) {
+    let title = format!("ライセンス情報 - {}", ui::APP_NAME);
+    run_modal(owner, w!("MyDictionaryLicense"), &title, LICENSE_W, LICENSE_H, std::ptr::null());
+}
+
+unsafe extern "system" fn license_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let ctl = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut LicenseCtl;
+    match msg {
+        WM_CREATE => {
+            let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+            let s = |v: i32| scale(v, dpi);
+            let fonts = Fonts::new(dpi);
+            // 区切り線(=====)や字下げをそろえるため、本文は等幅フォント
+            let mono = ui::font("Consolas", 9, dpi, false);
+            let (m, fw) = (24, LICENSE_W - 48);
+            let mut fields = Vec::new();
+            let mut y = 20;
+            label(hwnd, "ライセンス情報", (s(m), s(y), s(fw), s(24)), fonts.heading, 0);
+            y += 30;
+            label(
+                hwnd,
+                &format!("{} は MIT License で提供しています。また、以下のオープンソースソフトウェアを使用しています。", ui::APP_NAME),
+                (s(m), s(y), s(fw), s(40)),
+                fonts.small,
+                S_MUTED,
+            );
+            y += 46;
+            let footer_y = LICENSE_H - CTL_H - 16;
+            let text_h = footer_y - 16 - y;
+            let text = ui::field(hwnd, L_TEXT, (s(m), s(y), s(fw), s(text_h)), dpi, true, &mut fields, mono);
+            send(text, EM_SETREADONLY, 1, 0);
+            send(text, EM_SETLIMITTEXT, 0, 0);
+            let body = license::to_crlf(&license::full_text(ui::APP_NAME, ui::APP_VERSION));
+            set_text(text, &body);
+            send(text, EM_SETSEL, 0, 0);
+            let footer_line = s(footer_y - 16);
+            let note = label(hwnd, "", (s(m), s(footer_y + 9), s(fw - 2 * BTN_W - 30), s(20)), fonts.small, S_MUTED);
+            button(hwnd, "すべてコピー", L_COPY, (s(m + fw - 2 * BTN_W - 10), s(footer_y), s(BTN_W), s(CTL_H)), true);
+            button(hwnd, "閉じる", ID_CANCEL, (s(m + fw - BTN_W), s(footer_y), s(BTN_W), s(CTL_H)), true);
+            let c = Box::new(LicenseCtl { fonts, mono, dpi, text, note, fields, footer_line });
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(c) as isize);
+            let _ = SetFocus(text);
+            LRESULT(0)
+        }
+        WM_PAINT => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if !ctl.is_null() {
+                let c = &*ctl;
+                ui::paint_fields(hdc, &c.fields, c.dpi);
+                let mut rc = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rc);
+                ui::fill(hdc, &RECT { left: 0, top: c.footer_line, right: rc.right, bottom: c.footer_line + 1 }, BORDER);
+            }
+            let _ = EndPaint(hwnd, &ps);
+            LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
+            // 読み取り専用の EDIT も WM_CTLCOLORSTATIC で来る。背景は白のまま
+            let hdc = HDC(wparam.0 as *mut c_void);
+            let id = GetDlgCtrlID(HWND(lparam.0 as *mut c_void));
+            let color = if id as usize == S_MUTED { MUTED } else { TEXT };
+            ui::ctl_color(hdc, color, WHITE, white_brush())
+        }
+        WM_DRAWITEM => {
+            let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
+            if !ctl.is_null() {
+                let kind = if dis.CtlID as usize == ID_CANCEL { Btn::Primary } else { Btn::Secondary };
+                ui::draw_button(dis, kind, (*ctl).fonts.base, WHITE, (*ctl).dpi);
+            }
+            LRESULT(1)
+        }
+        WM_COMMAND => {
+            let id = wparam.0 & 0xFFFF;
+            let code = wparam.0 >> 16;
+            if ctl.is_null() {
+                return LRESULT(0);
+            }
+            let c = &*ctl;
+            match (id, code) {
+                (L_TEXT, EN_SETFOCUS_ | EN_KILLFOCUS_) => {
+                    ui::invalidate_field(hwnd, &c.fields, c.text);
+                }
+                (L_COPY, _) => {
+                    let ok = ui::set_clipboard(hwnd, &get_text(c.text));
+                    set_text(c.note, if ok { "クリップボードにコピーしました" } else { "コピーできませんでした" });
+                }
+                // Esc・閉じる・Ctrl+Enter(run_modal が ID_OK を送る)
+                (ID_CANCEL | ID_OK, _) => {
+                    let _ = DestroyWindow(hwnd);
+                }
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_NEXTDLGCTL => {
+            ui::next_dlg_ctl(hwnd, wparam, lparam);
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            if !ctl.is_null() {
+                let c = Box::from_raw(ctl);
+                c.fonts.destroy();
+                let _ = DeleteObject(c.mono);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             }
             LRESULT(0)

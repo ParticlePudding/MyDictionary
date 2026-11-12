@@ -61,3 +61,5 @@ docs/      取扱説明書・仕様書など
 ## ライセンス
 
 [MIT License](LICENSE)
+
+使用しているオープンソースソフトウェアと、そのライセンスは [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt) にまとめています。アプリでは「設定」→ 左下の「ライセンス情報」で確認できます。

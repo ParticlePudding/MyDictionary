@@ -257,7 +257,7 @@ pub fn run() {
         let init = load_config();
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
-            dwICC: ICC_LISTVIEW_CLASSES | ICC_HOTKEY_CLASS,
+            dwICC: ICC_LISTVIEW_CLASSES | ICC_HOTKEY_CLASS | ICC_LINK_CLASS,
         };
         let _ = InitCommonControlsEx(&icc);
 

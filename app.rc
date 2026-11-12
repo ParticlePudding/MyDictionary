@@ -3,8 +3,8 @@
 1 24 "app.manifest"
 
 1 VERSIONINFO
-FILEVERSION 2,0,1,0
-PRODUCTVERSION 2,0,1,0
+FILEVERSION 2,0,2,0
+PRODUCTVERSION 2,0,2,0
 FILEFLAGSMASK 0x3f
 FILEFLAGS 0x0
 FILEOS 0x40004
@@ -17,12 +17,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "ParticlePudding"
             VALUE "FileDescription", "MyDictionary"
-            VALUE "FileVersion", "2.01"
+            VALUE "FileVersion", "2.02"
             VALUE "InternalName", "MyDictionary"
             VALUE "LegalCopyright", "Copyright (C) 2026 ParticlePudding"
             VALUE "OriginalFilename", "MyDictionary.exe"
             VALUE "ProductName", "MyDictionary"
-            VALUE "ProductVersion", "2.01"
+            VALUE "ProductVersion", "2.02"
         END
     END
     BLOCK "VarFileInfo"

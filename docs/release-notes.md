@@ -7,6 +7,10 @@
 
 使い方は [取扱説明書](https://github.com/ParticlePudding/MyDictionary/blob/master/docs/manual.md) を参照してください。
 
+## 2.02 の内容
+- 設定の画面の左下に「ライセンス情報」を追加しました。このアプリのライセンス(MIT License)と、使用しているオープンソースソフトウェアのライセンスを確認できます。
+- 使用しているオープンソースソフトウェアのライセンスの一覧(`THIRD-PARTY-NOTICES.txt`)を、リポジトリと Release に置きました。
+
 ## 2.01 の内容
 - リンクの上にマウスを置くと、画面の左下に開く先を表示するようにしました(クリックする前に、どこへ飛ぶかを確かめられます)。
 
@@ -28,4 +32,4 @@
 - データは `%AppData%\MyDictionary\` に保存されます。
 
 ## ライセンス
-MIT License
+MIT License。使用しているオープンソースソフトウェアのライセンスは、下の **THIRD-PARTY-NOTICES.txt**、またはアプリの「設定」→「ライセンス情報」で確認できます。

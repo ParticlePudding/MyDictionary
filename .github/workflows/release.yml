@@ -1,4 +1,5 @@
-# Windows でテストとビルドを行い、GitHub の Release を作って MyDictionary.exe を添付する。
+# Windows でテストとビルドを行い、GitHub の Release を作って MyDictionary.exe を添付する
+# (ライセンスの LICENSE と THIRD-PARTY-NOTICES.txt も一緒に添付する)。
 #
 # 実行のしかた(どちらでもよい):
 #   1. Actions の画面で「release」→「Run workflow」を選び、tag に v2.00 のようなタグ名を入れる
@@ -41,7 +42,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: MyDictionary-windows-x64
-          path: target/release/MyDictionary.exe
+          path: |
+            target/release/MyDictionary.exe
+            LICENSE
+            THIRD-PARTY-NOTICES.txt
           if-no-files-found: error
 
       - name: Create release
@@ -58,7 +62,7 @@ jobs:
             sleep 5
           fi
           # タグが無ければ、このコミットに作られる
-          gh release create "$TAG" target/release/MyDictionary.exe \
+          gh release create "$TAG" target/release/MyDictionary.exe LICENSE THIRD-PARTY-NOTICES.txt \
             --target "$GITHUB_SHA" \
             --title "MyDictionary ${TAG#v}" \
             --notes-file docs/release-notes.md

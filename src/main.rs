@@ -10,6 +10,9 @@ mod dialogs;
 mod core;
 mod import;
 mod json_io;
+// ライセンス表示(画面は Windows のみ。文面のテストはどこでも動く)
+#[cfg_attr(not(windows), allow(dead_code))]
+mod license;
 mod safe;
 #[cfg(windows)]
 mod ui;

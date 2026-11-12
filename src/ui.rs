@@ -91,7 +91,7 @@ pub unsafe fn font(face: &str, pt: i32, dpi: i32, bold: bool) -> HFONT {
 
 /// アプリの名前と版(ウィンドウのタイトル、設定画面の表示に使う)
 pub const APP_NAME: &str = "MyDictionary";
-pub const APP_VERSION: &str = "2.01";
+pub const APP_VERSION: &str = "2.02";
 
 /// 実行ファイルに埋め込んだアイコン(リソース ID 1)。読み込めなければ Windows 標準のアイコン
 pub unsafe fn app_icon() -> HICON {
