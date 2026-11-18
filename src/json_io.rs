@@ -55,8 +55,13 @@ pub fn export(entries: &[Entry]) -> String {
     out
 }
 
+/// 文字列の値。数(`"word": 404`)も文字列として読む(型が違うだけで、黙って読み飛ばさないように)
 fn text_of(v: Option<&Value>) -> String {
-    v.and_then(Value::as_str).unwrap_or("").trim().to_string()
+    match v {
+        Some(Value::String(s)) => s.trim().to_string(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => String::new(),
+    }
 }
 
 /// 文字列、または文字列の配列を、指定の区切りでつないだ文字列にする
@@ -87,7 +92,7 @@ pub fn parse(text: &str) -> Result<(Vec<Row>, usize), String> {
             continue;
         };
         let word = text_of(o.get("word"));
-        let meaning = o.get("meaning").and_then(Value::as_str).unwrap_or("").replace("\r\n", "\n").trim().to_string();
+        let meaning = text_of(o.get("meaning")).replace("\r\n", "\n").trim().to_string();
         if word.is_empty() || meaning.is_empty() {
             skipped += 1;
             continue;

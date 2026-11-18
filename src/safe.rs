@@ -57,6 +57,27 @@ pub fn is_corrupt(e: &rusqlite::Error) -> bool {
     matches!(e, rusqlite::Error::SqliteFailure(f, _) if matches!(f.code, ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase))
 }
 
+/// 辞書を開けなかった理由を、利用者に分かる日本語にする(SQLite の英語のエラー文を、そのまま出さない)
+pub fn open_error_text(path: &Path, readonly: bool, e: &rusqlite::Error) -> String {
+    let code = match e {
+        rusqlite::Error::SqliteFailure(f, _) => Some(f.code),
+        _ => None,
+    };
+    let exists = path.exists();
+    let folder_ok = path.parent().map_or(true, |p| p.as_os_str().is_empty() || p.exists());
+    match code {
+        _ if !exists && readonly => "ファイルがありません(参照のみの辞書は、新しく作りません。パスを確かめてください)".into(),
+        _ if !exists && !folder_ok => "ファイルのあるフォルダが見つかりません(共有フォルダにつながっているか、パスが正しいかを確かめてください)".into(),
+        Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase) => "ファイルが壊れているか、辞書のファイルではありません".into(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => "ほかの人が書き込み中です。しばらくしてから、もう一度開いてください".into(),
+        Some(ErrorCode::PermissionDenied | ErrorCode::ReadOnly) => "ファイルを読み書きする権限がありません".into(),
+        Some(ErrorCode::CannotOpen) if !exists => "ファイルを作れません(フォルダに書き込めるかを確かめてください)".into(),
+        Some(ErrorCode::CannotOpen) => "ファイルを開けません(共有フォルダにつながっているか、ほかのアプリが使っていないかを確かめてください)".into(),
+        Some(ErrorCode::DiskFull) => "ディスクがいっぱいです".into(),
+        _ => format!("ファイルを開けません(詳細: {e})"),
+    }
+}
+
 fn classify(e: rusqlite::Error) -> WriteError {
     match &e {
         rusqlite::Error::QueryReturnedNoRows => WriteError::Conflict,

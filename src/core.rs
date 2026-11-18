@@ -185,6 +185,38 @@ pub struct Query {
 
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// 1つの語の欄ごとの文字数の上限(UTF-16 の単位で数える。画面の入力欄と同じ数え方)。
+/// これを超える語は、取り込まない・保存しない(極端に長い語を表示すると、画面が固まるため)
+pub const MAX_WORD: usize = 1_000;
+pub const MAX_READING: usize = 1_000;
+pub const MAX_TAGS: usize = 2_000;
+pub const MAX_LINK: usize = 20_000;
+pub const MAX_MEANING: usize = 100_000;
+
+/// 表示や保存に使わない制御文字を取り除く。取り除いたら true も返す。
+/// - 制御文字(タブと改行は残す)、DEL、C1 制御文字
+/// - 文字の向きを強制する文字(U+202A〜202E、U+2066〜2069)。リンクの開く先の表示を偽装できるため
+pub fn clean_text(s: &str) -> (String, bool) {
+    let bad = |c: char| {
+        let u = c as u32;
+        (u < 0x20 && c != '\t' && c != '\n' && c != '\r') || u == 0x7F || (0x80..=0x9F).contains(&u) || (0x202A..=0x202E).contains(&u) || (0x2066..=0x2069).contains(&u)
+    };
+    if s.chars().any(bad) {
+        (s.chars().filter(|&c| !bad(c)).collect(), true)
+    } else {
+        (s.to_string(), false)
+    }
+}
+
+/// 欄の文字数(UTF-16 の単位)が上限を超えていれば、その欄の名前と上限を返す
+pub fn too_long(word: &str, reading: &str, meaning: &str, tags: &str, link: &str) -> Option<(&'static str, usize)> {
+    let n = |s: &str| s.encode_utf16().count();
+    [("見出し語", n(word), MAX_WORD), ("読み", n(reading), MAX_READING), ("意味", n(meaning), MAX_MEANING), ("タグ", n(tags), MAX_TAGS), ("参照先", n(link), MAX_LINK)]
+        .into_iter()
+        .find(|x| x.1 > x.2)
+        .map(|x| (x.0, x.2))
+}
+
 pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -192,6 +224,8 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     // 共有フォルダで他の人が書き込み中でも、すぐ失敗せず少し待つ
     conn.busy_timeout(BUSY_TIMEOUT)?;
+    // 削除した語の文字が、ファイルの空き領域に残らないようにする(上書きして消す)
+    conn.pragma_update(None, "secure_delete", "ON")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS words (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -665,13 +699,15 @@ pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Ve
         };
     }
 
-    // 順位付けの基準: 見出し語欄があればその先頭の節、なければ全体検索の先頭の節(除外の節は使わない)
-    let first: Option<&Clause> = p.word.iter().find(|c| !c.neg).or_else(|| p.all.iter().find(|c| !c.neg));
+    // 順位付けの基準: 見出し語欄があればその節、なければ全体検索の節(除外の節は使わない)。
+    // 先頭の節で大きく順位を決め、2つ目以降の節は、同じ順位の中での並びに使う
+    // (「アムロジピン 5mg」では、見出し語に「5mg」も含む語を先にする)
+    let rank_src: Vec<&Clause> = if p.word.iter().any(|c| !c.neg) { p.word.iter().filter(|c| !c.neg).collect() } else { p.all.iter().filter(|c| !c.neg).collect() };
     // 完全一致の判定に使う、欄全体の文字列(語の間の空白は1つにそろえる)
     let key_src = if !p.word.is_empty() { &q.word } else { &q.all };
     let key: String = fold(key_src).split_whitespace().collect::<Vec<_>>().join(" ");
 
-    let mut hits: Vec<(u8, u32)> = Vec::new();
+    let mut hits: Vec<((u8, u32), u32)> = Vec::new();
     let all_idx: Vec<u32>;
     let cands: &[u32] = match candidates {
         Some(c) => c,
@@ -691,44 +727,61 @@ pub fn filter_in(entries: &[Entry], q: &Query, candidates: Option<&[u32]>) -> Ve
             && p.meaning.iter().all(|c| c.hit(|t| t.matches_within(&e.meaning_lc)))
             && p.tag.iter().all(|c| c.hit(|t| t.matches_tags(&e.tags_lc)));
         if ok {
-            // 見出し語/読みの完全一致 > 前方一致(ワイルドカードは一致) > 含む > その他
             let rd = &e.reading_norm;
-            let rank = match first {
-                None => 3,
-                Some(_) if e.word_lc == key || (!rd.is_empty() && *rd == key) => 0,
-                // 選択肢が複数あるときは、いちばん良い順位を使う
-                Some(c) => c
-                    .alts
-                    .iter()
-                    .map(|t| match t {
-                        Term::Plain(f) => {
-                            let f = f.as_str();
-                            if c.alts.len() > 1 && (e.word_lc == f || (!rd.is_empty() && rd == f)) {
-                                0
-                            } else if e.word_lc.starts_with(f) || rd.starts_with(f) {
-                                1
-                            } else if e.word_lc.contains(f) || rd.contains(f) {
-                                2
-                            } else {
-                                3
-                            }
-                        }
-                        g => {
-                            if g.matches_whole(&e.word_lc) || g.matches_whole(rd) {
-                                1
-                            } else {
-                                3
-                            }
-                        }
-                    })
-                    .min()
-                    .unwrap_or(3),
+            let rank = if rank_src.is_empty() {
+                (3, 0)
+            } else if e.word_lc == key || (!rd.is_empty() && *rd == key) {
+                (0, 0) // 見出し語/読みが、入力全体と完全に一致
+            } else {
+                let first = clause_rank(rank_src[0], &e.word_lc, rd);
+                let rest: u32 = rank_src[1..].iter().map(|c| clause_rank(c, &e.word_lc, rd) as u32).sum();
+                (first, rest)
             };
             hits.push((rank, i));
         }
     }
     hits.sort_by_key(|h| h.0); // 安定ソート
     hits.into_iter().map(|h| h.1).collect()
+}
+
+/// 節1つについての、見出し語・読みでの一致の度合い(小さいほど良い)。
+/// 0 = 完全一致、1 = 前方一致、2 = 含む、3 = 見出し語・読みには無い(意味やタグでだけ一致)。
+/// 選択肢が複数あるときは、いちばん良いものを使う
+fn clause_rank(c: &Clause, word: &str, rd: &str) -> u8 {
+    c.alts
+        .iter()
+        .map(|t| match t {
+            Term::Plain(f) => {
+                let f = f.as_str();
+                if word == f || (!rd.is_empty() && rd == f) {
+                    0
+                } else if word.starts_with(f) || rd.starts_with(f) {
+                    1
+                } else if word.contains(f) || rd.contains(f) {
+                    2
+                } else {
+                    3
+                }
+            }
+            Term::Glob { parts, .. } => {
+                // ワイルドカード: 見出し語全体が型どおり(前後に余分が無い)なら完全一致と同じ扱い
+                let whole = |w: &str| !w.is_empty() && glob(w, parts, true, true);
+                let head = |w: &str| !w.is_empty() && glob(w, parts, true, false);
+                let within = |w: &str| !w.is_empty() && glob(w, parts, false, false);
+                if whole(word) || whole(rd) {
+                    0
+                } else if head(word) || head(rd) {
+                    1
+                } else if within(word) || within(rd) {
+                    2
+                } else {
+                    3
+                }
+            }
+            Term::TagExact(_) => 3,
+        })
+        .min()
+        .unwrap_or(3)
 }
 
 impl Query {
@@ -1036,7 +1089,10 @@ pub enum LinkKind {
     Web,
     /// 実行される可能性のあるファイル(.exe / .bat / .lnk など)。強い警告を出す
     Executable,
-    /// それ以外(文書ファイル、フォルダ、その他のスキーム)。開く前に確認する
+    /// http / https / mailto / file 以外のスキーム(`ms-msdt:` `search-ms:` など)。
+    /// Windows に登録されたアプリを起動するので、強い警告を出す
+    Scheme,
+    /// それ以外(文書ファイル、フォルダ、メール)。開く前に確認する
     Other,
 }
 
@@ -1048,23 +1104,63 @@ pub fn link_kind(link: &str) -> LinkKind {
     if l.starts_with("http://") || l.starts_with("https://") {
         return LinkKind::Web;
     }
+    // 開くと、プログラムやスクリプトが動く可能性のある種類(マクロ付きの文書、ディスクのイメージ、ヘルプなども含む)
     const EXEC: &[&str] = &[
-        "exe", "com", "bat", "cmd", "scr", "pif", "msi", "msp", "ps1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta", "lnk", "url",
-        "reg", "jar", "cpl", "dll", "appref-ms",
+        "exe", "com", "bat", "cmd", "scr", "pif", "msi", "msp", "mst", "msc", "ps1", "psm1", "psd1", "vb", "vbs", "vbe", "js", "jse", "wsf", "wsh",
+        "wsc", "hta", "lnk", "url", "reg", "inf", "jar", "cpl", "dll", "ocx", "sys", "appref-ms", "application", "appx", "appxbundle", "msix",
+        "msixbundle", "chm", "hlp", "gadget", "scf", "library-ms", "searchconnector-ms", "settingcontent-ms", "diagcab", "xll", "iso", "img",
+        "vhd", "vhdx", "docm", "dotm", "xlsm", "xltm", "xlam", "pptm", "potm", "ppam", "sldm", "website", "theme", "themepack", "ins", "isp",
     ];
-    // mailto: などファイルではないスキーム(2文字以上。1文字はドライブ名)は、拡張子で判定しない
+    // スキーム(2文字以上。1文字はドライブ名)
     if let Some((scheme, _)) = l.split_once(':') {
         let is_scheme = scheme.len() >= 2
             && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
             && scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'));
-        if is_scheme && scheme != "file" {
+        if is_scheme && scheme == "mailto" {
             return LinkKind::Other;
         }
+        if is_scheme && scheme != "file" {
+            return LinkKind::Scheme;
+        }
     }
+    // ファイル名の部分。Windows は、名前の末尾のピリオドと空白を無視し、「名前:ストリーム」の形も開ける。
+    // そのため、それらを外してから拡張子を見る(calc.exe. や a.exe::$DATA を、実行ファイルとして扱う)
     let name = l.rsplit(['\\', '/']).next().unwrap_or("");
+    let name = name.split(':').next().unwrap_or("");
+    let name = name.trim_end_matches(['.', ' ']);
     match name.rsplit_once('.') {
         Some((_, ext)) if EXEC.contains(&ext.trim()) => LinkKind::Executable,
         _ => LinkKind::Other,
+    }
+}
+
+/// URL・ドメインらしい文字列の、ホスト名(小文字)。`https://a.example.com/x` → `a.example.com`、`example.com` → `example.com`
+fn host_of(s: &str) -> Option<String> {
+    let t = s.trim().to_lowercase();
+    let t = t.split_once("://").map_or(t.as_str(), |x| x.1);
+    let host = t.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or("");
+    let host = host.split(':').next().unwrap_or("").trim_end_matches('.');
+    // 最後の部分(com、jp など)が文字だけのもの(「v1.2」のような版の番号は、ドメインとみなさない)
+    let tld = host.rsplit('.').next().unwrap_or("");
+    let ok = host.contains('.')
+        && !host.starts_with('.')
+        && host.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '-'))
+        && tld.chars().count() >= 2
+        && tld.chars().all(char::is_alphabetic);
+    ok.then(|| host.trim_start_matches("www.").to_string())
+}
+
+/// リンクの表示名が、URL(ドメイン)の形をしているのに、実際の開く先と違うサーバーを指しているか。
+/// `[https://bank.example.jp](https://evil.example.com)` のような、行き先を偽った書き方を見つけるため
+pub fn label_disguised(label: &str, target: &str) -> bool {
+    let l = label.trim();
+    if l.contains(char::is_whitespace) {
+        return false; // 文章の表示名(「公式サイト」など)は対象外
+    }
+    match (host_of(l), host_of(target)) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
     }
 }
 
@@ -1127,6 +1223,41 @@ mod tests {
     fn exact_word_ranks_first() {
         let e = sample();
         assert_eq!(filter(&e, &q("apple"))[0], 0);
+    }
+
+    #[test]
+    fn ranking_uses_every_word() {
+        let e = vec![
+            Entry::new(1, "アムロジピン錠10mg".into(), "".into(), "".into(), 0),
+            Entry::new(2, "アムロジピン錠2.5mg".into(), "".into(), "".into(), 0),
+            Entry::new(3, "アムロジピン錠5mg".into(), "".into(), "".into(), 0),
+            Entry::new(4, "アムロジピンOD錠5mg".into(), "".into(), "".into(), 0),
+        ];
+        // 2語目(5mg)を見出し語に含む語が先。2.5mg も 5mg を含む
+        let r = filter(&e, &q("アムロジピン 5mg"));
+        assert_eq!(r.len(), 3); // 10mg は 5mg を含まない(AND で外れる)
+        assert!(!r.contains(&0));
+        // 見出し語には無く、意味だけで2語目に一致する語は、後ろになる
+        let e2 = vec![
+            Entry::new(1, "アムロジピン錠".into(), "規格 5mg と 10mg".into(), "".into(), 0),
+            Entry::new(2, "アムロジピン錠5mg".into(), "".into(), "".into(), 0),
+        ];
+        assert_eq!(filter(&e2, &q("アムロジピン 5mg")), vec![1, 0]);
+    }
+
+    #[test]
+    fn wildcard_exact_ranks_first() {
+        let e = vec![
+            Entry::new(1, "かきくけこ".into(), "".into(), "".into(), 0),
+            Entry::new(2, "あかさ".into(), "".into(), "".into(), 0),
+            Entry::new(3, "かさ".into(), "".into(), "".into(), 0),
+            Entry::new(4, "かくさ".into(), "".into(), "".into(), 0),
+        ];
+        // 「*か*」: 「か」で始まる語が先、途中に含むだけの語(あかさ)は後
+        assert_eq!(filter(&e, &q("*か*")), vec![0, 2, 3, 1]);
+        // 「*さ」: 見出し語全体が「さ」の語は無いので、含む語がそのままの順
+        let e2 = vec![Entry::new(1, "あさ".into(), "".into(), "".into(), 0), Entry::new(2, "さ".into(), "".into(), "".into(), 0)];
+        assert_eq!(filter(&e2, &q("*さ")), vec![1, 0]); // 型と完全に同じ語(さ)が先
     }
 
     #[test]
@@ -1681,12 +1812,34 @@ mod tests {
     }
 
     #[test]
+    fn disguised_labels() {
+        assert!(label_disguised("https://bank.example.jp/login", "https://evil.example.com/"));
+        assert!(label_disguised("bank.example.jp", "https://evil.example.com/"));
+        assert!(!label_disguised("https://www.example.com", "https://example.com/a"));
+        assert!(!label_disguised("公式サイト", "https://evil.example.com/"));
+        assert!(!label_disguised("example.com", "https://EXAMPLE.com/x"));
+        assert!(!label_disguised("v1.2", "https://example.com/")); // ドメインに見えない
+    }
+
+    #[test]
     fn link_kinds() {
         assert_eq!(link_kind("https://example.com/a.exe"), LinkKind::Web); // Web 上のファイルはブラウザが扱う
         assert_eq!(link_kind(" HTTP://example.com "), LinkKind::Web);
         assert_eq!(link_kind("C:\\docs\\spec.pdf"), LinkKind::Other);
         assert_eq!(link_kind("\\\\server\\share\\folder"), LinkKind::Other);
         assert_eq!(link_kind("mailto:a@example.com"), LinkKind::Other);
+        // すり抜けの形: 末尾のピリオド・空白、ストリームの指定、実行されうる種類の追加
+        assert_eq!(link_kind("C:\\Windows\\System32\\calc.exe."), LinkKind::Executable);
+        assert_eq!(link_kind("C:\\x\\a.exe . ."), LinkKind::Executable);
+        assert_eq!(link_kind("C:\\x\\a.exe::$DATA"), LinkKind::Executable);
+        for f in ["help.chm", "mmc.msc", "app.application", "disk.iso", "macro.docm", "book.xlsm"] {
+            assert_eq!(link_kind(&format!("\\\\server\\share\\{f}")), LinkKind::Executable, "{f}");
+        }
+        // アプリを起動するスキームは、強い警告の対象
+        for u in ["ms-msdt:/id PCWDiagnostic", "search-ms:query=x", "ms-settings:", "calculator:"] {
+            assert_eq!(link_kind(u), LinkKind::Scheme, "{u}");
+        }
+        assert_eq!(link_kind("file:///C:/x/a.exe"), LinkKind::Executable);
         assert_eq!(link_kind("\\\\server\\share\\tool.EXE"), LinkKind::Executable);
         assert_eq!(link_kind("\"C:\\x\\run.bat\""), LinkKind::Executable);
         assert_eq!(link_kind("file:///C:/x/a.lnk"), LinkKind::Executable);

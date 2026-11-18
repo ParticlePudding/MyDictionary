@@ -32,6 +32,8 @@ pub struct Hotkey {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DictConf {
+    /// 設定ファイルでの ID(`[dictionary.<ID>]`)。保存しても変わらないように覚えておく。空なら保存のときに付ける
+    pub id: String,
     pub name: String,
     pub path: PathBuf,
     pub readonly: bool,
@@ -134,7 +136,7 @@ impl Config {
             title: String::new(),
             shared: false,
             theme: Theme::Light,
-            dicts: vec![DictConf { name: "メイン".into(), path: base.join("dictionary.db"), readonly: false }],
+            dicts: vec![DictConf { id: "main".into(), name: "メイン".into(), path: base.join("dictionary.db"), readonly: false }],
         }
     }
 }
@@ -248,22 +250,40 @@ pub fn window_title(cfg: &Config, app: &str) -> String {
 /// `base` と同じフォルダにある辞書はファイル名だけで書く。
 pub fn to_ini(cfg: &Config, base: &Path) -> String {
     let mut s = String::new();
-    s.push_str("; MyDictionary 設定ファイル(UTF-8)。設定ダイアログからも変更できます。\r\n\r\n[general]\r\n");
+    // 設定の画面から保存すると、ファイル全体を書き直す(手で書いたコメントは残らない)。
+    // その代わり、各項目の説明を毎回書いておく
+    s.push_str("; MyDictionary 設定ファイル(UTF-8)。設定の画面から保存すると、この説明以外のコメントは消えます。\r\n");
+    s.push_str("; 先頭が ; の行と、値の後ろの「 ; 」から行末までは、コメントです。\r\n\r\n[general]\r\n");
+    s.push_str("; 呼び出しホットキー(例: Ctrl+Alt+D)。none で無効\r\n");
     s.push_str(&format!("hotkey = {}\r\n", cfg.hotkey.as_ref().map_or("none".to_string(), |h| h.text.clone())));
+    s.push_str("; true にすると、閉じてもトレイに常駐する\r\n");
     s.push_str(&format!("close_to_tray = {}\r\n", cfg.close_to_tray));
+    s.push_str("; 候補の並び順: word(見出し語順)/ updated_asc / updated_desc\r\n");
     s.push_str(&format!("sort = {}\r\n", cfg.sort.key()));
+    s.push_str("; ウィンドウに表示する名前。空なら MyDictionary\r\n");
     s.push_str(&format!("title = {}\r\n", cfg.title));
+    s.push_str("; 共用フォルダで運用する(しおりは無効、並び順は保存しない)\r\n");
     s.push_str(&format!("shared = {}\r\n", cfg.shared));
     // 既定(明るい)のときは書かない(この設定を知らない古い版が、同じ設定ファイルを読んでも警告を出さないように)
     if cfg.theme != Theme::Light {
         s.push_str(&format!("theme = {}\r\n", cfg.theme.key()));
     }
+    s.push_str("\r\n; 辞書。先頭が既定の登録先。path の相対パスは、この設定ファイルのあるフォルダが基準\r\n");
+    let mut used: Vec<String> = Vec::new();
     for (i, d) in cfg.dicts.iter().enumerate() {
         let path = match d.path.parent() {
             Some(p) if p == base => d.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
             _ => d.path.to_string_lossy().to_string(),
         };
-        s.push_str(&format!("\r\n[dictionary.d{}]\r\nname = {}\r\npath = {}\r\n", i + 1, d.name, path));
+        // ID は、読み込んだときのものを使う(無い・重なるときは、空いている d<番号> を付ける)
+        let valid = |id: &str| !id.is_empty() && !id.contains([']', '\r', '\n']) && !used.iter().any(|u| u.eq_ignore_ascii_case(id));
+        let id = if valid(&d.id) {
+            d.id.clone()
+        } else {
+            (i + 1..).map(|n| format!("d{n}")).find(|c| valid(c)).unwrap_or_default()
+        };
+        used.push(id.clone());
+        s.push_str(&format!("\r\n[dictionary.{}]\r\nname = {}\r\npath = {}\r\n", id, d.name, path));
         if d.readonly {
             s.push_str("readonly = true\r\n");
         }
@@ -301,6 +321,18 @@ pub fn expand_env(s: &str, getenv: &dyn Fn(&str) -> Option<String>) -> String {
     out
 }
 
+/// 値の後ろのコメントを外す。空白(タブ)の後ろの `;` から行末までをコメントとみなす
+/// (`shared = true   ; 共用で運用する` の形。値の中の `;` は、直前が空白でなければ値の一部)
+fn strip_comment(v: &str) -> &str {
+    let b = v.as_bytes();
+    for i in 1..b.len() {
+        if b[i] == b';' && (b[i - 1] == b' ' || b[i - 1] == b'\t') {
+            return &v[..i];
+        }
+    }
+    v
+}
+
 fn parse_bool(v: &str) -> Option<bool> {
     match v.trim().to_ascii_lowercase().as_str() {
         "true" | "yes" | "on" | "1" => Some(true),
@@ -333,7 +365,7 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
                     let pb = PathBuf::from(&expanded);
                     let full = if pb.is_absolute() { pb } else { base.join(pb) };
                     let name = p.name.unwrap_or_else(|| p.id.clone());
-                    cfg.dicts.push(DictConf { name, path: full, readonly: p.readonly });
+                    cfg.dicts.push(DictConf { id: p.id.clone(), name, path: full, readonly: p.readonly });
                 }
                 None => warns.push(format!("設定: 辞書「{}」に path がありません", p.id)),
             }
@@ -361,7 +393,7 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
             warns.push(format!("設定: {}行目 「key = value」の形式ではありません", n + 1));
             continue;
         };
-        let (k, v) = (k.trim().to_ascii_lowercase(), v.trim());
+        let (k, v) = (k.trim().to_ascii_lowercase(), strip_comment(v).trim());
         if let Some(p) = pending.as_mut() {
             match k.as_str() {
                 "name" => p.name = Some(v.to_string()),
@@ -485,8 +517,8 @@ mod tests {
             shared: true,
             theme: Theme::System,
             dicts: vec![
-                DictConf { name: "メイン".into(), path: base.join("dictionary.db"), readonly: false },
-                DictConf { name: "参照 用".into(), path: PathBuf::from("/other/dir/ref.db"), readonly: true },
+                DictConf { id: "main".into(), name: "メイン".into(), path: base.join("dictionary.db"), readonly: false },
+                DictConf { id: "ref".into(), name: "参照 用".into(), path: PathBuf::from("/other/dir/ref.db"), readonly: true },
             ],
         };
         let (back, warns) = parse(&to_ini(&cfg, base), base, &env);
@@ -497,7 +529,13 @@ mod tests {
         assert_eq!(back.title, "社内 用語集");
         assert!(back.shared);
         assert_eq!(back.theme, Theme::System);
-        assert_eq!(back.dicts, cfg.dicts);
+        assert_eq!(back.dicts, cfg.dicts); // ID(main, ref)も変わらない
+        // ID が無い・重なる辞書には、空いている番号を付ける
+        let mut c2 = cfg.clone();
+        c2.dicts[1].id = "MAIN".into();
+        c2.dicts.push(DictConf { id: String::new(), name: "新".into(), path: base.join("new.db"), readonly: false });
+        let ini = to_ini(&c2, base);
+        assert!(ini.contains("[dictionary.main]") && ini.contains("[dictionary.d2]") && ini.contains("[dictionary.d3]"), "{ini}");
         // ホットキー無し
         let none = Config { hotkey: None, ..cfg };
         assert!(parse(&to_ini(&none, base), base, &env).0.hotkey.is_none());
@@ -520,6 +558,23 @@ mod tests {
         let (c, w) = parse("[general]\ntitle = 営業部 用語集\nshared = yes\n", Path::new("/b"), &env);
         assert!(w.is_empty());
         assert_eq!((c.title.as_str(), c.shared), ("営業部 用語集", true));
+    }
+
+    #[test]
+    fn trailing_comments() {
+        // 説明書の例のように、値の後ろに「; 説明」を書ける
+        let text = "[general]\nshared = true           ; 共用フォルダで運用する\ntitle = 社内用語集        ; ウィンドウに表示する名前\ntheme = dark\t; 配色\n\
+[dictionary.d1]\nname = メイン\npath = dictionary.db     ; 相対パス\nreadonly = true          ; 参照のみ\n";
+        let (c, w) = parse(text, Path::new("/b"), &env);
+        assert!(w.is_empty(), "{w:?}");
+        assert!(c.shared);
+        assert_eq!(c.title, "社内用語集");
+        assert_eq!(c.theme, Theme::Dark);
+        assert_eq!(c.dicts[0].path, PathBuf::from("/b/dictionary.db"));
+        assert!(c.dicts[0].readonly);
+        // 空白の無い ; は値の一部
+        let (c, _) = parse("[general]\ntitle = A;B\n", Path::new("/b"), &env);
+        assert_eq!(c.title, "A;B");
     }
 
     #[test]

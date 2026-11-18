@@ -48,6 +48,21 @@ pub fn loadable(path: &str) -> bool {
     crate::core::is_absolute_path(path) || crate::core::is_relative_path(path)
 }
 
+/// 共有フォルダのパス(`\\サーバー\…`)なら、サーバーの名前(小文字)
+pub fn unc_host(path: &str) -> Option<String> {
+    let p = path.replace('/', "\\");
+    let rest = p.strip_prefix("\\\\")?;
+    let host = rest.split('\\').next().unwrap_or("");
+    (!host.is_empty()).then(|| host.to_lowercase())
+}
+
+/// 表示のために自動で読んでよいか(`loadable` に加えて、共有フォルダのサーバーを限る)。
+/// 共有フォルダの画像は、辞書を置いているサーバー(`allowed`)のものだけを自動で読む。
+/// ほかのサーバーの画像は、説明の文字のリンクのままにする(語を表示しただけで、知らないサーバーへ接続しないように)
+pub fn auto_load(path: &str, allowed: &[String]) -> bool {
+    loadable(path) && unc_host(path).map_or(true, |h| allowed.contains(&h))
+}
+
 /// 画像の種類と、幅・高さ(ピクセル)。画像でなければ None
 pub fn probe(b: &[u8]) -> Option<(Kind, u32, u32)> {
     let be16 = |i: usize| b.get(i..i + 2).map(|v| u16::from_be_bytes([v[0], v[1]]) as u32);
@@ -287,6 +302,17 @@ mod tests {
 
         assert!(has_image_ext("C:\\a\\図.PNG") && has_image_ext("a.jpeg") && has_image_ext("x/y.gif"));
         assert!(!has_image_ext("a.exe") && !has_image_ext("png") && !has_image_ext("a.png.exe") && !has_image_ext("dir.png\\file"));
+    }
+
+    #[test]
+    fn auto_load_hosts() {
+        let allowed = vec!["fs01".to_string()];
+        assert!(auto_load("\\\\FS01\\share\\a.png", &allowed));
+        assert!(!auto_load("\\\\evil.example.com\\x\\a.png", &allowed));
+        assert!(auto_load("C:\\pic\\a.png", &allowed));
+        assert!(auto_load("dictionary_pic\\a.png", &[]));
+        assert_eq!(unc_host("//Srv/s/a.png").as_deref(), Some("srv"));
+        assert_eq!(unc_host("C:\\a.png"), None);
     }
 
     #[test]

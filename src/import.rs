@@ -75,6 +75,8 @@ pub struct Table {
     /// `rows` と同じ形。そのセルで `\n` の書き方を改行として扱うか
     /// (タブ区切りで、"..." で囲まれていないセルだけ)
     escapes: Vec<Vec<bool>>,
+    /// 引用符(")が閉じないまま、ファイルが終わった。その引用符があった行(1 始まり、ファイルの行)
+    pub unclosed_quote: Option<usize>,
 }
 
 /// 区切りテキストを行×列に分解する。空行は捨てる
@@ -88,8 +90,13 @@ pub fn parse_table(text: &str, delim: char) -> Table {
     let mut quoted = false; // 引用符の中
     let mut was_quoted = false; // このセルは引用符で始まった
     let mut at_start = true; // セルの先頭
+    let mut line = 1usize; // ファイルの行(引用符の中の改行も数える)
+    let mut quote_line = 0usize; // 開いている引用符の行
     let mut it = text.chars().peekable();
     while let Some(c) = it.next() {
+        if c == '\n' {
+            line += 1;
+        }
         if quoted {
             if c == '"' {
                 if it.peek() == Some(&'"') {
@@ -104,6 +111,7 @@ pub fn parse_table(text: &str, delim: char) -> Table {
             continue;
         }
         if c == '"' && at_start {
+            quote_line = line;
             quoted = true;
             was_quoted = true;
             at_start = false;
@@ -138,7 +146,7 @@ pub fn parse_table(text: &str, delim: char) -> Table {
         rows.push(row);
         escapes.push(esc);
     }
-    Table { rows, escapes }
+    Table { rows, escapes, unclosed_quote: quoted.then_some(quote_line) }
 }
 
 /// 列名 → 列の種類(0: 見出し語, 1: 意味, 2: タグ, 3: 参照先, 4: 読み, 5: 管理用)。
@@ -147,11 +155,11 @@ fn header_kind(name: &str) -> Option<usize> {
     let n = name.trim().trim_start_matches('\u{feff}').to_lowercase();
     let n = n.split(['(', '(']).next().unwrap_or("").trim();
     const NAMES: [&[&str]; 6] = [
-        &["見出し語", "見出し", "単語", "語", "word", "term", "headword"],
-        &["意味", "説明", "meaning", "definition", "description"],
-        &["タグ", "tag", "tags"],
+        &["見出し語", "見出し", "単語", "語", "用語", "原語", "項目", "名称", "word", "term", "headword", "source", "entry"],
+        &["意味", "説明", "訳語", "訳", "定義", "解説", "内容", "回答", "meaning", "definition", "description", "translation", "target", "answer"],
+        &["タグ", "分類", "分野", "カテゴリ", "カテゴリー", "tag", "tags", "category"],
         &["参照先", "リンク", "link", "links", "url"],
-        &["読み", "よみ", "読み方", "ふりがな", "reading", "yomi", "kana"],
+        &["読み", "よみ", "読み方", "ふりがな", "フリガナ", "reading", "yomi", "kana"],
         &["管理用", "管理番号", "key"],
     ];
     NAMES.iter().position(|set| set.contains(&n))
@@ -171,25 +179,70 @@ fn parse_key(s: &str) -> Option<(i64, i64)> {
     (id > 0).then_some((id, ts))
 }
 
+/// 表を登録用の行に変換した結果
+pub struct Converted {
+    pub rows: Vec<Row>,
+    /// 見出し語か意味が空で、読み飛ばした行の数
+    pub skipped: usize,
+    /// 取り込む前の確認の画面に出す説明(列の対応、閉じていない引用符など)
+    pub notes: Vec<String>,
+}
+
+const KIND_NAMES: [&str; 6] = ["見出し語", "意味", "タグ", "参照先", "読み", "管理用"];
+
 /// 表を登録用の行に変換する。戻り値は (行, 見出し語か意味が空で読み飛ばした件数)
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn to_rows(table: Table) -> (Vec<Row>, usize) {
-    let Table { rows: cells, escapes } = table;
+    let c = to_rows_detail(table);
+    (c.rows, c.skipped)
+}
+
+/// 表を登録用の行に変換する(列の対応などの説明も返す)
+pub fn to_rows_detail(table: Table) -> Converted {
+    let Table { rows: cells, escapes, unclosed_quote } = table;
+    let mut notes = Vec::new();
+    if let Some(line) = unclosed_quote {
+        notes.push(format!(
+            "{line} 行目の引用符(\")が閉じていません。そこから最後までが、1つの値として読まれています。ファイルを確かめてください"
+        ));
+    }
     // 列の対応: [見出し語, 意味, タグ, 参照先, 読み, 管理用] がそれぞれ何列目か
     let mut cols: [Option<usize>; 6] = [Some(0), Some(1), Some(2), Some(3), Some(4), None];
     let mut start = 0;
-    let header = cells.first().map(|first| first.iter().map(|c| header_kind(c)).collect::<Vec<_>>());
+    let header: Option<Vec<Option<usize>>> = cells.first().map(|first| first.iter().map(|c| header_kind(c)).collect());
     let given = match header {
-        Some(kinds) if kinds.contains(&Some(0)) && kinds.contains(&Some(1)) => {
+        // 1行目に、知っている列名が1つでもあれば、見出し行とみなす
+        Some(kinds) if kinds.iter().any(|k| k.is_some()) => {
+            let names = &cells[0];
             cols = [None; 6];
             for (i, k) in kinds.iter().enumerate() {
                 if let Some(k) = k {
                     cols[*k].get_or_insert(i);
                 }
             }
+            // 見出し語・意味の列名が見つからなければ、使われていない列を左から当てる
+            for k in [0, 1] {
+                if cols[k].is_none() {
+                    cols[k] = (0..names.len()).find(|i| kinds[*i].is_none() && !cols.contains(&Some(*i)));
+                }
+            }
             start = 1; // 見出し行は登録しない
+            let mut used: Vec<String> = Vec::new();
+            for (k, col) in cols.iter().enumerate() {
+                if let Some(i) = col {
+                    used.push(format!("「{}」→ {}", names[*i].trim().trim_start_matches('\u{feff}'), KIND_NAMES[k]));
+                }
+            }
+            let unused: Vec<String> = (0..names.len()).filter(|i| !cols.contains(&Some(*i)) && !names[*i].trim().is_empty()).map(|i| format!("「{}」", names[i].trim())).collect();
+            let mut note = format!("列の対応: {}", used.join("、"));
+            if !unused.is_empty() {
+                note.push_str(&format!("。使わない列: {}", unused.join("、")));
+            }
+            notes.push(note);
             Given { tags: cols[2].is_some(), link: cols[3].is_some(), reading: cols[4].is_some() }
         }
         _ => {
+            notes.push("1行目に列名が無いため、左から 見出し語・意味・タグ・参照先・読み の順として読みます(列名の書き方は説明書を参照)".into());
             // 見出し行が無い表: どこかの行にその列があれば、「列がある」とみなす
             let width = cells.iter().map(Vec::len).max().unwrap_or(0);
             Given { tags: width > 2, link: width > 3, reading: width > 4 }
@@ -199,18 +252,29 @@ pub fn to_rows(table: Table) -> (Vec<Row>, usize) {
     let mut skipped = 0;
     for (r, esc) in cells.iter().zip(&escapes).skip(start) {
         let get = |k: usize| cols[k].and_then(|i| r.get(i)).map(|s| s.trim().to_string()).unwrap_or_default();
-        // 意味と参照先は改行を含められる。タブ区切りで "..." で囲んでいない値は、`\n` を改行として扱う
-        let multiline = |k: usize| {
+        // 改行を含められる値。タブ区切りで "..." で囲んでいない値は、`\n` を改行として扱う。
+        // 参照先(`is_link`)は、`\\fs01\netadmin` のような共有フォルダのパスを壊さないように、
+        // 区切った後の各行が、どれも参照先の形をしているときだけ改行にする
+        let multiline = |k: usize, is_link: bool| {
             let v = get(k);
             let escaped = cols[k].and_then(|i| esc.get(i)).copied().unwrap_or(false);
-            let v = if escaped { v.replace("\\r\\n", "\n").replace("\\n", "\n") } else { v };
+            let v = if !escaped {
+                v
+            } else {
+                let split = v.replace("\\r\\n", "\n").replace("\\n", "\n");
+                if !is_link || split.lines().skip(1).all(looks_like_link_line) {
+                    split
+                } else {
+                    v
+                }
+            };
             v.replace("\r\n", "\n").replace('\r', "\n")
         };
         let row = Row {
             word: get(0),
-            meaning: multiline(1),
+            meaning: multiline(1, false),
             tags: core::normalize_tags(&get(2)),
-            link: multiline(3),
+            link: multiline(3, true),
             reading: get(4),
             updated_at: None,
             given,
@@ -222,7 +286,42 @@ pub fn to_rows(table: Table) -> (Vec<Row>, usize) {
             rows.push(row);
         }
     }
-    (rows, skipped)
+    Converted { rows, skipped, notes }
+}
+
+/// 参照先の1行らしいか(`[[語]]`、URL、パス、「表示名 | 開く先」)。空の行もよい
+fn looks_like_link_line(line: &str) -> bool {
+    let t = line.trim();
+    t.is_empty() || t.starts_with("[[") || t.contains(" | ") || t.contains("://") || core::is_link_target(t)
+}
+
+/// 取り込む行を点検する(CSV / TSV / JSON 共通)。
+/// - 制御文字と、文字の向きを強制する文字を取り除く(`core::clean_text`)
+/// - 長すぎる欄のある行は、取り込まない(`core::too_long`。極端に長い語を表示すると、画面が固まるため)
+///
+/// 戻り値は (取り込む行, 長すぎて外した行の見出し語, 文字を取り除いた行の数)
+pub fn screen(rows: Vec<Row>) -> (Vec<Row>, Vec<String>, usize) {
+    let mut out = Vec::with_capacity(rows.len());
+    let (mut long, mut cleaned) = (Vec::new(), 0);
+    for mut r in rows {
+        let mut changed = false;
+        for f in [&mut r.word, &mut r.meaning, &mut r.tags, &mut r.link, &mut r.reading] {
+            let (c, ch) = core::clean_text(f);
+            if ch {
+                *f = c;
+                changed = true;
+            }
+        }
+        if changed {
+            cleaned += 1;
+        }
+        if core::too_long(&r.word, &r.reading, &r.meaning, &r.tags, &r.link).is_some() {
+            long.push(r.word.chars().take(30).collect());
+            continue;
+        }
+        out.push(r);
+    }
+    (out, long, cleaned)
 }
 
 /// 辞書の内容を CSV / TSV にする(`delim` が区切り文字)。UTF-8(BOM 付き)で、行末は CRLF。
@@ -290,6 +389,10 @@ pub struct Outcome {
     pub ambiguous: Vec<String>,
     /// 上書きした語の (前の見出し語, 新しい見出し語)
     pub changes: Vec<(String, String)>,
+    /// 上書きした語ごとの、変わる項目の説明(`changes` と同じ順)
+    pub diffs: Vec<Vec<String>>,
+    /// 表計算ソフトで崩れたように見える値(「#NAME?」、先頭の 0 が消えた番号など)。(見出し語, 説明)
+    pub suspicious: Vec<(String, String)>,
 }
 
 impl Outcome {
@@ -320,9 +423,8 @@ impl Outcome {
     }
 }
 
-/// 上書きの見込みの詳細(確認画面の「詳細」と、結果の画面に出す)。何も無ければ空
+/// 上書きの見込みの詳細(確認画面の「詳細…」と、結果の画面に出す)。すべての語と、項目ごとの変更を書く。何も無ければ空
 pub fn overwrite_details(plan: &Outcome) -> String {
-    const MAX: usize = 8;
     let mut out = String::new();
     let mut section = |title: &str, items: Vec<String>| {
         if items.is_empty() {
@@ -331,18 +433,90 @@ pub fn overwrite_details(plan: &Outcome) -> String {
         if !out.is_empty() {
             out.push('\n');
         }
-        out.push_str(&format!("{title}({} 件)\n", items.len()));
-        for it in items.iter().take(MAX) {
-            out.push_str(&format!("  ・{it}\n"));
-        }
-        if items.len() > MAX {
-            out.push_str(&format!("  …ほか {} 件\n", items.len() - MAX));
+        out.push_str(&format!("■ {title}({} 件)\n", items.len()));
+        for it in items {
+            out.push_str(&format!("・{it}\n"));
         }
     };
-    section("上書きする語", plan.changes.iter().map(|(a, b)| if a == b { a.clone() } else { format!("{a} → {b}") }).collect());
+    section(
+        "表計算ソフトで崩れた可能性のある値(確かめてから取り込んでください)",
+        plan.suspicious.iter().map(|(w, d)| format!("{w}: {d}")).collect(),
+    );
+    section(
+        "上書きする語",
+        plan.changes
+            .iter()
+            .zip(plan.diffs.iter().map(Some).chain(std::iter::repeat(None)))
+            .map(|((a, b), d)| {
+                let name = if a == b { a.clone() } else { format!("{a} → {b}") };
+                match d {
+                    Some(d) if !d.is_empty() => format!("{name}\n    {}", d.join("\n    ")),
+                    _ => name,
+                }
+            })
+            .collect(),
+    );
     section("書き出した後に変更されたため、上書きしない語", plan.conflicts.clone());
     section("同じ見出し語が複数あるため、追加として扱う語", plan.ambiguous.clone());
     out
+}
+
+/// 値を、詳細の画面に出す長さに縮める(改行は「↵」にする)
+fn brief(v: &str) -> String {
+    let one: String = v.replace("\r\n", "\n").chars().map(|c| if c == '\n' { '↵' } else { c }).collect();
+    if one.chars().count() > 40 {
+        format!("「{}…」", one.chars().take(40).collect::<String>())
+    } else {
+        format!("「{one}」")
+    }
+}
+
+/// 上書きで変わる項目の説明
+fn diff_lines(ex: &Snapshot, new: &Snapshot) -> Vec<String> {
+    let mut v = Vec::new();
+    for (name, a, b) in [
+        ("見出し語", &ex.word, &new.word),
+        ("読み", &ex.reading, &new.reading),
+        ("意味", &ex.meaning, &new.meaning),
+        ("タグ", &ex.tags, &new.tags),
+        ("参照先", &ex.link, &new.link),
+    ] {
+        let (a2, b2) = (a.replace("\r\n", "\n"), b.replace("\r\n", "\n"));
+        if a2 == b2 {
+            continue;
+        }
+        if b2.trim().is_empty() {
+            v.push(format!("{name}: {} → 空にする", brief(a)));
+        } else if a2.trim().is_empty() {
+            v.push(format!("{name}: (空) → {}", brief(b)));
+        } else {
+            v.push(format!("{name}: {} → {}", brief(a), brief(b)));
+        }
+    }
+    v
+}
+
+/// 表計算ソフト(Excel など)で開いて保存したときに、崩れたように見える値か。崩れていそうなら説明を返す。
+/// `old` は辞書の今の値(分からなければ空)
+pub fn excel_damage(old: &str, new: &str) -> Option<String> {
+    let n = new.trim();
+    const ERRORS: [&str; 9] = ["#NAME?", "#VALUE!", "#REF!", "#DIV/0!", "#N/A", "#NUM!", "#NULL!", "#SPILL!", "#CALC!"];
+    if ERRORS.iter().any(|e| n.eq_ignore_ascii_case(e)) {
+        return Some(format!("{n}(数式のエラー。元の値が数式として扱われた可能性)"));
+    }
+    if !n.is_empty() && n.chars().all(|c| c == '#') {
+        return Some("「####」(列の幅が足りないときの表示が、そのまま保存された可能性)".into());
+    }
+    let o = old.trim();
+    // 先頭の 0 が消えた(0123 → 123)
+    if o.len() > 1 && o.starts_with('0') && o.chars().all(|c| c.is_ascii_digit()) && o.trim_start_matches('0') == n && !n.is_empty() {
+        return Some(format!("{} → {}(先頭の 0 が消えた可能性)", brief(o), brief(n)));
+    }
+    // 長い数字が指数の形になった(123456789012 → 1.23457E+11)
+    if !o.is_empty() && o.chars().all(|c| c.is_ascii_digit()) && o.len() >= 12 && n.contains(['E', 'e']) && n.contains('+') {
+        return Some(format!("{} → {}(長い数字が指数の形になった可能性)", brief(o), brief(n)));
+    }
+    None
 }
 
 /// 取り込みの間、辞書の内容をメモリ上で追うための表
@@ -365,24 +539,30 @@ impl Book {
     }
 
     fn put(&mut self, s: Snapshot) {
-        self.seen.insert((s.word.clone(), s.meaning.clone()));
-        self.by_word.entry(s.word.clone()).or_default().push(s.id);
+        self.seen.insert(seen_key(&s.word, &s.meaning));
+        self.by_word.entry(core::fold(&s.word)).or_default().push(s.id);
         self.by_id.insert(s.id, s);
     }
 
     /// 語の内容を置き換える(見出し語が変わっていれば、見出し語の索引も直す)
     fn replace(&mut self, s: Snapshot) {
         if let Some(old) = self.by_id.get(&s.id) {
-            if old.word != s.word {
-                if let Some(v) = self.by_word.get_mut(&old.word) {
+            if core::fold(&old.word) != core::fold(&s.word) {
+                if let Some(v) = self.by_word.get_mut(&core::fold(&old.word)) {
                     v.retain(|&i| i != s.id);
                 }
-                self.by_word.entry(s.word.clone()).or_default().push(s.id);
+                self.by_word.entry(core::fold(&s.word)).or_default().push(s.id);
             }
         }
-        self.seen.insert((s.word.clone(), s.meaning.clone()));
+        self.seen.insert(seen_key(&s.word, &s.meaning));
         self.by_id.insert(s.id, s);
     }
+}
+
+/// 「同じ内容の語」の判定に使う組。見出し語は、検索・登録画面の重複の知らせと同じ規則でそろえる
+/// (「ﾉﾙﾊﾞｽｸ」と「ノルバスク」は同じ見出し語)。意味は、改行の書き方だけそろえる
+fn seen_key(word: &str, meaning: &str) -> (String, String) {
+    (core::fold(word), meaning.replace("\r\n", "\n").trim().to_string())
 }
 
 /// 行の内容が、辞書の語と同じか(ファイルに列の無い項目は比べない)
@@ -416,9 +596,9 @@ pub fn import_rows(conn: &Connection, rows: &[Row], mode: Mode, dry: bool) -> ru
     let now = core::now_unix();
 
     // ファイルの中での、見出し語ごとの行数
-    let mut in_file: HashMap<&str, usize> = HashMap::new();
+    let mut in_file: HashMap<String, usize> = HashMap::new();
     for r in rows {
-        *in_file.entry(r.word.as_str()).or_default() += 1;
+        *in_file.entry(core::fold(&r.word)).or_default() += 1;
     }
     // 取り込む前から辞書にあった語
     let original: HashSet<i64> = book.by_id.keys().copied().collect();
@@ -427,7 +607,7 @@ pub fn import_rows(conn: &Connection, rows: &[Row], mode: Mode, dry: bool) -> ru
 
     // 「両方残す」の規則: 見出し語と意味が両方同じ語が無ければ、追加する
     let add = |book: &mut Book, out: &mut Outcome, undo: &mut Undo, r: &Row| -> rusqlite::Result<()> {
-        if book.seen.contains(&(r.word.clone(), r.meaning.clone())) {
+        if book.seen.contains(&seen_key(&r.word, &r.meaning)) {
             out.duplicate += 1;
             return Ok(());
         }
@@ -450,8 +630,9 @@ pub fn import_rows(conn: &Connection, rows: &[Row], mode: Mode, dry: bool) -> ru
         match mode {
             Mode::KeepBoth => add(&mut book, &mut out, &mut undo, r)?,
             Mode::Skip => {
-                let by_key = r.key.map_or(false, |k| book.by_id.contains_key(&k.0));
-                let by_word = book.by_word.get(&r.word).map_or(false, |v| !v.is_empty());
+                // 取り込む前から辞書にあった見出し語だけを見る(同じファイルの中の、同じ見出し語の2行目以降は、取り込む)
+                let by_key = r.key.map_or(false, |k| original.contains(&k.0));
+                let by_word = book.by_word.get(&core::fold(&r.word)).map_or(false, |v| v.iter().any(|id| original.contains(id)));
                 if by_key || by_word {
                     out.skipped += 1;
                 } else {
@@ -476,8 +657,8 @@ pub fn import_rows(conn: &Connection, rows: &[Row], mode: Mode, dry: bool) -> ru
                 }
                 if by_word {
                     // その見出し語の語のうち、取り込む前から辞書にあったもの
-                    let olds: Vec<i64> = book.by_word.get(&r.word).map(|v| v.iter().copied().filter(|id| original.contains(id)).collect()).unwrap_or_default();
-                    let single = olds.len() == 1 && !claimed.contains(&olds[0]) && in_file.get(r.word.as_str()) == Some(&1);
+                    let olds: Vec<i64> = book.by_word.get(&core::fold(&r.word)).map(|v| v.iter().copied().filter(|id| original.contains(id)).collect()).unwrap_or_default();
+                    let single = olds.len() == 1 && !claimed.contains(&olds[0]) && in_file.get(&core::fold(&r.word)) == Some(&1);
                     if olds.is_empty() {
                         // 辞書に無かった見出し語(この取り込みで追加した語と同じ見出し語の行も、追加する)
                         add(&mut book, &mut out, &mut undo, r)?;
@@ -513,6 +694,12 @@ pub fn import_rows(conn: &Connection, rows: &[Row], mode: Mode, dry: bool) -> ru
                         )?;
                         undo.updated.push((ex.clone(), new.updated_at));
                     }
+                    for (name, a, b) in [("見出し語", &ex.word, &new.word), ("読み", &ex.reading, &new.reading), ("意味", &ex.meaning, &new.meaning), ("タグ", &ex.tags, &new.tags), ("参照先", &ex.link, &new.link)] {
+                        if let Some(d) = excel_damage(a, b) {
+                            out.suspicious.push((new.word.clone(), format!("{name} {d}")));
+                        }
+                    }
+                    out.diffs.push(diff_lines(&ex, &new));
                     out.changes.push((ex.word.clone(), new.word.clone()));
                     out.overwritten += 1;
                     book.replace(new);
@@ -534,6 +721,77 @@ pub fn insert_rows(conn: &Connection, rows: &[Row]) -> rusqlite::Result<(usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fold_and_skip_rules() {
+        let (conn, dir) = open("fold");
+        import_rows(&conn, &[row("ノルバスク錠5mg", "降圧薬")], Mode::KeepBoth, false).unwrap();
+        // 半角カナ・全角英数で書いた同じ見出し語も、すでにあるとみなす
+        let (o, _) = import_rows(&conn, &[row("ﾉﾙﾊﾞｽｸ錠５ｍｇ", "降圧薬"), row("アムロジピン", "降圧薬")], Mode::Skip, true).unwrap();
+        assert_eq!((o.skipped, o.added), (1, 1));
+        // 両方残す: 同じ見出し語(そろえて同じ)と同じ意味は、追加しない
+        let (o, _) = import_rows(&conn, &[row("ﾉﾙﾊﾞｽｸ錠5mg", "降圧薬")], Mode::KeepBoth, true).unwrap();
+        assert_eq!((o.duplicate, o.added), (1, 0));
+        // 取り込まない: 同じファイルの中で、辞書に無い見出し語が2回出てきても、両方取り込む
+        let (o, _) = import_rows(&conn, &[row("新薬", "説明1"), row("新薬", "説明2")], Mode::Skip, true).unwrap();
+        assert_eq!((o.skipped, o.added), (0, 2));
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn column_names_and_notes() {
+        // 訳語・原語の表。知らない列(備考)は使わず、そのことを知らせる
+        let c = to_rows_detail(parse_table("原語,訳語,分野,備考\nliability,責任,法務,注意\n", ','));
+        assert_eq!((c.rows[0].word.as_str(), c.rows[0].meaning.as_str(), c.rows[0].tags.as_str()), ("liability", "責任", "法務"));
+        assert!(c.notes[0].contains("「備考」"), "{:?}", c.notes);
+        // 見出し語の列名だけ分かる表: 意味は、残りの列の左から
+        let c = to_rows_detail(parse_table("Term\tNotes\nAPI\tインターフェース\n", '\t'));
+        assert_eq!((c.rows.len(), c.rows[0].meaning.as_str()), (1, "インターフェース"));
+        // 列名が無い表は、そのことを知らせる
+        let c = to_rows_detail(parse_table("a,b\n", ','));
+        assert!(c.notes[0].contains("列名が無い"));
+        // 閉じていない引用符
+        let c = to_rows_detail(parse_table("見出し語,意味\na,\"説明\nb,続き\n", ','));
+        assert_eq!(c.rows.len(), 1);
+        assert!(c.notes.iter().any(|n| n.contains("2 行目の引用符")), "{:?}", c.notes);
+        // TSV の参照先では、\n を改行にしない(共有フォルダのパスを壊さない)
+        let c = to_rows_detail(parse_table("見出し語\t意味\t参照先\nx\ta\\nb\t\\\\fs01\\netadmin\n", '\t'));
+        assert_eq!(c.rows[0].meaning, "a\nb");
+        assert_eq!(c.rows[0].link, "\\\\fs01\\netadmin");
+    }
+
+    #[test]
+    fn screening() {
+        let long = "あ".repeat(core::MAX_MEANING + 1);
+        let rows = vec![row("ok", "普通"), row("長い", &long), row("制御\u{202E}文字\u{0}", "a\u{7}b")];
+        let (rows, long, cleaned) = screen(rows);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(long, vec!["長い".to_string()]);
+        assert_eq!(cleaned, 1);
+        assert_eq!((rows[1].word.as_str(), rows[1].meaning.as_str()), ("制御文字", "ab"));
+    }
+
+    #[test]
+    fn spreadsheet_damage() {
+        assert!(excel_damage("=A1", "#NAME?").is_some());
+        assert!(excel_damage("", "#VALUE!").is_some());
+        assert!(excel_damage("abc", "#####").is_some());
+        assert!(excel_damage("0123", "123").is_some());
+        assert!(excel_damage("123456789012", "1.23457E+11").is_some());
+        assert!(excel_damage("123", "124").is_none());
+        assert!(excel_damage("#タグ", "#タグ2").is_none());
+        // 上書きの見込みに出る
+        let (conn, dir) = open("damage");
+        import_rows(&conn, &[Row { reading: "0123".into(), given: Given { reading: true, ..Default::default() }, ..row("社員番号", "説明") }], Mode::KeepBoth, false).unwrap();
+        let r = Row { reading: "123".into(), given: Given { reading: true, ..Default::default() }, ..row("社員番号", "説明") };
+        let (o, _) = import_rows(&conn, &[r], Mode::Overwrite, true).unwrap();
+        assert_eq!(o.overwritten, 1);
+        assert_eq!(o.suspicious.len(), 1);
+        assert!(overwrite_details(&o).contains("先頭の 0"));
+        drop(conn);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn row(word: &str, meaning: &str) -> Row {
         Row { word: word.into(), meaning: meaning.into(), ..Default::default() }
@@ -687,7 +945,7 @@ mod tests {
         assert_eq!(plan.writes(), 3);
         assert_eq!(
             overwrite_details(&plan),
-            "上書きする語(2 件)\n  ・apple\n  ・carot → carrot\n\n書き出した後に変更されたため、上書きしない語(1 件)\n  ・banana\n"
+            "■ 上書きする語(2 件)\n・apple\n    意味: 「りんご」 → 「りんご。赤い果物」\n    タグ: 「果物」 → 空にする\n・carot → carrot\n    見出し語: 「carot」 → 「carrot」\n\n■ 書き出した後に変更されたため、上書きしない語(1 件)\n・banana\n"
         );
         assert_eq!(overwrite_details(&Outcome::default()), "");
         assert_eq!(sorted(&conn).len(), 4);

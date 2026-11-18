@@ -261,6 +261,11 @@ struct State {
     in_sizemove: Cell<bool>,
     /// 画像の大きさを決めたときの、本文欄の幅
     img_width: Cell<i32>,
+    /// 設定ファイルの誤り・ホットキーの登録の失敗など、画面の下段だけでは見落としやすい問題。
+    /// 読み込みが終わったときに、まとめて確認の画面で知らせる
+    alerts: Vec<String>,
+    /// 確認の画面で知らせた、辞書を開けない問題(同じ知らせを繰り返さない)
+    reported_errors: HashSet<(PathBuf, String)>,
     /// 「新しい版のアプリでも使われている」と知らせた辞書(同じ知らせを繰り返さない)
     warned_version: HashSet<PathBuf>,
     /// 絞り込みのタグ欄の横の「一覧…」
@@ -399,7 +404,8 @@ pub fn run() {
         add_tray_icon(hwnd);
         if let Some(st) = state(hwnd) {
             if let Some(w) = register_hotkey(hwnd, st) {
-                st.warns.push(w);
+                st.warns.push(w.clone());
+                st.alerts.push(w);
             }
             set_tray_tip(hwnd, st);
             start_load(hwnd, st, false);
@@ -576,7 +582,7 @@ unsafe fn start_load(hwnd: HWND, st: &mut State, keep: bool) {
                     let stamp = stamp.or_else(|| safe::file_stamp(path));
                     dicts.push(LoadedDict { error: None, corrupt: false, stamp, version });
                 }
-                Err(e) => dicts.push(LoadedDict { corrupt: safe::is_corrupt(&e), error: Some(e.to_string()), stamp, version: 0 }),
+                Err(e) => dicts.push(LoadedDict { corrupt: safe::is_corrupt(&e), error: Some(safe::open_error_text(path, *ro, &e)), stamp, version: 0 }),
             }
         }
         core::sort_entries(&mut entries);
@@ -773,7 +779,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         list_box: RECT::default(),
         pane: RECT::default(),
         status_top: 0,
-        warns: init.warns,
+        warns: init.warns.clone(),
         cfg: init.cfg,
         cfg_path: init.cfg_path,
         dicts: Vec::new(),
@@ -800,6 +806,8 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         img_mode: Cell::new(0),
         in_sizemove: Cell::new(false),
         img_width: Cell::new(0),
+        alerts: init.warns.clone(),
+        reported_errors: HashSet::new(),
         warned_version: HashSet::new(),
         btn_tags,
         bookmarks: if init_shared { Bookmarks::default() } else { Bookmarks::load(&bm_path) },
@@ -1105,8 +1113,10 @@ unsafe fn refresh(st: &mut State) {
         let (entries, map) = (&st.entries, &st.bm_map);
         st.matches.retain(|&i| map.contains_key(&(entries[i as usize].dict, entries[i as usize].id)));
     }
-    // 並び順(安定ソートなので、同じ日時の語は見出し語順のまま)
-    {
+    // 並び順(安定ソートなので、同じ日時の語は見出し語順のまま)。
+    // 検索しているときは、一致の度合いの順を優先する(並び順は、何も検索していないときの並び)
+    let searching = st.last_query.as_ref().map_or(false, |q| [&q.all, &q.word, &q.meaning, &q.tag].iter().any(|s| !s.trim().is_empty()));
+    if !searching {
         let (entries, map) = (&st.entries, &st.bm_map);
         match st.sort {
             Sort::Word => {}
@@ -1128,6 +1138,9 @@ unsafe fn refresh(st: &mut State) {
 
 /// リンクの開く先を、左下に表示するための文字列にする
 fn link_label(target: &str) -> String {
+    // 文字の向きを強制する文字が紛れていると、行き先の表示が偽装されるので、取り除いて表示する
+    let cleaned = core::clean_text(target).0;
+    let target = cleaned.as_str();
     if let Some(tag) = target.strip_prefix(TAG_SCHEME) {
         return format!("クリックすると、タグ「{tag}」の語を表示します");
     }
@@ -1368,13 +1381,19 @@ unsafe fn render(
     if !images.is_empty() && st.img_mode.get() != 3 {
         let mut slots = st.img_slots.borrow_mut();
         // 自動で読むのは、ファイルのパスだけ(URL などは、説明の文字のリンクのままにする)
-        for (a, b, path) in images.iter().filter(|i| pics::loadable(&i.2)).take(pics::MAX_IMAGES) {
+        let hosts = dict_hosts(st);
+        for (a, b, path) in images.iter().filter(|i| pics::loadable(&i.2) && pics::auto_load(&core::resolve_path(&i.2, base), &hosts)).take(pics::MAX_IMAGES) {
             let alt: String = body.encode_utf16().skip(*a).take(b - a).map(|u| char::from_u32(u as u32).unwrap_or(' ')).collect();
             slots.push(ImgSlot { start: (r_body.0 + a) as i32, end: (r_body.0 + b) as i32, path: core::resolve_path(path, base), alt, shown: None });
         }
         drop(slots);
         start_pics(st, gen);
     }
+}
+
+/// 辞書を置いている共有フォルダのサーバー(画像を自動で読んでよいサーバー)
+fn dict_hosts(st: &State) -> Vec<String> {
+    st.dicts.iter().filter_map(|d| pics::unc_host(&d.path.to_string_lossy())).collect()
 }
 
 /// 本文欄の、文字を並べる領域の幅
@@ -1627,7 +1646,13 @@ unsafe fn update_detail(st: &State) {
             parts.push(format!("更新 {}", core::format_jst(e.updated_at)));
             let meta = parts.join("    ·    ");
             // 意味の文中の [[語]]・[表示名](開く先)・URL をリンクに、![説明](パス) を画像にする(表示は、記法を外した形)
-            let parsed = core::parse_body(&e.meaning.replace("\r\n", "\n"));
+            // 古い版で保存した制御文字は、表示しない。極端に長い意味は、画面が固まらないように途中までにする
+            let mut shown = core::clean_text(&e.meaning.replace("\r\n", "\n")).0;
+            if shown.chars().count() > core::MAX_MEANING {
+                shown = shown.chars().take(core::MAX_MEANING).collect::<String>();
+                shown.push_str(&format!("\n\n…(長すぎるため、先頭の {} 文字だけを表示しています)", core::MAX_MEANING));
+            }
+            let parsed = core::parse_body(&shown);
             let (body, body_links) = (parsed.text, parsed.links);
             // 相対パスの基準は、その語の辞書ファイルのあるフォルダ
             let base = st.dicts.get(e.dict).and_then(|d| d.path.parent()).map(Path::to_path_buf).unwrap_or_default();
@@ -1676,6 +1701,21 @@ unsafe fn update_detail(st: &State) {
 
 /// 参照先を開く。Web ページはそのまま、ファイル等は確認してから開く。
 /// 共有の辞書には他の人が登録したリンクも入るため、実行ファイルには強い警告を出す。
+/// 本文に表示している、開く先が `target` のリンクの表示名
+unsafe fn link_labels(st: &State, target: &str) -> Vec<String> {
+    st.links
+        .borrow()
+        .iter()
+        .filter(|l| l.2.trim() == target)
+        .map(|l| {
+            let mut buf = vec![0u16; (l.1 - l.0).max(0) as usize + 1];
+            let tr = TEXTRANGEW { chrg: CHARRANGE { cpMin: l.0, cpMax: l.1 }, lpstrText: PWSTR(buf.as_mut_ptr()) };
+            let n = send(st.rich, EM_GETTEXTRANGE, 0, &tr as *const _ as isize).0 as usize;
+            String::from_utf16_lossy(&buf[..n.min(buf.len())])
+        })
+        .collect()
+}
+
 unsafe fn open_link(hwnd: HWND, st: &mut State, link: &str) {
     let link = link.trim().trim_matches('"').to_string();
     if link.is_empty() {
@@ -1687,7 +1727,7 @@ unsafe fn open_link(hwnd: HWND, st: &mut State, link: &str) {
     }
     // 画像: 拡張子が画像のものなら、確認なしで開く(それ以外は、ふつうのリンクと同じ確認をする)
     let (link, plain_image) = match link.strip_prefix(core::IMAGE_SCHEME) {
-        Some(p) => (p.to_string(), pics::has_image_ext(p) && pics::loadable(p)),
+        Some(p) => (p.to_string(), pics::has_image_ext(p) && pics::loadable(p) && pics::unc_host(p).map_or(true, |h| dict_hosts(st).contains(&h))),
         None => (link, false),
     };
     match core::link_kind(&link) {
@@ -1696,11 +1736,28 @@ unsafe fn open_link(hwnd: HWND, st: &mut State, link: &str) {
             jump_to_word(st, &word);
             return;
         }
-        core::LinkKind::Web => {}
+        core::LinkKind::Web => {
+            // 表示名が URL の形なのに、別のサーバーを指していたら、行き先を見せて確かめる
+            let disguised = link_labels(st, &link).iter().find(|l| core::label_disguised(l, &link)).cloned();
+            if let Some(label) = disguised {
+                let text = format!("リンクの表示「{label}」と、実際の行き先が違います。\n\n実際の行き先: {link}\n\n開きますか?");
+                if message_box(hwnd, &text, "参照先を開く(注意)", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES {
+                    return;
+                }
+            }
+        }
         core::LinkKind::Other if plain_image => {}
         core::LinkKind::Other => {
             let text = format!("次の参照先を開きますか?\n\n{link}");
             if message_box(hwnd, &text, "参照先を開く", MB_YESNO | MB_ICONQUESTION) != IDYES {
+                return;
+            }
+        }
+        core::LinkKind::Scheme => {
+            let text = format!(
+                "この参照先は、Windows に登録されたアプリを起動する形式です(Web ページやファイルではありません)。\n\n{link}\n\n登録した人と内容を信頼できる場合だけ開いてください。開きますか?"
+            );
+            if message_box(hwnd, &text, "参照先を開く(注意)", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES {
                 return;
             }
         }
@@ -2278,6 +2335,35 @@ unsafe fn do_open_link(hwnd: HWND, st: &mut State) {
 
 // ---- 操作: 新規登録 / 編集 / 削除 / 設定 -----------------------------------------
 
+/// 終了してよいか。「元に戻す」で取り消せる操作が残っているときは、たずねる(既定は「いいえ」)。
+/// Esc を続けて押して、意図せず終了したときに、直前の削除などを取り消せなくなるのを防ぐ
+unsafe fn confirm_quit(hwnd: HWND) -> bool {
+    let Some(label) = state(hwnd).and_then(|st| st.undo.as_ref().map(|u| u.label.clone())) else { return true };
+    let text = format!("終了すると、直前の操作({label})を元に戻せなくなります。\n終了しますか?");
+    message_box(hwnd, &text, "終了の確認", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES
+}
+
+/// 設定の誤りや、辞書を開けない問題を、確認の画面でまとめて知らせる(下段の小さな文字だけでは見落とすため)。
+/// 辞書を開けない問題は、同じ内容を起動中に1回だけ知らせる
+unsafe fn show_alerts(hwnd: HWND, st: &mut State) {
+    let mut lines: Vec<String> = std::mem::take(&mut st.alerts);
+    for d in &st.dicts {
+        if let Some(e) = &d.error {
+            if st.reported_errors.insert((d.path.clone(), e.clone())) {
+                lines.push(format!("辞書「{}」を開けません: {}\n    {}", d.name, e, d.path.display()));
+            }
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+    let text = format!(
+        "次の問題があります。\n\n{}\n\n設定は「設定」ボタン、またはトレイのアイコンの右クリック →「設定ファイルを開く」で直せます。",
+        lines.iter().map(|l| format!("・{l}")).collect::<Vec<_>>().join("\n")
+    );
+    message_box(hwnd, &text, "設定と辞書の確認", MB_OK | MB_ICONWARNING);
+}
+
 unsafe fn message_box(hwnd: HWND, text: &str, caption: &str, style: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESULT {
     let (t, c) = (wide(text), wide(caption));
     MessageBoxW(hwnd, PCWSTR(t.as_ptr()), PCWSTR(c.as_ptr()), style)
@@ -2324,6 +2410,25 @@ unsafe fn offer_restore(hwnd: HWND, st: &mut State, d: usize) {
                 MB_OK | MB_ICONERROR,
             );
         }
+    }
+}
+
+/// 保存できなかったとき、入力した内容を失わないように、クリップボードへ控えて知らせる
+/// (ほかの人が同時に同じ語を変更したときなど。登録の画面を開き直して、貼り付けて直せる)
+unsafe fn keep_input(hwnd: HWND, dlg: &EntryDlg) {
+    let mut text = format!("見出し語: {}\n", dlg.word);
+    if !dlg.reading.is_empty() {
+        text.push_str(&format!("読み: {}\n", dlg.reading));
+    }
+    if !dlg.tags.is_empty() {
+        text.push_str(&format!("タグ: {}\n", dlg.tags));
+    }
+    text.push_str(&format!("意味:\n{}\n", dlg.meaning));
+    if !dlg.link.is_empty() {
+        text.push_str(&format!("参照先:\n{}\n", dlg.link));
+    }
+    if ui::set_clipboard(hwnd, &text) {
+        message_box(hwnd, "保存できなかったため、入力した内容をクリップボードにコピーしました。\nこの後に出る説明を読んでから、必要なら貼り付けて入力し直してください。", "入力した内容を控えました", MB_OK | MB_ICONINFORMATION);
     }
 }
 
@@ -2519,7 +2624,10 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
             };
             notice(st, &msg);
         }
-        Err(e) => report_write_error(hwnd, st, d, e),
+        Err(e) => {
+            keep_input(hwnd, &dlg);
+            report_write_error(hwnd, st, d, e)
+        }
     }
 }
 
@@ -2577,7 +2685,10 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
             after_write(hwnd, st, e.dict, stale, Some((e.dict, e.id)));
             notice(st, &format!("「{}」を更新しました", dlg.word));
         }
-        Err(err) => report_write_error(hwnd, st, e.dict, err),
+        Err(err) => {
+            keep_input(hwnd, &dlg);
+            report_write_error(hwnd, st, e.dict, err)
+        }
     }
 }
 
@@ -2741,9 +2852,11 @@ unsafe fn reload_config(hwnd: HWND, st: &mut State) {
     let init = load_config();
     st.cfg = init.cfg;
     st.cfg_path = init.cfg_path;
-    st.warns = init.warns;
+    st.warns = init.warns.clone();
+    st.alerts = init.warns;
     if let Some(w) = register_hotkey(hwnd, st) {
-        st.warns.push(w);
+        st.warns.push(w.clone());
+        st.alerts.push(w);
     }
     set_tray_tip(hwnd, st);
     if st.bm_view {
@@ -2905,6 +3018,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     st.warns.clear();
                     notice(st, &w);
                 }
+                show_alerts(hwnd, st);
                 // 壊れている辞書は、ローカルのバックアップから復元するかたずねる(辞書ごとに1回だけ)
                 for i in corrupt {
                     if st.asked_restore.insert(st.dicts[i].path.clone()) {
@@ -3159,7 +3273,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 }
                             }
                             MENU_EXIT => {
-                                let _ = DestroyWindow(hwnd);
+                                if confirm_quit(hwnd) {
+                                    let _ = DestroyWindow(hwnd);
+                                }
                             }
                             _ => {}
                         }
@@ -3174,7 +3290,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let hide = state(hwnd).map_or(false, |st| st.cfg.close_to_tray);
             if hide {
                 let _ = ShowWindow(hwnd, SW_HIDE);
-            } else {
+            } else if confirm_quit(hwnd) {
                 let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)

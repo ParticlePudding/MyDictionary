@@ -24,6 +24,7 @@ const ID_CANCEL: usize = 2;
 const EN_SETFOCUS_: usize = 0x0100;
 const EN_KILLFOCUS_: usize = 0x0200;
 const EN_CHANGE_: usize = 0x0300;
+const EN_MAXTEXT_: usize = 0x0501;
 const CB_ADDSTRING: u32 = 0x0143;
 const CB_GETCURSEL: u32 = 0x0147;
 const CB_SETCURSEL: u32 = 0x014E;
@@ -412,6 +413,18 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             button(hwnd, "保存", ID_OK, (s(m + fw - 2 * BTN_W - 10), s(y), s(BTN_W), s(CTL_H)), true);
             button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
 
+            // 入力できる文字数(既定の上限は約3万字で、超えた分は黙って切られる。上限を広げ、超えたら知らせる)
+            // すでに上限より長い語(古い版で取り込んだもの)は、切らずに表示する(保存のときに知らせる)
+            let len16 = |s: &str| s.encode_utf16().count() + s.matches('\n').count();
+            for (h, max, cur) in [
+                (word, core::MAX_WORD, len16(&d.word)),
+                (reading, core::MAX_READING, len16(&d.reading)),
+                (tags, core::MAX_TAGS, len16(&d.tags)),
+                (meaning, core::MAX_MEANING, len16(&d.meaning)),
+                (link, core::MAX_LINK, len16(&d.link)),
+            ] {
+                send(h, EM_SETLIMITTEXT, max.max(cur), 0);
+            }
             set_text(word, &d.word);
             set_text(reading, &d.reading);
             set_text(link, &d.link.replace("\r\n", "\n").replace('\n', "\r\n"));
@@ -470,6 +483,17 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 (E_WORD | E_READING | E_TAGS | E_MEANING | E_LINK, EN_SETFOCUS_ | EN_KILLFOCUS_) => {
                     ui::invalidate_field(hwnd, &c.fields, HWND(lparam.0 as *mut c_void));
                 }
+                // 文字数の上限に達した(貼り付けた分の後ろが入らなかった)
+                (E_WORD | E_READING | E_TAGS | E_MEANING | E_LINK, EN_MAXTEXT_) => {
+                    let (name, max) = match id {
+                        E_WORD => ("見出し語", core::MAX_WORD),
+                        E_READING => ("読み", core::MAX_READING),
+                        E_TAGS => ("タグ", core::MAX_TAGS),
+                        E_MEANING => ("意味", core::MAX_MEANING),
+                        _ => ("参照先", core::MAX_LINK),
+                    };
+                    set_text(c.err, &format!("{name}は {max} 文字までです。入りきらなかった分は入力されていません"));
+                }
                 (E_WORD | E_TAGS | E_MEANING, EN_CHANGE_) => {
                     if !ui::is_busy() {
                         set_text(c.err, "");
@@ -509,6 +533,8 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                     } else if meaning.is_empty() {
                         set_text(c.err, "意味を入力してください");
                         let _ = SetFocus(c.meaning);
+                    } else if let Some((name, max)) = core::too_long(&word, &get_text(c.reading), &meaning, &get_text(c.tags), &get_text(c.link).replace("\r\n", "\n")) {
+                        set_text(c.err, &format!("{name}が長すぎます({max} 文字まで)。短くしてから保存してください"));
                     } else if !confirm_same_word(hwnd, c, &word) {
                         let _ = SetFocus(c.word);
                     } else {
@@ -533,11 +559,13 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                                 }
                             }
                         }
-                        d.word = word;
-                        d.reading = get_text(c.reading).trim().to_string();
-                        d.meaning = meaning;
-                        d.tags = core::normalize_tags(&get_text(c.tags));
-                        d.link = get_text(c.link).replace("\r\n", "\n").lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
+                        // 制御文字と、文字の向きを強制する文字は、保存しない(貼り付けた文に紛れていることがある)
+                        let clean = |s: String| core::clean_text(&s).0;
+                        d.word = clean(word);
+                        d.reading = clean(get_text(c.reading).trim().to_string());
+                        d.meaning = clean(meaning);
+                        d.tags = core::normalize_tags(&clean(get_text(c.tags)));
+                        d.link = clean(get_text(c.link).replace("\r\n", "\n").lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n"));
                         if d.show_choice {
                             let sel = send(c.combo, CB_GETCURSEL, 0, 0).0;
                             if sel >= 0 {
@@ -549,7 +577,9 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                     }
                 }
                 (ID_CANCEL, _) => {
-                    let _ = DestroyWindow(hwnd);
+                    if confirm_discard(hwnd, c) {
+                        let _ = DestroyWindow(hwnd);
+                    }
                 }
                 _ => {}
             }
@@ -586,7 +616,9 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             LRESULT(0)
         }
         WM_CLOSE => {
-            let _ = DestroyWindow(hwnd);
+            if ctl.is_null() || confirm_discard(hwnd, &*ctl) {
+                let _ = DestroyWindow(hwnd);
+            }
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -699,6 +731,12 @@ unsafe fn current_target(c: &EntryCtl) -> Option<usize> {
 }
 
 /// 見出し語以外の欄が、開いたときから変わっているか
+/// 入力した内容があるのに閉じようとしたとき、捨ててよいかをたずねる(既定は「いいえ」)。閉じてよければ true
+unsafe fn confirm_discard(hwnd: HWND, c: &EntryCtl) -> bool {
+    let changed = get_text(c.word).trim() != (*c.data).word.trim() || entry_modified(c) || !c.pending_pics.is_empty();
+    !changed || msg_box(hwnd, "入力した内容は保存されていません。\n保存せずに閉じますか?", "確認", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES
+}
+
 unsafe fn entry_modified(c: &EntryCtl) -> bool {
     let d = &*c.data;
     let norm = |s: &str| s.replace("\r\n", "\n").trim().to_string();
@@ -1209,7 +1247,7 @@ label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(2
                     if let Some(p) = pick_db_path(hwnd, "") {
                         let path = PathBuf::from(&p);
                         let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "新しい辞書".into());
-                        d.cfg.dicts.push(DictConf { name, path, readonly: false });
+                        d.cfg.dicts.push(DictConf { id: String::new(), name, path, readonly: false });
                         let n = d.cfg.dicts.len() - 1;
                         reload_list(c, Some(n));
                         set_text(c.err, "");
@@ -1277,6 +1315,12 @@ label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(2
                     }
                     if d.cfg.dicts.iter().any(|x| x.path.as_os_str().is_empty()) {
                         set_text(c.err, "辞書のパスを入力してください");
+                        return LRESULT(0);
+                    }
+                    // 参照のみの辞書は、ファイルを新しく作らない。無いファイルを参照のみにすると開けないので、ここで止める
+                    let base = d.cfg_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                    if let Some(x) = d.cfg.dicts.iter().find(|x| x.readonly && !(if x.path.is_absolute() { x.path.clone() } else { base.join(&x.path) }).exists()) {
+                        set_text(c.err, &format!("辞書「{}」は参照のみですが、ファイルがありません。パスを確かめるか、参照のみを外してください", x.name.trim()));
                         return LRESULT(0);
                     }
                     // ホットキー: 変更されていなければ元の値(Win キー等を含む)を保持
@@ -1348,16 +1392,36 @@ struct LicenseCtl {
     footer_line: i32,
 }
 
+/// 長い文章を読むための画面(ライセンス情報、取り込みの詳細)の中身
+struct TextView {
+    heading: String,
+    note: String,
+    body: String,
+}
+
 /// ライセンス情報の画面(このアプリのライセンスと、使用しているオープンソースソフトウェアのライセンス)
 pub unsafe fn license_dialog(owner: HWND) {
     let title = format!("ライセンス情報 - {}", ui::APP_NAME);
-    run_modal(owner, w!("MyDictionaryLicense"), &title, LICENSE_W, LICENSE_H, std::ptr::null());
+    let view = TextView {
+        heading: "ライセンス情報".into(),
+        note: format!("{} は MIT License で提供しています。また、以下のオープンソースソフトウェアを使用しています。", ui::APP_NAME),
+        body: license::full_text(ui::APP_NAME, ui::APP_VERSION),
+    };
+    run_modal(owner, w!("MyDictionaryLicense"), &title, LICENSE_W, LICENSE_H, &view as *const TextView as *const c_void);
+}
+
+/// 長い文章を、読み取り専用で表示する(すべてコピー・閉じる)
+unsafe fn text_dialog(owner: HWND, title: &str, heading: &str, note: &str, body: &str) {
+    let view = TextView { heading: heading.into(), note: note.into(), body: body.into() };
+    run_modal(owner, w!("MyDictionaryLicense"), title, LICENSE_W, LICENSE_H, &view as *const TextView as *const c_void);
 }
 
 unsafe extern "system" fn license_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let ctl = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut LicenseCtl;
     match msg {
         WM_CREATE => {
+            let cs = &*(lparam.0 as *const CREATESTRUCTW);
+            let view = &*(cs.lpCreateParams as *const TextView);
             let dpi = GetDpiForWindow(hwnd).max(96) as i32;
             let s = |v: i32| scale(v, dpi);
             let fonts = Fonts::new(dpi);
@@ -1366,22 +1430,16 @@ unsafe extern "system" fn license_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
             let (m, fw) = (24, LICENSE_W - 48);
             let mut fields = Vec::new();
             let mut y = 20;
-            label(hwnd, "ライセンス情報", (s(m), s(y), s(fw), s(24)), fonts.heading, 0);
+            label(hwnd, &view.heading, (s(m), s(y), s(fw), s(24)), fonts.heading, 0);
             y += 30;
-            label(
-                hwnd,
-                &format!("{} は MIT License で提供しています。また、以下のオープンソースソフトウェアを使用しています。", ui::APP_NAME),
-                (s(m), s(y), s(fw), s(40)),
-                fonts.small,
-                S_MUTED,
-            );
+            label(hwnd, &view.note, (s(m), s(y), s(fw), s(40)), fonts.small, S_MUTED);
             y += 46;
             let footer_y = LICENSE_H - CTL_H - 16;
             let text_h = footer_y - 16 - y;
             let text = ui::field(hwnd, L_TEXT, (s(m), s(y), s(fw), s(text_h)), dpi, true, &mut fields, mono);
             send(text, EM_SETREADONLY, 1, 0);
             send(text, EM_SETLIMITTEXT, 0, 0);
-            let body = license::to_crlf(&license::full_text(ui::APP_NAME, ui::APP_VERSION));
+            let body = license::to_crlf(&view.body);
             set_text(text, &body);
             send(text, EM_SETSEL, 0, 0);
             let footer_line = s(footer_y - 16);
@@ -1512,18 +1570,34 @@ unsafe fn decode_text(bytes: &[u8]) -> Option<String> {
 /// 取り込みの確認画面。3つの扱い(両方残す・上書き・飛ばす)から選んでもらう。
 /// `plans` は、それぞれを選んだときの見込み。キャンセルなら None。
 /// 選択肢つきの標準の確認画面(TaskDialog)を使う。使えない環境では、これまでと同じ「両方残す」だけの確認にする
-unsafe fn ask_import_mode(owner: HWND, dict_name: &str, total: usize, preview: &str, plans: &[import::Outcome; 3]) -> Option<import::Mode> {
+/// 取り込みの確認画面で、「上書きの詳細を表示…」が押されたとき(`lprefdata` は詳細の文字列へのポインタ)
+unsafe extern "system" fn import_dialog_callback(hwnd: HWND, msg: TASKDIALOG_NOTIFICATIONS, _w: WPARAM, _l: LPARAM, lprefdata: isize) -> windows::core::HRESULT {
+    if msg == TDN_HYPERLINK_CLICKED && lprefdata != 0 {
+        let details = &*(lprefdata as *const String);
+        text_dialog(hwnd, "上書きの詳細", "「ファイルの内容で上書きする」を選んだときに変わる内容", "すべての語と、項目ごとの変更です。「空にする」は、ファイルのその列が空だったため、値が消えることを表します。", details);
+    }
+    windows::core::HRESULT(0)
+}
+
+unsafe fn ask_import_mode(owner: HWND, dict_name: &str, total: usize, preview: &str, plans: &[import::Outcome; 3], prefer_overwrite: bool) -> Option<import::Mode> {
     const ID_GO: i32 = 1; // IDOK
     const R_KEEP: i32 = 101;
     const R_OVER: i32 = 102;
     const R_SKIP: i32 = 103;
     let title = wide("取り込み");
     let main = wide(&format!("{total} 件を、辞書「{dict_name}」に取り込みます"));
-    let content = wide(&format!("{preview}\n同じ見出し語の語がすでにあるときの扱いを選んでください。"));
+    // 上書きを選んだときに何が起きるかを、別の画面で見られるようにする(全件と、項目ごとの変更)
+    let details = import::overwrite_details(&plans[1]);
+    // 確認の画面の本文は、<a> を記号として読むので、語の中の < は全角にしておく
+    let preview = preview.replace('<', "＜");
+    let link = if details.is_empty() { String::new() } else { "\n<a href=\"details\">上書きの詳細を表示…</a>(全件と、項目ごとの変更)\n".to_string() };
+    let content = wide(&format!("{preview}{link}\n同じ見出し語の語がすでにあるときの扱いを選んでください。"));
+    // ボタンの文字の & は、キー操作の印として読まれるので、&& にする
+    let amp = |s: String| s.replace('&', "&&");
     let radios_text = [
-        wide(&format!("両方残す(これまでの動作): {}", plans[0].summary())),
-        wide(&format!("ファイルの内容で上書きする: {}", plans[1].summary())),
-        wide(&format!("見出し語がすでにある語は取り込まない: {}", plans[2].summary())),
+        wide(&amp(format!("両方残す(同じ見出し語でも、別の語として追加する): {}", plans[0].summary()))),
+        wide(&amp(format!("ファイルの内容で上書きする: {}", plans[1].summary()))),
+        wide(&amp(format!("見出し語がすでにある語は取り込まない: {}", plans[2].summary()))),
     ];
     let radios = [
         TASKDIALOG_BUTTON { nButtonID: R_KEEP, pszButtonText: PCWSTR(radios_text[0].as_ptr()) },
@@ -1535,14 +1609,10 @@ unsafe fn ask_import_mode(owner: HWND, dict_name: &str, total: usize, preview: &
         TASKDIALOG_BUTTON { nButtonID: ID_GO, pszButtonText: PCWSTR(go.as_ptr()) },
         TASKDIALOG_BUTTON { nButtonID: 2 /* IDCANCEL */, pszButtonText: PCWSTR(cancel.as_ptr()) },
     ];
-    // 上書きを選んだときに何が起きるかを、「詳細」に出す
-    let details = import::overwrite_details(&plans[1]);
-    let details_w = wide(&details);
-    let (show, hide) = (wide("上書きの詳細を表示"), wide("詳細を隠す"));
-    let mut cfg = TASKDIALOGCONFIG {
+    let cfg = TASKDIALOGCONFIG {
         cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
         hwndParent: owner,
-        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW,
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW | TDF_ENABLE_HYPERLINKS,
         pszWindowTitle: PCWSTR(title.as_ptr()),
         pszMainInstruction: PCWSTR(main.as_ptr()),
         pszContent: PCWSTR(content.as_ptr()),
@@ -1551,15 +1621,13 @@ unsafe fn ask_import_mode(owner: HWND, dict_name: &str, total: usize, preview: &
         nDefaultButton: ID_GO,
         cRadioButtons: radios.len() as u32,
         pRadioButtons: radios.as_ptr(),
-        nDefaultRadioButton: R_KEEP,
+        // 書き出したファイル(管理用の列がある)を取り込むときは、上書きを最初から選んでおく
+        nDefaultRadioButton: if prefer_overwrite { R_OVER } else { R_KEEP },
         cxWidth: 300,
+        pfCallback: Some(import_dialog_callback),
+        lpCallbackData: &details as *const String as isize,
         ..Default::default()
     };
-    if !details.is_empty() {
-        cfg.pszExpandedInformation = PCWSTR(details_w.as_ptr());
-        cfg.pszCollapsedControlText = PCWSTR(show.as_ptr());
-        cfg.pszExpandedControlText = PCWSTR(hide.as_ptr());
-    }
     let (mut button, mut radio) = (0i32, 0i32);
     if TaskDialogIndirect(&cfg, Some(&mut button), Some(&mut radio), None).is_ok() {
         return match (button, radio) {
@@ -1580,6 +1648,12 @@ unsafe fn ask_import_mode(owner: HWND, dict_name: &str, total: usize, preview: &
 /// ファイルを選び、確認のうえ辞書へ取り込む。取り込んだら、結果と、元に戻すための記録を返す
 unsafe fn import_into(owner: HWND, dict: &DictConf, backup_root: &std::path::Path) -> Option<(import::Outcome, Undo)> {
     let file = pick_import_file(owner)?;
+    // 大きすぎるファイルは読まない(誤って選んだファイルや、細工したファイルで、アプリが固まらないように)
+    const MAX_FILE: u64 = 200 * 1024 * 1024;
+    if std::fs::metadata(&file).map_or(false, |m| m.len() > MAX_FILE) {
+        msg_box(owner, "ファイルが大きすぎます(200MB まで)。分けてから取り込んでください。", "インポート", MB_OK | MB_ICONERROR);
+        return None;
+    }
     let bytes = match std::fs::read(&file) {
         Ok(b) => b,
         Err(e) => {
@@ -1594,17 +1668,20 @@ unsafe fn import_into(owner: HWND, dict: &DictConf, backup_root: &std::path::Pat
     // 拡張子が .json、または中身が [ か { で始まっていれば JSON として読む
     let head = text.trim_start_matches('\u{feff}').trim_start();
     let is_json = file.to_lowercase().ends_with(".json") || head.starts_with('[') || head.starts_with('{');
-    let (rows, skipped) = if is_json {
+    let (rows, skipped, notes) = if is_json {
         match json_io::parse(&text) {
-            Ok(r) => r,
+            Ok((r, s)) => (r, s, Vec::new()),
             Err(e) => {
                 msg_box(owner, &format!("取り込めません。\n\n{e}"), "インポート", MB_OK | MB_ICONERROR);
                 return None;
             }
         }
     } else {
-        import::to_rows(import::parse_table(&text, import::sniff_delim(&text, &file)))
+        let c = import::to_rows_detail(import::parse_table(&text, import::sniff_delim(&text, &file)));
+        (c.rows, c.skipped, c.notes)
     };
+    // 制御文字を取り除き、長すぎる語を外す
+    let (rows, too_long, cleaned) = import::screen(rows);
     if rows.is_empty() {
         msg_box(
             owner,
@@ -1625,6 +1702,21 @@ unsafe fn import_into(owner: HWND, dict: &DictConf, backup_root: &std::path::Pat
     if skipped > 0 {
         preview.push_str(&format!("(見出し語か意味が空の {skipped} 行は取り込みません)\n"));
     }
+    if !too_long.is_empty() {
+        preview.push_str(&format!(
+            "(長すぎる欄のある {} 行は取り込みません。意味は {} 文字まで: {}{})\n",
+            too_long.len(),
+            core::MAX_MEANING,
+            too_long.iter().take(3).cloned().collect::<Vec<_>>().join("、"),
+            if too_long.len() > 3 { "…" } else { "" }
+        ));
+    }
+    if cleaned > 0 {
+        preview.push_str(&format!("({cleaned} 行から、表示に使わない制御文字を取り除きました)\n"));
+    }
+    for n in &notes {
+        preview.push_str(&format!("※ {n}\n"));
+    }
 
     // 3つの扱いそれぞれの見込みを出す(辞書は変更しない)。まだ無い辞書は、ここで作られる
     let old = SetCursor(LoadCursorW(None, IDC_WAIT).unwrap());
@@ -1636,11 +1728,12 @@ unsafe fn import_into(owner: HWND, dict: &DictConf, backup_root: &std::path::Pat
     let plans = match plans {
         Ok(p) => p,
         Err(e) => {
-            msg_box(owner, &format!("辞書を読み込めません。\n\n{e}"), "インポート", MB_OK | MB_ICONERROR);
+            msg_box(owner, &format!("辞書を読み込めません。\n\n{}", safe::open_error_text(&dict.path, dict.readonly, &e)), "インポート", MB_OK | MB_ICONERROR);
             return None;
         }
     };
-    let mode = ask_import_mode(owner, &dict.name, rows.len(), &preview, &plans)?;
+    let prefer_overwrite = rows.iter().any(|r| r.key.is_some());
+    let mode = ask_import_mode(owner, &dict.name, rows.len(), &preview, &plans, prefer_overwrite)?;
 
     // 書き込みの中で、もう一度照合し直す(確認している間に、ほかの人が変更しているかもしれないため)
     let old = SetCursor(LoadCursorW(None, IDC_WAIT).unwrap());
@@ -1649,9 +1742,17 @@ unsafe fn import_into(owner: HWND, dict: &DictConf, backup_root: &std::path::Pat
     match r {
         Ok((out, undo)) => {
             let mut text = format!("{}。\n", out.summary());
-            let details = import::overwrite_details(&import::Outcome { changes: Vec::new(), ..out.clone() });
-            if !details.is_empty() {
-                text.push_str(&format!("\n{details}"));
+            // 上書きしなかった語などは、先頭の数件だけ出す(多いときは、件数を出す)
+            for (title, items) in [("書き出した後に変更されたため、上書きしなかった語", &out.conflicts), ("同じ見出し語が複数あるため、追加として扱った語", &out.ambiguous)] {
+                if !items.is_empty() {
+                    text.push_str(&format!("\n{title}({} 件)\n", items.len()));
+                    for w in items.iter().take(8) {
+                        text.push_str(&format!("  ・{w}\n"));
+                    }
+                    if items.len() > 8 {
+                        text.push_str(&format!("  …ほか {} 件\n", items.len() - 8));
+                    }
+                }
             }
             if !undo.is_empty() {
                 text.push_str("\nこの取り込みは、設定の画面を閉じたあと、メイン画面の下段の「元に戻す」で取り消せます。");
