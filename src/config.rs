@@ -582,7 +582,8 @@ mod tests {
     #[test]
     fn manual_examples_parse_cleanly() {
         // 説明書(docs/manual.md)の ini の例を、そのまま設定ファイルにしても、警告が出ず、書いたとおりに効くこと
-        let manual = include_str!("../docs/manual.md");
+        // Windows で取り出したファイルは、行末が CRLF になっていることがあるので、そろえてから探す
+        let manual = include_str!("../docs/manual.md").replace("\r\n", "\n");
         let blocks: Vec<&str> = manual.split("```ini\n").skip(1).map(|b| b.split("```").next().unwrap_or("")).collect();
         assert!(blocks.len() >= 2);
         for b in &blocks {
