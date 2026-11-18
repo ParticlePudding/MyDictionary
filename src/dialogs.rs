@@ -71,9 +71,14 @@ unsafe fn register_classes() {
 
 /// モーダルダイアログを作って、閉じるまでメッセージを処理する
 unsafe fn run_modal(owner: HWND, class: PCWSTR, title: &str, client_w: i32, client_h: i32, param: *const c_void) {
+    run_modal_ex(owner, class, title, client_w, client_h, param, false)
+}
+
+/// `resizable` なら、枠をつかんで大きさを変えられる画面にする
+unsafe fn run_modal_ex(owner: HWND, class: PCWSTR, title: &str, client_w: i32, client_h: i32, param: *const c_void, resizable: bool) {
     register_classes();
     let dpi = GetDpiForWindow(owner).max(96) as i32;
-    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU | if resizable { WS_THICKFRAME | WS_MAXIMIZEBOX } else { WINDOW_STYLE(0) };
     let mut rc = RECT { left: 0, top: 0, right: scale(client_w, dpi), bottom: scale(client_h, dpi) };
     let _ = AdjustWindowRectExForDpi(&mut rc, style, false, WS_EX_DLGMODALFRAME, dpi as u32);
     let (ww, wh) = (rc.right - rc.left, rc.bottom - rc.top);
@@ -159,7 +164,7 @@ unsafe fn button(parent: HWND, text: &str, id: usize, (x, y, w, h): (i32, i32, i
     let hinst = GetModuleHandleW(None).unwrap();
     let t = wide(text);
     let style = WS_CHILD.0 | WS_VISIBLE.0 | 0x0B /* BS_OWNERDRAW */ | if tab { WS_TABSTOP.0 } else { 0 };
-    CreateWindowExW(
+    let b = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         w!("BUTTON"),
         PCWSTR(t.as_ptr()),
@@ -173,7 +178,9 @@ unsafe fn button(parent: HWND, text: &str, id: usize, (x, y, w, h): (i32, i32, i
         hinst,
         None,
     )
-    .unwrap()
+    .unwrap();
+    ui::track_hover(b);
+    b
 }
 
 unsafe fn checkbox(parent: HWND, text: &str, id: usize, (x, y, w, h): (i32, i32, i32, i32), fnt: HFONT, checked: bool) -> HWND {
@@ -262,6 +269,13 @@ struct EntryCtl {
     fields: Vec<(RECT, HWND)>,
     /// 「画像を追加…」で選んだ画像: (元のファイル, 意味の欄に書いたパス)。コピーは、保存を押したときに行う
     pending_pics: Vec<(PathBuf, String)>,
+    /// 画面の大きさを変えたときの配置のための、最初の位置: (部品, 最初の位置, 枠付きの入力欄か)
+    anchors: Vec<(HWND, RECT, bool)>,
+    /// 最初の画面の大きさ(内側)と、ウィンドウの大きさ(これより小さくはできない)
+    base: (i32, i32),
+    min_track: (i32, i32),
+    /// 最初の、意味の欄の下端(これより下の部品は、画面を縦に広げた分だけ下へ動かす)
+    meaning_bottom: i32,
 }
 
 /// 見出し語の欄の下に出す、重複の知らせの行の高さ
@@ -277,7 +291,7 @@ pub unsafe fn entry_dialog(owner: HWND, data: &mut EntryDlg) -> bool {
     data.ok = false;
     let h = entry_height(data.show_choice);
     let title = data.title.clone();
-    run_modal(owner, w!("MyDictionaryEntry"), &title, 540, h, data as *mut EntryDlg as *const c_void);
+    run_modal_ex(owner, w!("MyDictionaryEntry"), &title, 540, h, data as *mut EntryDlg as *const c_void, true);
     data.ok
 }
 
@@ -378,6 +392,11 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             label(hwnd, "参照先(任意。1行に1つ。「表示名 | URL」と書くと表示名を付けられます)", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
             let link = ui::field(hwnd, E_LINK, (s(m), s(y + 22), s(fw), s(76)), dpi, true, &mut fields, fonts.base);
             y += 22 + 76 + 12;
+            // Tab の順番: 入力欄(見出し語 → 読み → タグ → 意味 → 参照先)を先に、リンク(「画像を追加…」「その語を表示」)は後に回す
+            // (知らせのリンクが出たり消えたりしても、欄の間の移動の順番が変わらないように)
+            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+            let _ = SetWindowPos(add_pic, link, 0, 0, 0, 0, flags);
+            let _ = SetWindowPos(dup_link, add_pic, 0, 0, 0, 0, flags);
 
             let hinst = GetModuleHandleW(None).unwrap();
             let combo = CreateWindowExW(
@@ -432,7 +451,45 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             set_text(meaning, &d.meaning.replace("\r\n", "\n").replace('\n', "\r\n"));
             let _ = SetWindowTextW(hwnd, PCWSTR(wide(&d.title).as_ptr()));
 
-            let c = Box::new(EntryCtl { data, fonts, dpi, word, reading, tags, meaning, link, combo, err, dup, dup_link, fields, pending_pics: Vec::new() });
+            // 画面の大きさを変えたときのために、各部品の最初の位置を控える
+            let mut crc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut crc);
+            let mut wrc = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wrc);
+            let meaning_bottom = fields.iter().find(|f| f.1 == meaning).map_or(0, |f| f.0.bottom);
+            let mut anchors: Vec<(HWND, RECT, bool)> = fields.iter().map(|f| (f.1, f.0, true)).collect();
+            unsafe extern "system" fn collect(child: HWND, lp: LPARAM) -> BOOL {
+                let v = &mut *(lp.0 as *mut Vec<(HWND, RECT, bool)>);
+                if !v.iter().any(|a| a.0 == child) {
+                    let mut r = RECT::default();
+                    let _ = GetWindowRect(child, &mut r);
+                    let mut pts = [POINT { x: r.left, y: r.top }, POINT { x: r.right, y: r.bottom }];
+                    MapWindowPoints(None, GetParent(child).unwrap_or_default(), &mut pts);
+                    v.push((child, RECT { left: pts[0].x, top: pts[0].y, right: pts[1].x, bottom: pts[1].y }, false));
+                }
+                TRUE
+            }
+            let _ = EnumChildWindows(hwnd, Some(collect), LPARAM(&mut anchors as *mut _ as isize));
+            let c = Box::new(EntryCtl {
+                data,
+                fonts,
+                dpi,
+                word,
+                reading,
+                tags,
+                meaning,
+                link,
+                combo,
+                err,
+                dup,
+                dup_link,
+                fields,
+                pending_pics: Vec::new(),
+                anchors,
+                base: (crc.right, crc.bottom),
+                min_track: (wrc.right - wrc.left, wrc.bottom - wrc.top),
+                meaning_bottom,
+            });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(c) as isize);
             update_dup(&*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const EntryCtl));
             let _ = SetFocus(word);
@@ -564,7 +621,7 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         d.word = clean(word);
                         d.reading = clean(get_text(c.reading).trim().to_string());
                         d.meaning = clean(meaning);
-                        d.tags = core::normalize_tags(&clean(get_text(c.tags)));
+                        d.tags = unify_tags(hwnd, &d.all_tags, &core::normalize_tags(&clean(get_text(c.tags))));
                         d.link = clean(get_text(c.link).replace("\r\n", "\n").lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n"));
                         if d.show_choice {
                             let sel = send(c.combo, CB_GETCURSEL, 0, 0).0;
@@ -608,6 +665,48 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         let _ = DestroyWindow(hwnd);
                     }
                 }
+            }
+            LRESULT(0)
+        }
+        WM_GETMINMAXINFO => {
+            if !ctl.is_null() {
+                let mmi = &mut *(lparam.0 as *mut MINMAXINFO);
+                mmi.ptMinTrackSize = POINT { x: (*ctl).min_track.0, y: (*ctl).min_track.1 };
+            }
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            // 大きさを変えたら: 意味の欄を広げ、その下の部品は下へ、右端の部品は右へ動かす。幅いっぱいの欄は伸ばす
+            if !ctl.is_null() && wparam.0 != 1 /* SIZE_MINIMIZED */ {
+                let c = &mut *ctl;
+                let (w, h) = ((lparam.0 & 0xFFFF) as i32, ((lparam.0 >> 16) & 0xFFFF) as i32);
+                let (dx, dy) = ((w - c.base.0).max(0), (h - c.base.1).max(0));
+                let (w0, mb) = (c.base.0, c.meaning_bottom);
+                let edge = scale(30, c.dpi);
+                for (hc, r, is_field) in c.anchors.clone() {
+                    let mut n = r;
+                    let wide = r.left < w0 / 2 && r.right > w0 - edge; // 左から右端まで
+                    let right_side = r.left >= w0 / 2; // 右側の部品(「選ぶ…」、保存・キャンセルなど)
+                    let left_to_mid = r.left < w0 / 2 && r.right > w0 / 2 && !wide; // タグの欄(右に「選ぶ…」)
+                    if wide || left_to_mid {
+                        n.right += dx;
+                    } else if right_side {
+                        n.left += dx;
+                        n.right += dx;
+                    }
+                    if hc == c.meaning {
+                        n.bottom += dy;
+                    } else if r.top >= mb {
+                        n.top += dy;
+                        n.bottom += dy;
+                    }
+                    if is_field {
+                        ui::place_field(hc, (n.left, n.top, n.right - n.left, n.bottom - n.top), c.dpi, hc == c.meaning || hc == c.link, &mut c.fields);
+                    } else {
+                        let _ = MoveWindow(hc, n.left, n.top, n.right - n.left, n.bottom - n.top, false);
+                    }
+                }
+                let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
             }
             LRESULT(0)
         }
@@ -731,6 +830,28 @@ unsafe fn current_target(c: &EntryCtl) -> Option<usize> {
 }
 
 /// 見出し語以外の欄が、開いたときから変わっているか
+/// 入力したタグに、すでにあるタグと書き方だけが違うもの(「it」と「IT」、全角と半角)があれば、
+/// すでにある書き方にそろえるかをたずねる(既定は「はい」)。タグの一覧で、似たタグが黙って増えないように
+unsafe fn unify_tags(hwnd: HWND, existing: &[(String, usize)], tags: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for t in tags.split(' ').filter(|t| !t.is_empty()) {
+        let same = existing.iter().any(|(e, _)| e == t);
+        let similar = existing.iter().filter(|(e, _)| e != t && core::fold(e) == core::fold(t)).max_by_key(|(_, n)| *n);
+        match similar {
+            Some((e, n)) if !same => {
+                let q = format!("タグ「{t}」は、すでにあるタグ「{e}」({n} 語)と、書き方だけが違います。\n「{e}」にそろえますか?\n\n(「いいえ」なら、「{t}」のまま、別のタグとして保存します)");
+                if msg_box(hwnd, &q, "タグの書き方", MB_YESNO | MB_ICONQUESTION) == IDYES {
+                    out.push(e.clone());
+                    continue;
+                }
+                out.push(t.to_string());
+            }
+            _ => out.push(t.to_string()),
+        }
+    }
+    core::normalize_tags(&out.join(" "))
+}
+
 /// 入力した内容があるのに閉じようとしたとき、捨ててよいかをたずねる(既定は「いいえ」)。閉じてよければ true
 unsafe fn confirm_discard(hwnd: HWND, c: &EntryCtl) -> bool {
     let changed = get_text(c.word).trim() != (*c.data).word.trim() || entry_modified(c) || !c.pending_pics.is_empty();
@@ -2086,6 +2207,8 @@ struct TagsCtl {
     checks: Vec<bool>,
     /// 一覧の行 → `data.tags` の添字(絞り込みで、一部だけを表示しているため)
     rows: Vec<usize>,
+    /// 並べ方: 0 = 名前の順、1 = 語数の多い順(列の見出しをクリックして切り替える)
+    sort: u8,
 }
 
 /// タグの一覧を表示する。OK なら true(結果は `data.checked`)。
@@ -2103,6 +2226,9 @@ unsafe fn tags_fill(c: &mut TagsCtl) {
     let d = &*c.data;
     let key = core::fold(get_text(c.filter).trim());
     c.rows = (0..d.tags.len()).filter(|&i| key.is_empty() || core::fold(&d.tags[i].0).contains(&key)).collect();
+    if c.sort == 1 {
+        c.rows.sort_by_key(|&i| std::cmp::Reverse(d.tags[i].1)); // 語数の多い順(同じ数は名前の順)
+    }
     let (list, rows, checks) = (c.list, &c.rows, &c.checks);
     ui::quiet(|| {
         send(list, LVM_DELETEALLITEMS_, 0, 0);
@@ -2112,6 +2238,11 @@ unsafe fn tags_fill(c: &mut TagsCtl) {
             send(list, LVM_INSERTITEMW, 0, &item as *const _ as isize);
             lv_set_cell(list, row, 1, &format!("{} 語", d.tags[i].1));
             set_check(list, row, checks[i]);
+        }
+        // キーボードで操作する位置(先頭の行)を決めておく(Tab で移った直後に Space でチェックできるように)
+        if !rows.is_empty() {
+            let it = LVITEMW { stateMask: LVIS_FOCUSED, state: LVIS_FOCUSED, ..Default::default() };
+            send(list, LVM_SETITEMSTATE, 0, &it as *const _ as isize);
         }
     });
 }
@@ -2182,7 +2313,7 @@ unsafe extern "system" fn tags_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
             button(hwnd, "キャンセル", ID_CANCEL, (s(m + fw - BTN_W), s(y), s(BTN_W), s(CTL_H)), true);
 
             let checks: Vec<bool> = d.tags.iter().map(|(t, _)| d.checked.contains(t)).collect();
-            let c = Box::new(TagsCtl { data, fonts, dpi, filter, list, err, fields, checks, rows: Vec::new() });
+            let c = Box::new(TagsCtl { data, fonts, dpi, filter, list, err, fields, checks, rows: Vec::new(), sort: 0 });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(c) as isize);
             let c = &mut *(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut TagsCtl);
             tags_fill(c);
@@ -2224,6 +2355,14 @@ unsafe extern "system" fn tags_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam
         WM_NOTIFY => {
             // チェックの付け外しを控える(絞り込みで行を並べ直しても、状態を保てるように)
             let hdr = &*(lparam.0 as *const NMHDR);
+            // 列の見出しのクリック: 名前の順 / 語数の多い順
+            if !ctl.is_null() && hdr.idFrom == T_LIST && hdr.code == LVN_COLUMNCLICK {
+                let nm = &*(lparam.0 as *const NMLISTVIEW);
+                let c = &mut *ctl;
+                c.sort = if nm.iSubItem == 1 { 1 } else { 0 };
+                tags_fill(c);
+                return LRESULT(0);
+            }
             if !ctl.is_null() && hdr.idFrom == T_LIST && hdr.code == LVN_ITEMCHANGED && !ui::is_busy() {
                 let nm = &*(lparam.0 as *const NMLISTVIEW);
                 let c = &mut *ctl;

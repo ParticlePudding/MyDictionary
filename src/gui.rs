@@ -59,6 +59,9 @@ const ID_BACK: usize = 124; // リンクで移動する前の状態に戻る(Alt
 const BACK_MAX: usize = 50;
 const ID_UNDO: usize = 125; // 下段の「元に戻す」のリンク
 const ID_TAGS: usize = 126; // 絞り込みのタグ欄の横の「一覧…」
+const ID_UNDOKEY: usize = 127; // Ctrl+Z(入力欄の外で押したとき)
+const ID_COPYMEANING: usize = 128; // Ctrl+Shift+C: 選んでいる語の意味をコピー
+const ID_MENUKEY: usize = 129; // Shift+F10 / アプリケーションキー: フォーカスのある所の右クリックメニュー
 /// 本文のタグのリンクを表す開く先の接頭辞(例: `tag:IT`)。クリックすると、そのタグで検索する
 const TAG_SCHEME: &str = "tag:";
 const HOTKEY_ID: i32 = 1;
@@ -95,6 +98,7 @@ const LVM_ENSUREVISIBLE_: u32 = 0x1013;
 const LVM_SETIMAGELIST_: u32 = 0x1003;
 const LVM_GETITEMRECT_: u32 = 0x100E;
 const LVM_GETITEMSTATE_: u32 = 0x102C;
+const LVM_GETNEXTITEM_: u32 = 0x100C;
 
 // ---- 状態 -----------------------------------------------------------------
 
@@ -132,6 +136,8 @@ struct View {
     advanced: bool,
     bm_view: bool,
     selected: Option<(usize, i64)>,
+    /// 本文のスクロールの位置(戻ったときに、読んでいた場所から続けられるように)
+    scroll: POINT,
 }
 
 /// 直前の操作(登録・編集・削除・取り込み)を元に戻すための記録。起動中だけ持つ
@@ -158,6 +164,8 @@ struct ImgSlot {
     end: i32,
     /// 画像のパス(相対パスは、辞書のフォルダを基準に直したもの)
     path: String,
+    /// 意味の欄に書かれたとおりのパス
+    raw: String,
     alt: String,
     /// 画像を表示しているときの、表示の大きさ(ピクセル)。クリックの判定に使う
     shown: Option<(i32, i32)>,
@@ -261,6 +269,10 @@ struct State {
     in_sizemove: Cell<bool>,
     /// 画像の大きさを決めたときの、本文欄の幅
     img_width: Cell<i32>,
+    /// 未登録の語へのリンクをたどったときの (その語, そのときの検索欄)。Ctrl+N の見出し語の初期値に使う
+    missing_link: Option<(String, String)>,
+    /// ほかの画面に切り替わる前に、フォーカスのあった部品(戻ってきたときに戻す)
+    last_focus: HWND,
     /// 設定ファイルの誤り・ホットキーの登録の失敗など、画面の下段だけでは見落としやすい問題。
     /// 読み込みが終わったときに、まとめて確認の画面で知らせる
     alerts: Vec<String>,
@@ -281,6 +293,8 @@ struct State {
     sort: Sort,
     /// しおり表示に入る前の並び順
     prev_sort: Sort,
+    /// しおり表示のときの並び順(起動中だけ覚える)
+    bm_sort: Sort,
 }
 
 fn app_dir() -> PathBuf {
@@ -420,6 +434,11 @@ pub fn run() {
                 let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_BACK | BN_CLICKED_ << 16), LPARAM(0));
                 continue;
             }
+            // Shift+F10: 右クリックのメニュー(F10 はメニューのキーなので、WM_SYSKEYDOWN で届く)
+            if msg.message == WM_SYSKEYDOWN && msg.wParam.0 == VK_F10.0 as usize && GetKeyState(VK_SHIFT.0 as i32) < 0 && GetActiveWindow() == hwnd {
+                let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_MENUKEY | BN_CLICKED_ << 16), LPARAM(0));
+                continue;
+            }
             if msg.message == WM_KEYDOWN && GetActiveWindow() == hwnd {
                 let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
                 let vk = msg.wParam.0 as u16;
@@ -440,14 +459,54 @@ pub fn run() {
                     let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(c | BN_CLICKED_ << 16), LPARAM(0));
                     continue;
                 }
+                let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
                 if let Some(st) = state(hwnd) {
+                    let f = GetFocus();
+                    let in_edit = class_is(f, "edit");
+                    let key_cmd = if ctrl && shift && vk == 'C' as u16 {
+                        Some(ID_COPYMEANING)
+                    } else if ctrl && !shift && vk == 'Z' as u16 && !in_edit {
+                        // 入力欄の中では、入力の取り消し(Windows の標準)のまま
+                        Some(ID_UNDOKEY)
+                    } else if (shift && vk == VK_F10.0) || vk == VK_APPS.0 {
+                        Some(ID_MENUKEY)
+                    } else if vk == VK_RETURN.0 && !ctrl && f == st.list {
+                        // 候補リストで Enter = 編集(ダイアログの処理に Enter を取られないよう、ここで受ける)
+                        Some(ID_EDITBTN)
+                    } else {
+                        None
+                    };
+                    if let Some(c) = key_cmd {
+                        let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(c | BN_CLICKED_ << 16), LPARAM(0));
+                        continue;
+                    }
+                    // 本文の中: Tab / Shift+Tab で次・前のリンクを選び、Enter で開く(マウスなしでリンクをたどれるように)
+                    if f == st.rich && !ctrl {
+                        if vk == VK_TAB.0 {
+                            // リンクが無くなったら、次の部品へ移る(本文の部品は Tab を自分で受け取ってしまうため、ここで移す)
+                            if !select_next_link(st, shift) {
+                                if let Ok(next) = GetNextDlgTabItem(hwnd, st.rich, shift) {
+                                    let _ = SetFocus(next);
+                                }
+                            }
+                            continue;
+                        }
+                        if vk == VK_RETURN.0 {
+                            if let Some(t) = link_at_selection(st) {
+                                let boxed = Box::into_raw(Box::new(t));
+                                if PostMessageW(hwnd, WM_APP_LINK, WPARAM(0), LPARAM(boxed as isize)).is_err() {
+                                    drop(Box::from_raw(boxed));
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     if ctrl && vk == 'F' as u16 {
                         let _ = SetFocus(st.edit);
                         send(st.edit, EM_SETSEL, 0, -1);
                         continue;
                     }
                     // 検索欄にいるまま ↑↓ / PageUp / PageDown で候補を移動(電子辞書と同じ操作感)
-                    let f = GetFocus();
                     let in_search = f == st.edit || f == st.qw || f == st.qm || f == st.qt;
                     if in_search && [VK_UP.0, VK_DOWN.0, VK_PRIOR.0, VK_NEXT.0].contains(&vk) {
                         SendMessageW(st.list, WM_KEYDOWN, msg.wParam, msg.lParam);
@@ -661,6 +720,7 @@ unsafe fn create_child(parent: HWND, class: PCWSTR, ex: u32, style: u32, id: usi
 unsafe fn owner_button(parent: HWND, id: usize, text: &str) -> HWND {
     let b = create_child(parent, w!("BUTTON"), 0, WS_TABSTOP.0 | 0x0B /* BS_OWNERDRAW */, id).unwrap();
     set_text(b, text);
+    ui::track_hover(b);
     b
 }
 
@@ -715,7 +775,8 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
 
     // 本文: RichEdit(書式付き)。使えない環境では通常の複数行エディットで代用
     let _ = LoadLibraryW(w!("Msftedit.dll"));
-    let rich_style = WS_VSCROLL.0 | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32;
+    // 本文も Tab で入れるようにする(キーボードだけで、本文の文字の選択・コピーと、リンクをたどれるように)
+    let rich_style = WS_TABSTOP.0 | WS_VSCROLL.0 | ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32;
     let (rich, rich_ok) = match create_child(hwnd, w!("RICHEDIT50W"), 0, rich_style, ID_RICH) {
         Some(h) => {
             send(h, EM_SETBKGNDCOLOR, 0, ui::pal().bg.0 as isize);
@@ -806,6 +867,8 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         img_mode: Cell::new(0),
         in_sizemove: Cell::new(false),
         img_width: Cell::new(0),
+        last_focus: HWND::default(),
+        missing_link: None,
         alerts: init.warns.clone(),
         reported_errors: HashSet::new(),
         warned_version: HashSet::new(),
@@ -816,6 +879,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         bm_view: false,
         sort,
         prev_sort: sort,
+        bm_sort: Sort::Bookmark,
     };
     apply_fonts(&st);
     update_sort_button(&st);
@@ -890,7 +954,8 @@ unsafe fn layout(hwnd: HWND, st: &mut State) {
     let h = (bottom - top).max(s(80));
 
     // --- 左: 候補リスト(枠の内側に置く) ---
-    let list_w = s(320); // 候補リストの幅は固定(ウィンドウを広げた分は、本文の側が広がる)
+    // 候補リストの幅: ウィンドウの幅の 3 割(320〜480)。広げると、長い見出し語や規格・タグも切れずに見える
+    let list_w = (w * 3 / 10).clamp(s(320), s(480));
     st.list_box = RECT { left: m, top, right: m + list_w, bottom: top + h };
     let inset = s(2);
     // 枠の上部: しおり表示の切替と並び順
@@ -974,6 +1039,16 @@ unsafe fn draw_row(st: &State, hdc: HDC, row: usize) {
         ui::fill(hdc, &RECT { left: rc.left, top: rc.top + s(6), right: rc.left + s(4), bottom: rc.bottom - s(6) }, ui::pal().accent);
     }
     ui::fill(hdc, &RECT { left: rc.left + s(14), top: rc.bottom - 1, right: rc.right, bottom: rc.bottom }, ui::pal().hairline);
+    // 候補リストにフォーカスがあるときは、いまの行を枠で囲む(キーボードで操作している場所が分かるように)
+    let focused_row = send(st.list, LVM_GETITEMSTATE_, row, LVIS_FOCUSED.0 as isize).0 as u32 & LVIS_FOCUSED.0 != 0;
+    if focused_row && GetFocus() == st.list {
+        let b = CreateSolidBrush(ui::pal().accent);
+        let r = RECT { left: rc.left + 1, top: rc.top + 1, right: rc.right - 1, bottom: rc.bottom - 1 };
+        FrameRect(hdc, &r, b);
+        let r2 = RECT { left: r.left + 1, top: r.top + 1, right: r.right - 1, bottom: r.bottom - 1 };
+        FrameRect(hdc, &r2, b);
+        let _ = DeleteObject(b);
+    }
 
     let (x0, x1) = (rc.left + s(16), rc.right - s(12));
     let (y1, y2) = (rc.top + s(9), rc.top + s(33));
@@ -1137,7 +1212,7 @@ unsafe fn refresh(st: &mut State) {
 }
 
 /// リンクの開く先を、左下に表示するための文字列にする
-fn link_label(target: &str) -> String {
+fn link_label(st: &State, target: &str) -> String {
     // 文字の向きを強制する文字が紛れていると、行き先の表示が偽装されるので、取り除いて表示する
     let cleaned = core::clean_text(target).0;
     let target = cleaned.as_str();
@@ -1145,12 +1220,20 @@ fn link_label(target: &str) -> String {
         return format!("クリックすると、タグ「{tag}」の語を表示します");
     }
     if let Some(path) = target.strip_prefix(core::IMAGE_SCHEME) {
-        return format!("画像: {path}(クリックすると開きます)");
+        let shown = st.img_slots.borrow().iter().any(|s| s.raw == path && s.shown.is_some());
+        return if shown { format!("画像: {path}(クリックすると開きます)") } else { format!("画像を表示できません(ファイルが無いか、形式が違います): {path}") };
     }
     match target.strip_prefix(core::WORD_SCHEME) {
-        Some(word) => format!("リンク先: この辞書の「{}」", word.trim()),
+        Some(word) if word_exists(st, word) => format!("リンク先: この辞書の「{}」", word.trim()),
+        Some(word) => format!("「{}」は、まだ登録されていません(クリックした後、Ctrl+N で登録できます)", word.trim()),
         None => format!("リンク先: {target}"),
     }
+}
+
+/// 見出し語が `word` の語があるか(検索と同じ規則でそろえて比べる)
+fn word_exists(st: &State, word: &str) -> bool {
+    let key = core::fold(word.trim());
+    st.entries.iter().any(|e| e.word_norm() == key)
 }
 
 /// マウスが乗っているリンクが変わったら、左下の表示を切り替える
@@ -1174,7 +1257,7 @@ unsafe fn update_status(st: &State) {
     }
     // リンクの上にマウスがある間は、開く先を表示する(クリックする前に確かめられるように)
     if let Some(target) = &st.hover_link {
-        set_text(st.status, &link_label(target));
+        set_text(st.status, &link_label(st, target));
         return;
     }
     let text = if !st.loaded {
@@ -1244,21 +1327,17 @@ unsafe fn rich_format(rich: HWND, range: (usize, usize), pt: Option<i32>, bold: 
 }
 
 /// 範囲を、リンクの見た目にする(クリックは、自前の表 `State::links` で判定する)。
-/// 明るい配色では、RichEdit のリンクの書式(青い文字に下線)を使う。
-/// 暗い配色では、その青が暗い地の上で読みにくいので、色と下線を自分で付ける
-unsafe fn rich_link(rich: HWND, range: (usize, usize)) {
+/// RichEdit のリンクの書式(`CFE_LINK`)は、色を変えられず、検索語の強調も消してしまうので使わない。
+/// 色と下線を自分で付ける。`missing`(行き先の無いリンク: 未登録の語、表示できない画像)は、灰色の点線にする
+unsafe fn rich_link(rich: HWND, range: (usize, usize), missing: bool) {
     let cr = CHARRANGE { cpMin: range.0 as i32, cpMax: range.1 as i32 };
     send(rich, EM_EXSETSEL, 0, &cr as *const _ as isize);
     let mut cf = CHARFORMAT2W::default();
     cf.Base.cbSize = std::mem::size_of::<CHARFORMAT2W>() as u32;
-    if ui::pal().dark {
-        cf.Base.dwMask = CFM_COLOR | CFM_UNDERLINE;
-        cf.Base.dwEffects = CFE_UNDERLINE;
-        cf.Base.crTextColor = ui::pal().accent;
-    } else {
-        cf.Base.dwMask = CFM_LINK;
-        cf.Base.dwEffects = CFE_LINK;
-    }
+    cf.Base.dwMask = CFM_COLOR | CFM_UNDERLINE | CFM_UNDERLINETYPE;
+    cf.Base.dwEffects = CFE_UNDERLINE;
+    cf.Base.crTextColor = if missing { ui::pal().muted } else { ui::pal().accent };
+    cf.bUnderlineType = if missing { 4 /* CFU_UNDERLINEDOTTED */ } else { 1 /* CFU_UNDERLINE */ };
     send(rich, EM_SETCHARFORMAT, SCF_SELECTION as usize, &cf as *const _ as isize);
 }
 
@@ -1346,20 +1425,23 @@ unsafe fn render(
     for (i, (bullet, name)) in r_links.iter().enumerate() {
         rich_format(st.rich, *bullet, Some(10), false, ui::pal().muted);
         rich_format(st.rich, *name, Some(10), false, ui::pal().accent);
-        rich_link(st.rich, *name);
+        let missing = links[i].1.strip_prefix(core::WORD_SCHEME).map_or(false, |w| !word_exists(st, w));
+        rich_link(st.rich, *name, missing);
         store.push((name.0 as i32, name.1 as i32, links[i].1.clone()));
     }
     // 意味の文中のリンク([[語]] と URL)
     for (a, b, target) in body_links {
         let r = (r_body.0 + a, r_body.0 + b);
         rich_format(st.rich, r, None, false, ui::pal().accent);
-        rich_link(st.rich, r);
+        // 未登録の語へのリンクと、画像(読み込めたら画像に置き換わる。読めなければ、このまま)は点線
+        let missing = target.strip_prefix(core::WORD_SCHEME).map_or(false, |w| !word_exists(st, w)) || target.starts_with(core::IMAGE_SCHEME);
+        rich_link(st.rich, r, missing);
         store.push((r.0 as i32, r.1 as i32, target.clone()));
     }
     // 補足の行のリンク(タグ。クリックすると、そのタグで検索する)
     for (a, b, target) in meta_links {
         let r = (r_meta.0 + a, r_meta.0 + b);
-        rich_link(st.rich, r);
+        rich_link(st.rich, r, false);
         store.push((r.0 as i32, r.1 as i32, target.clone()));
     }
     for &(a, b) in title_marks {
@@ -1384,7 +1466,7 @@ unsafe fn render(
         let hosts = dict_hosts(st);
         for (a, b, path) in images.iter().filter(|i| pics::loadable(&i.2) && pics::auto_load(&core::resolve_path(&i.2, base), &hosts)).take(pics::MAX_IMAGES) {
             let alt: String = body.encode_utf16().skip(*a).take(b - a).map(|u| char::from_u32(u as u32).unwrap_or(' ')).collect();
-            slots.push(ImgSlot { start: (r_body.0 + a) as i32, end: (r_body.0 + b) as i32, path: core::resolve_path(path, base), alt, shown: None });
+            slots.push(ImgSlot { start: (r_body.0 + a) as i32, end: (r_body.0 + b) as i32, path: core::resolve_path(path, base), raw: path.clone(), alt, shown: None });
         }
         drop(slots);
         start_pics(st, gen);
@@ -1492,7 +1574,8 @@ unsafe fn decode_dib(pic: &Pic, w: i32, h: i32) -> Option<Vec<u8>> {
     scaler.Initialize(&conv, w as u32, h as u32, WICBitmapInterpolationModeFant).ok()?;
     let mut pixels = vec![0u8; w as usize * h as usize * 4];
     scaler.CopyPixels(std::ptr::null(), w as u32 * 4, &mut pixels).ok()?;
-    let bg = ui::pal().bg.0;
+    // 透明な部分は、明るい地に重ねる(暗い配色でも。黒い線の図が見えなくならないように)
+    let bg = ui::LIGHT.bg.0;
     pics::dib_from_pbgra(&pixels, w as usize, h as usize, ((bg & 0xFF) as u8, ((bg >> 8) & 0xFF) as u8, ((bg >> 16) & 0xFF) as u8))
 }
 
@@ -1530,7 +1613,10 @@ unsafe fn show_pic(st: &State, index: usize, pic: &Pic) {
     if mode == 3 {
         return;
     }
-    let (w, h) = pics::fit(pic.w, pic.h, st.img_width.get() - scale(8, st.dpi), st.dpi);
+    // 幅は本文の幅に、高さは本文の欄の高さの 6 割に収める
+    let mut rc = RECT::default();
+    let _ = GetClientRect(st.rich, &mut rc);
+    let (w, h) = pics::fit_box(pic.w, pic.h, st.img_width.get() - scale(8, st.dpi), ((rc.bottom - rc.top) * 6 / 10).max(scale(160, st.dpi)), st.dpi);
     // 選択とスクロールの位置を控えて、置き換えの後で戻す(画像は、読んでいる途中にも届く)
     let mut sel = CHARRANGE::default();
     send(st.rich, EM_EXGETSEL, 0, &mut sel as *mut _ as isize);
@@ -1552,7 +1638,9 @@ unsafe fn show_pic(st: &State, index: usize, pic: &Pic) {
         }
     };
     let mut inserted = 0;
-    if mode <= 1 {
+    // 暗い配色では、透明な部分のある画像(黒い線の図など)が暗い地に溶けて見えなくなる。
+    // Windows の機能(方法 1)は透明な部分を本文の地のまま描くので、明るい地に重ねて変換する方法 2 を使う
+    if mode <= 1 && !ui::pal().dark {
         send(st.rich, EM_EXSETSEL, 0, &range as *const _ as isize);
         inserted = inserted_by(insert_image_native(st.rich, pic, w, h, st.dpi, &alt));
         if inserted >= 1 {
@@ -1591,6 +1679,15 @@ unsafe fn show_pic(st: &State, index: usize, pic: &Pic) {
                 s.end += delta;
             }
         }
+        // 画像の段落の上下に、少し間を空ける(前後の文と、くっつかないように)
+        let r = CHARRANGE { cpMin: start, cpMax: new_end };
+        send(st.rich, EM_EXSETSEL, 0, &r as *const _ as isize);
+        let mut pf = PARAFORMAT2::default();
+        pf.Base.cbSize = std::mem::size_of::<PARAFORMAT2>() as u32;
+        pf.Base.dwMask = PFM_SPACEBEFORE | PFM_SPACEAFTER;
+        pf.dySpaceBefore = 80; // 1/1440 インチ(約 1.4mm)
+        pf.dySpaceAfter = 80;
+        send(st.rich, EM_SETPARAFORMAT, 0, &pf as *const _ as isize);
         let fix = |p: i32| if p >= end { p + delta } else { p.min(start) };
         sel = CHARRANGE { cpMin: fix(sel.cpMin), cpMax: fix(sel.cpMax) };
     }
@@ -1617,10 +1714,18 @@ unsafe fn update_detail(st: &State) {
     let sel = selected_entries(st);
     match sel.len() {
         0 => {
+            let missing = st.missing_link.as_ref().filter(|(_, at)| *at == get_text(st.edit)).map(|(w, _)| format!("「{w}」は、まだ登録されていません"));
             let (t, m) = if !st.loaded {
                 ("読み込み中…", "")
             } else if st.entries.is_empty() {
-                ("まだ単語がありません", "右上の「＋ 新規登録」(Ctrl+N)から最初の単語を追加できます。")
+                (
+                    "まだ語がありません",
+                    "右上の「＋ 新規登録」(Ctrl+N)から、最初の語を登録できます。\n\
+                     表計算ソフトなどで作った一覧(CSV / TSV / JSON)は、「設定」→「取り込む…」でまとめて入れられます。\n\
+                     意味の中に [[語]] と書くと、別の語へのリンクになります。使い方は、説明書(docs\\manual.md)を参照してください。",
+                )
+            } else if let Some(t) = missing.as_deref() {
+                (t, "Ctrl+N で、この語を見出し語にして登録できます。Alt+← で、リンクをたどる前の語に戻ります。")
             } else if st.matches.is_empty() {
                 ("見つかりません", "検索語を変えるか、「＋ 新規登録」(Ctrl+N)でこの語を追加できます。")
             } else {
@@ -1684,9 +1789,9 @@ unsafe fn update_detail(st: &State) {
         }
         n => render(st, &format!("{n} 件を選択中"), "", "Delete キーまたは「削除」でまとめて削除できます。", "", &[], &[], &[], &[], &[], &[], &[], Path::new("")),
     }
-    let marked = sel.len() == 1 && st.bm_map.contains_key(&(st.entries[sel[0]].dict, st.entries[sel[0]].id));
+    let marked = !sel.is_empty() && sel.iter().all(|&i| st.bm_map.contains_key(&(st.entries[i].dict, st.entries[i].id)));
     set_text(st.btn_bm, if marked { "★ しおり" } else { "☆ しおり" });
-    let _ = EnableWindow(st.btn_bm, sel.len() == 1);
+    let _ = EnableWindow(st.btn_bm, !sel.is_empty());
     let _ = InvalidateRect(st.btn_bm, None, false);
     let can_edit = sel.len() == 1 && writable(&st.dicts[st.entries[sel[0]].dict]).is_ok();
     let can_del = !sel.is_empty() && sel.iter().all(|&i| writable(&st.dicts[st.entries[i].dict]).is_ok());
@@ -1794,6 +1899,11 @@ unsafe fn current_view(st: &State) -> View {
         advanced: st.advanced,
         bm_view: st.bm_view,
         selected: if sel.len() == 1 { Some((st.entries[sel[0]].dict, st.entries[sel[0]].id)) } else { None },
+        scroll: {
+            let mut p = POINT::default();
+            send(st.rich, EM_GETSCROLLPOS, 0, &mut p as *mut _ as isize);
+            p
+        },
     }
 }
 
@@ -1822,7 +1932,13 @@ unsafe fn jump_to_word(st: &mut State, word: &str) {
             update_detail(st);
             notice(st, &format!("「{word}」へ移動しました(Alt+← で戻る)"));
         }
-        None => notice(st, &format!("「{word}」は登録されていません(Ctrl+N で登録できます。Alt+← で戻る)")),
+        None => {
+            // 前方一致した別の語を表示しないように、選択を外す。Ctrl+N で、この語を見出し語にして登録できるようにする
+            st.missing_link = Some((word.trim().to_string(), get_text(st.edit)));
+            select_row(st, None);
+            update_detail(st);
+            notice(st, &format!("「{word}」は登録されていません(Ctrl+N で登録できます。Alt+← で戻る)"));
+        }
     }
 }
 
@@ -1863,6 +1979,16 @@ unsafe fn do_tags(hwnd: HWND, st: &mut State) {
         notice(st, "データベースの読み込みが完了していません");
         return;
     }
+    // 名前の変更・削除をしたら、一覧を開き直す(続けて整理できるように)
+    loop {
+        if !tags_once(hwnd, st) || st.loading {
+            break;
+        }
+    }
+}
+
+/// タグの一覧を1回開く。名前の変更・削除をしたら true(一覧を開き直す)
+unsafe fn tags_once(hwnd: HWND, st: &mut State) -> bool {
     // 検索する辞書に入っている語のタグ
     let mask = st.dict_mask.clone();
     let tags = core::tag_counts(st.entries.iter().filter(|e| mask.get(e.dict).copied().unwrap_or(true)));
@@ -1892,8 +2018,12 @@ unsafe fn do_tags(hwnd: HWND, st: &mut State) {
         set_text(st.qt, &out.join(" "));
         refresh(st);
         let _ = SetFocus(st.qt);
+        false
     } else if let Some(action) = dlg.action.take() {
         do_retag(hwnd, st, action);
+        true
+    } else {
+        false
     }
 }
 
@@ -1973,6 +2103,7 @@ unsafe fn go_back(hwnd: HWND, st: &mut State) {
     refresh(st);
     if let Some((d, id)) = v.selected {
         select_entry(st, d, id);
+        send(st.rich, EM_SETSCROLLPOS, 0, &v.scroll as *const _ as isize);
     }
     notice(st, "リンクで移動する前の表示に戻りました");
 }
@@ -2056,8 +2187,31 @@ unsafe fn toggle_bookmark(st: &mut State) {
         return;
     }
     let sel = selected_entries(st);
-    if sel.len() != 1 {
-        notice(st, "しおりを付ける語を1つ選択してください");
+    if sel.is_empty() {
+        notice(st, "しおりを付ける語を選択してください");
+        return;
+    }
+    if sel.len() > 1 {
+        // 複数を選んでいるとき: 1つでもしおりの無い語があれば、すべてに付ける。すべてに付いていれば、すべて外す
+        let items: Vec<(usize, i64, String)> = sel.iter().map(|&i| (st.entries[i].dict, st.entries[i].id, st.entries[i].word.clone())).collect();
+        let all_on = items.iter().all(|(d, id, _)| st.bm_map.contains_key(&(*d, *id)));
+        let now = core::now_unix();
+        for (n, (d, id, word)) in items.iter().enumerate() {
+            let path = st.dicts[*d].path.to_string_lossy().to_string();
+            let on = st.bm_map.contains_key(&(*d, *id));
+            if on == all_on {
+                st.bookmarks.toggle(&path, *id, word, now + n as i64);
+            }
+        }
+        rebuild_bm_map(st);
+        if st.bm_view {
+            refresh(st);
+        } else {
+            let _ = InvalidateRect(st.list, None, false);
+            update_detail(st);
+        }
+        notice(st, &if all_on { format!("{} 件のしおりを外しました", items.len()) } else { format!("{} 件にしおりを付けました", items.len()) });
+        save_bookmarks(st);
         return;
     }
     let (d, id, word) = (st.entries[sel[0]].dict, st.entries[sel[0]].id, st.entries[sel[0]].word.clone());
@@ -2096,10 +2250,12 @@ unsafe fn set_bm_view(st: &mut State, on: bool) {
         return;
     }
     st.bm_view = on;
+    // しおり表示と通常の表示で、それぞれの並び順を覚えておく(起動中)
     if on {
         st.prev_sort = st.sort;
-        st.sort = Sort::Bookmark;
-    } else if st.sort == Sort::Bookmark {
+        st.sort = st.bm_sort;
+    } else {
+        st.bm_sort = st.sort;
         st.sort = if st.prev_sort == Sort::Bookmark { Sort::Word } else { st.prev_sort };
     }
     st.last_query = None;
@@ -2109,7 +2265,8 @@ unsafe fn set_bm_view(st: &mut State, on: bool) {
 unsafe fn set_sort(st: &mut State, sort: Sort) {
     st.sort = sort;
     update_sort_button(st);
-    if sort != Sort::Bookmark && st.cfg.sort != sort && !st.cfg.shared {
+    // しおり表示の中で選んだ並び順は、設定に書かない(しおり表示を出ると、元の並び順に戻る)
+    if !st.bm_view && sort != Sort::Bookmark && st.cfg.sort != sort && !st.cfg.shared {
         // 次回起動時も同じ並び順にする(共用の設定には書き込まない)
         st.cfg.sort = sort;
         let base = st.cfg_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
@@ -2171,7 +2328,7 @@ unsafe fn copy_selected(hwnd: HWND, st: &mut State, what: usize) {
 }
 
 /// 候補リストの右クリックメニュー
-unsafe fn list_menu(hwnd: HWND, st: &mut State) {
+unsafe fn list_menu(hwnd: HWND, st: &mut State, by_key: bool) {
     let sel = selected_entries(st);
     if sel.is_empty() {
         return;
@@ -2180,13 +2337,13 @@ unsafe fn list_menu(hwnd: HWND, st: &mut State) {
     let single = sel.len() == 1;
     let editable = sel.iter().all(|&i| writable(&st.dicts[st.entries[i].dict]).is_ok());
     let gray = |on: bool| if on { MF_STRING } else { MF_STRING | MF_GRAYED };
-    let marked = single && st.bm_map.contains_key(&(st.entries[sel[0]].dict, st.entries[sel[0]].id));
+    let marked = sel.iter().all(|&i| st.bm_map.contains_key(&(st.entries[i].dict, st.entries[i].id)));
     let _ = AppendMenuW(menu, MF_STRING, CM_COPY_WORD, w!("見出し語をコピー"));
     let _ = AppendMenuW(menu, MF_STRING, CM_COPY_MEANING, w!("意味をコピー"));
     let _ = AppendMenuW(menu, MF_STRING, CM_COPY_BOTH, w!("見出し語と意味をコピー\tCtrl+C"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     if !st.cfg.shared {
-        let _ = AppendMenuW(menu, gray(single), CM_BOOKMARK, if marked { w!("しおりを外す\tCtrl+D") } else { w!("しおりを付ける\tCtrl+D") });
+        let _ = AppendMenuW(menu, MF_STRING, CM_BOOKMARK, if marked { w!("しおりを外す\tCtrl+D") } else { w!("しおりを付ける\tCtrl+D") });
     }
     let _ = AppendMenuW(menu, gray(single && editable), CM_EDIT, w!("編集…\tF2"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -2198,6 +2355,16 @@ unsafe fn list_menu(hwnd: HWND, st: &mut State) {
     }
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
+    if by_key {
+        // キーで開いたときは、選んでいる行の左下に出す
+        let row = send(st.list, LVM_GETNEXTITEM_, usize::MAX, LVNI_SELECTED as isize).0;
+        let mut rc = RECT::default();
+        if row >= 0 {
+            send(st.list, LVM_GETITEMRECT_, row as usize, &mut rc as *mut _ as isize);
+        }
+        pt = POINT { x: rc.left + scale(24, st.dpi), y: rc.bottom };
+        let _ = ClientToScreen(st.list, &mut pt);
+    }
     let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
     let _ = DestroyMenu(menu);
     match cmd.0 as usize {
@@ -2207,6 +2374,39 @@ unsafe fn list_menu(hwnd: HWND, st: &mut State) {
         CM_DELETE => do_delete(hwnd, st),
         CM_UNDO => do_undo(hwnd, st),
         _ => {}
+    }
+}
+
+/// 部品のクラス名が `name` か(大文字・小文字は区別しない)
+unsafe fn class_is(h: HWND, name: &str) -> bool {
+    let mut buf = [0u16; 32];
+    let n = GetClassNameW(h, &mut buf) as usize;
+    String::from_utf16_lossy(&buf[..n]).eq_ignore_ascii_case(name)
+}
+
+/// 本文で選んでいる範囲が、リンクの中にあれば、その開く先
+unsafe fn link_at_selection(st: &State) -> Option<String> {
+    let mut cr = CHARRANGE::default();
+    send(st.rich, EM_EXGETSEL, 0, &mut cr as *mut _ as isize);
+    st.links.borrow().iter().find(|l| cr.cpMin >= l.0 && cr.cpMax <= l.1 && l.1 > l.0).map(|l| l.2.clone())
+}
+
+/// 本文の中で、次(`back` なら前)のリンクを選ぶ。無ければ false(Tab で次の部品へ移る)
+unsafe fn select_next_link(st: &State, back: bool) -> bool {
+    let mut cr = CHARRANGE::default();
+    send(st.rich, EM_EXGETSEL, 0, &mut cr as *mut _ as isize);
+    let mut links: Vec<(i32, i32)> = st.links.borrow().iter().map(|l| (l.0, l.1)).filter(|l| l.1 > l.0).collect();
+    links.sort();
+    links.dedup();
+    let next = if back { links.iter().rev().find(|l| l.1 <= cr.cpMin && *l != &(cr.cpMin, cr.cpMax)).copied() } else { links.iter().find(|l| l.0 >= cr.cpMax && *l != &(cr.cpMin, cr.cpMax)).copied() };
+    match next {
+        Some((a, b)) => {
+            let r = CHARRANGE { cpMin: a, cpMax: b };
+            send(st.rich, EM_EXSETSEL, 0, &r as *const _ as isize);
+            send(st.rich, EM_SCROLLCARET, 0, 0);
+            true
+        }
+        None => false,
     }
 }
 
@@ -2282,12 +2482,13 @@ unsafe extern "system" fn rich_subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lp
 }
 
 /// 本文欄の右クリックメニュー(コピー / すべて選択 / リンク)
-unsafe fn rich_menu(hwnd: HWND, st: &mut State, x: i32, y: i32) {
+unsafe fn rich_menu(hwnd: HWND, st: &mut State, x: i32, y: i32, by_key: bool) {
     let Ok(menu) = CreatePopupMenu() else { return };
     let mut cr = CHARRANGE::default();
     send(st.rich, EM_EXGETSEL, 0, &mut cr as *mut _ as isize);
     let has_sel = cr.cpMax > cr.cpMin;
-    let link = link_at(st, x, y);
+    // キーで開いたときは、選んでいる範囲のリンク
+    let link = if by_key { link_at_selection(st) } else { link_at(st, x, y) };
     if link.is_some() {
         let _ = AppendMenuW(menu, MF_STRING, CM_OPEN_LINK, w!("リンクを開く"));
         let _ = AppendMenuW(menu, MF_STRING, CM_COPY_LINK, w!("リンク先をコピー"));
@@ -2297,6 +2498,11 @@ unsafe fn rich_menu(hwnd: HWND, st: &mut State, x: i32, y: i32) {
     let _ = AppendMenuW(menu, MF_STRING, CM_SELECT_ALL, w!("すべて選択\tCtrl+A"));
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
+    if by_key {
+        let p = rich_pos(st.rich, cr.cpMin);
+        pt = POINT { x: p.x, y: p.y + scale(22, st.dpi) };
+        let _ = ClientToScreen(st.rich, &mut pt);
+    }
     let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, None);
     let _ = DestroyMenu(menu);
     match cmd.0 as usize {
@@ -2478,12 +2684,9 @@ unsafe fn set_undo(hwnd: HWND, st: &mut State, op: Option<UndoOp>) {
         // SysLink は <a> を記号として読むので、語の中の < > は全角にしておく
         Some(o) => {
             let label = o.label.replace('<', "＜").replace('>', "＞");
-            if ui::pal().dark {
-                // 暗い配色では、全体をリンクにする(リンクでない部分の文字の色は、部品まかせで、暗い地の上で読めないことがある)
-                format!("<a>元に戻す({label})</a>")
-            } else {
-                format!("<a>元に戻す</a>({label})")
-            }
+            // 全体をリンクにする(リンクでない部分の文字の色は部品まかせで、暗い地の上で読めないことがある。
+            // どちらの配色でも同じ見た目にする)
+            format!("<a>元に戻す({label})</a>")
         }
         None => String::new(),
     };
@@ -2575,7 +2778,12 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
     let choice = targets.iter().position(|&t| st.dict_mask.get(t).copied().unwrap_or(true)).unwrap_or(0);
     // 検索して見つからなかった語を、見出し語の初期値にする
     let q = get_text(st.edit).trim().to_string();
-    let word = if st.matches.is_empty() && !q.contains(char::is_whitespace) { q } else { String::new() };
+    let word = match &st.missing_link {
+        // 未登録の語へのリンクをたどった直後(検索欄がそのまま)なら、その語
+        Some((w, at)) if at.trim() == q => w.clone(),
+        _ if st.matches.is_empty() && !q.contains(char::is_whitespace) => q,
+        _ => String::new(),
+    };
     let mut dlg = EntryDlg {
         title: "新規登録".into(),
         word,
@@ -2617,6 +2825,20 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
             };
             set_undo(hwnd, st, Some(op));
             after_write(hwnd, st, d, stale, Some((d, id)));
+            st.missing_link = None;
+            // 登録した語が、いまの検索に当たらないとき: その語を検索欄に入れて、選んだ状態にする
+            // (見えないまま、続けて押した Ctrl+D などが、先頭の別の語に効いてしまわないように)
+            if !stale && !st.matches.iter().any(|&i| st.entries[i as usize].dict == d && st.entries[i as usize].id == id) {
+                for h in [st.qw, st.qm, st.qt] {
+                    set_text(h, "");
+                }
+                if st.bm_view {
+                    set_bm_view(st, false);
+                }
+                set_text(st.edit, &core::search_text_for(&dlg.word));
+                refresh(st);
+                select_entry(st, d, id);
+            }
             let msg = if st.dicts.len() > 1 {
                 format!("「{}」を「{}」に登録しました", dlg.word, st.dicts[d].name)
             } else {
@@ -2684,6 +2906,23 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
             core::sort_entries(&mut st.entries);
             after_write(hwnd, st, e.dict, stale, Some((e.dict, e.id)));
             notice(st, &format!("「{}」を更新しました", dlg.word));
+            // 見出し語を変えた語に、ほかの語からのリンクがあったら知らせる(リンクは、元の見出し語のまま)
+            if core::fold(&e.word) != core::fold(&dlg.word) {
+                let mut names: Vec<String> = core::backlinks(&st.entries, &e.word, Some((e.dict, e.id))).iter().map(|b| b.word.clone()).collect();
+                names.sort();
+                names.dedup();
+                if !names.is_empty() {
+                    let text = format!(
+                        "「{}」へのリンクが、ほかの {} 件の語にあります({}{})。\nリンクは「{}」のままなので、行き先の無いリンクになります。必要なら、それらの語のリンクを直してください。",
+                        e.word,
+                        names.len(),
+                        names.iter().take(5).cloned().collect::<Vec<_>>().join("、"),
+                        if names.len() > 5 { "…" } else { "" },
+                        e.word
+                    );
+                    message_box(hwnd, &text, "リンクの確認", MB_OK | MB_ICONINFORMATION);
+                }
+            }
         }
         Err(err) => {
             keep_input(hwnd, &dlg);
@@ -2716,6 +2955,25 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
         }
         t
     };
+    // ほかの語からリンクされている語は、そのことを知らせる(削除すると、リンクが行き先の無いリンクになる)
+    let linked: Vec<String> = sel
+        .iter()
+        .flat_map(|&i| {
+            let e = &st.entries[i];
+            core::backlinks(&st.entries, &e.word, Some((e.dict, e.id))).into_iter().filter(|b| !sel.iter().any(|&j| st.entries[j].dict == b.dict && st.entries[j].id == b.id)).map(|b| b.word.clone()).collect::<Vec<_>>()
+        })
+        .collect();
+    if !linked.is_empty() {
+        let mut names: Vec<String> = linked.clone();
+        names.sort();
+        names.dedup();
+        text.push_str(&format!(
+            "\n注意: この語は、ほかの {} 件の語からリンクされています({}{})。削除すると、それらのリンクは行き先の無いリンクになります。\n",
+            names.len(),
+            names.iter().take(5).cloned().collect::<Vec<_>>().join("、"),
+            if names.len() > 5 { "…" } else { "" }
+        ));
+    }
     text.push_str("\n削除した直後なら、下段の「元に戻す」で取り消せます。");
     if message_box(hwnd, &text, "削除の確認", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES {
         return;
@@ -2905,7 +3163,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_GETMINMAXINFO => {
             let mmi = &mut *(lparam.0 as *mut MINMAXINFO);
             let dpi = state(hwnd).map_or(96, |s| s.dpi);
-            mmi.ptMinTrackSize.x = scale(960, dpi);
+            // 狭い画面や、画面の端に寄せて使えるように、最小の幅を小さめにする
+            mmi.ptMinTrackSize.x = scale(760, dpi);
             mmi.ptMinTrackSize.y = scale(520, dpi);
             LRESULT(0)
         }
@@ -2933,13 +3192,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_ACTIVATE => {
-            // 前面に出たとき、他の人がファイルを変更していたら読み直す
-            if wparam.0 & 0xFFFF != 0 {
-                if let Some(st) = state(hwnd) {
-                    reload_if_changed(hwnd, st);
+            let Some(st) = state(hwnd) else { return DefWindowProcW(hwnd, msg, wparam, lparam) };
+            if wparam.0 & 0xFFFF == 0 {
+                // 確認の画面などに切り替わる前に、フォーカスのあった部品を覚えておく
+                let f = GetFocus();
+                if !f.is_invalid() && IsChild(hwnd, f).as_bool() {
+                    st.last_focus = f;
                 }
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
             }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
+            // 前面に戻ったとき: フォーカスを元の部品に戻す(削除の確認を閉じた後も、候補リストで Ctrl+Z などが効くように)。
+            // 他の人がファイルを変更していたら読み直す
+            let back = st.last_focus;
+            let r = DefWindowProcW(hwnd, msg, wparam, lparam);
+            if !back.is_invalid() && IsWindow(back).as_bool() && IsWindowVisible(back).as_bool() && IsWindowEnabled(back).as_bool() {
+                let _ = SetFocus(back);
+            } else if GetFocus() == hwnd {
+                let _ = SetFocus(st.edit);
+            }
+            reload_if_changed(hwnd, st);
+            r
         }
         WM_DPICHANGED => {
             let rc = &*(lparam.0 as *const RECT);
@@ -3048,6 +3320,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
                 (ID_DICTS, BN_CLICKED_) => do_select_dicts(hwnd, st),
+                (ID_UNDOKEY, _) => do_undo(hwnd, st),
+                (ID_COPYMEANING, _) => copy_selected(hwnd, st, CM_COPY_MEANING),
+                (ID_MENUKEY, _) => {
+                    let f = GetFocus();
+                    if f == st.list {
+                        list_menu(hwnd, st, true);
+                    } else if f == st.rich {
+                        rich_menu(hwnd, st, 0, 0, true);
+                    }
+                }
                 (ID_ADV, BN_CLICKED_) => {
                     st.advanced = !st.advanced;
                     if !st.advanced {
@@ -3132,7 +3414,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             }
                         }
                     } else if m == WM_RBUTTONUP {
-                        rich_menu(hwnd, st, x, y);
+                        rich_menu(hwnd, st, x, y, false);
                         return LRESULT(1); // 既定の処理はさせない
                     }
                 }
@@ -3192,10 +3474,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // 仮想リストでは、範囲選択(Shift+クリック / Ctrl+A)はこの通知で届く
                     let _ = InvalidateRect(st.list, None, false);
                     update_detail(st);
+                } else if hdr.code == NM_SETFOCUS || hdr.code == NM_KILLFOCUS {
+                    // フォーカスの枠を描き直す
+                    let _ = InvalidateRect(st.list, None, false);
                 } else if hdr.code == NM_DBLCLK {
                     do_edit(hwnd, st);
                 } else if hdr.code == NM_RCLICK {
-                    list_menu(hwnd, st);
+                    list_menu(hwnd, st, false);
                 }
             }
             LRESULT(0)

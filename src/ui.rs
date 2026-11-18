@@ -355,6 +355,53 @@ pub unsafe fn round_box(hdc: HDC, rc: &RECT, fill_color: COLORREF, border: COLOR
     let _ = DeleteObject(brush);
 }
 
+/// 角丸の枠線だけ(中は塗らない)
+pub unsafe fn ring_box(hdc: HDC, rc: &RECT, color: COLORREF, width: i32, radius: i32) {
+    let pen = CreatePen(PS_SOLID, width, color);
+    let (op, ob) = (SelectObject(hdc, pen), SelectObject(hdc, GetStockObject(NULL_BRUSH)));
+    let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+    SelectObject(hdc, op);
+    SelectObject(hdc, ob);
+    let _ = DeleteObject(pen);
+}
+
+/// マウスが乗っているボタン(`track_hover` を付けたボタンのうち、1つ)
+static HOT_BUTTON: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+const HOVER_SUBCLASS: usize = 0xB7;
+
+/// ボタンに、マウスが乗ったときの見た目を付ける(自前で描くボタン用)
+pub unsafe fn track_hover(button: HWND) {
+    let _ = SetWindowSubclass(button, Some(hover_subclass), HOVER_SUBCLASS, 0);
+}
+
+unsafe extern "system" fn hover_subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM, _id: usize, _data: usize) -> LRESULT {
+    const WM_MOUSELEAVE: u32 = 0x02A3;
+    match msg {
+        WM_MOUSEMOVE => {
+            if HOT_BUTTON.swap(hwnd.0 as isize, Ordering::Relaxed) != hwnd.0 as isize {
+                let mut tme = windows::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<windows::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT>() as u32,
+                    dwFlags: windows::Win32::UI::Input::KeyboardAndMouse::TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::TrackMouseEvent(&mut tme);
+                let _ = InvalidateRect(hwnd, None, false);
+            }
+        }
+        WM_MOUSELEAVE => {
+            let _ = HOT_BUTTON.compare_exchange(hwnd.0 as isize, 0, Ordering::Relaxed, Ordering::Relaxed);
+            let _ = InvalidateRect(hwnd, None, false);
+        }
+        WM_NCDESTROY => {
+            let _ = HOT_BUTTON.compare_exchange(hwnd.0 as isize, 0, Ordering::Relaxed, Ordering::Relaxed);
+            let _ = RemoveWindowSubclass(hwnd, Some(hover_subclass), HOVER_SUBCLASS);
+        }
+        _ => {}
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
 #[derive(Clone, Copy)]
 pub enum Btn {
     Primary,
@@ -384,11 +431,33 @@ pub unsafe fn draw_button(dis: &DRAWITEMSTRUCT, kind: Btn, font: HFONT, parent_b
             }
         }
     };
+    // マウスが乗っているボタンは、地の色を少し変える(押せる場所だと分かるように)
+    let hot = !pressed && !disabled && HOT_BUTTON.load(Ordering::Relaxed) == dis.hwndItem.0 as isize;
+    let bg = if !hot {
+        bg
+    } else {
+        match kind {
+            Btn::Primary => pal().accent_pressed,
+            Btn::Danger => pal().danger_soft,
+            Btn::Toggle(true) => bg,
+            _ => pal().panel,
+        }
+    };
     let (bg, border, fg) = if disabled { (pal().panel, pal().border, pal().muted) } else { (bg, border, fg) };
     let border = if focused && !disabled && !matches!(kind, Btn::Primary | Btn::Danger) { pal().accent } else { border };
 
     let inner = RECT { left: rc.left, top: rc.top, right: rc.right, bottom: rc.bottom };
     round_box(hdc, &inner, bg, border, scale(8, dpi));
+    // フォーカスのあるボタンは、内側に太さ 2 の枠を描く(どのボタンでも、キーボードの位置が分かるように)
+    if focused && !disabled {
+        let ring = match kind {
+            Btn::Primary => pal().on_accent,
+            Btn::Danger => pal().danger,
+            _ => pal().accent,
+        };
+        let d = scale(3, dpi);
+        ring_box(hdc, &RECT { left: rc.left + d, top: rc.top + d, right: rc.right - d, bottom: rc.bottom - d }, ring, scale(2, dpi).max(2), scale(6, dpi));
+    }
 
     let mut buf = vec![0u16; 128];
     let n = GetWindowTextW(dis.hwndItem, &mut buf);
@@ -847,6 +916,10 @@ pub unsafe fn paint_fields(hdc: HDC, fields: &[(RECT, HWND)], dpi: i32) {
         }
         let color = if *h == focus { pal().accent } else { pal().border };
         round_box(hdc, rc, pal().bg, color, scale(8, dpi));
+        // 入力中の欄は、枠を太くする(色だけでは見分けにくいため)
+        if *h == focus {
+            ring_box(hdc, &RECT { left: rc.left + 1, top: rc.top + 1, right: rc.right - 1, bottom: rc.bottom - 1 }, color, 1, scale(7, dpi));
+        }
     }
 }
 

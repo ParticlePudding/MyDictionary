@@ -1050,6 +1050,22 @@ pub fn display_text(meaning: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// 見出し語 `word` の語へリンクしている語(意味の中の `[[語]]`・`[表示](word:語)` と、参照先の欄)。
+/// 同じ見出し語かどうかは、検索と同じ規則でそろえて比べる。`except` の語(リンク先の語そのもの)は除く
+pub fn backlinks<'a>(entries: &'a [Entry], word: &str, except: Option<(usize, i64)>) -> Vec<&'a Entry> {
+    let key = fold(word.trim());
+    let hits = |target: &str| target.strip_prefix(WORD_SCHEME).map_or(false, |w| fold(w.trim()) == key);
+    entries
+        .iter()
+        .filter(|e| Some((e.dict, e.id)) != except)
+        .filter(|e| {
+            // 速く済ませるため、記法の無い語は解析しない
+            let m = (e.meaning.contains("[[") || e.meaning.contains(WORD_SCHEME)) && parse_body(&e.meaning).links.iter().any(|l| hits(&l.2));
+            m || (!e.link.is_empty() && parse_links(&e.link).iter().any(|l| hits(&l.1)))
+        })
+        .collect()
+}
+
 /// 参照先の欄(1行に1つ)を (表示名, 開く先) の一覧にする。
 /// 「表示名 | URL」または「[表示名](URL)」なら表示名付き。それ以外は行全体が表示名かつ開く先。
 pub fn parse_links(text: &str) -> Vec<(String, String)> {
@@ -1809,6 +1825,19 @@ mod tests {
         assert_eq!(resolve_path("https://a.example/", base), "https://a.example/");
         assert_eq!(resolve_path("word:語", base), "word:語");
         assert_eq!(resolve_path("mailto:a@example.com", base), "mailto:a@example.com");
+    }
+
+    #[test]
+    fn backlinks_found() {
+        let e = vec![
+            Entry::new(1, "API".into(), "説明".into(), "".into(), 0),
+            Entry::new(2, "REST".into(), "[[ａｐｉ]] の一種".into(), "".into(), 0),
+            Entry::new(3, "SDK".into(), "関連".into(), "".into(), 0).with_link("[[API]]".into()),
+            Entry::new(4, "GUI".into(), "API とは無関係".into(), "".into(), 0),
+            Entry::new(5, "RPC".into(), "[API の説明](word:API)".into(), "".into(), 0),
+        ];
+        let b: Vec<i64> = backlinks(&e, "API", Some((0, 1))).iter().map(|x| x.id).collect();
+        assert_eq!(b, vec![2, 3, 5]);
     }
 
     #[test]
