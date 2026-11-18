@@ -2395,6 +2395,11 @@ unsafe fn link_at_selection(st: &State) -> Option<String> {
 unsafe fn select_next_link(st: &State, back: bool) -> bool {
     let mut cr = CHARRANGE::default();
     send(st.rich, EM_EXGETSEL, 0, &mut cr as *mut _ as isize);
+    // Tab で本文に入ったときは、全体が選ばれている(ダイアログの標準の動き)。そのときは、先頭(戻るときは末尾)から探す
+    let len = rich_text_len(st.rich);
+    if cr.cpMin <= 0 && (cr.cpMax >= len || cr.cpMax < 0) && len > 0 {
+        cr = if back { CHARRANGE { cpMin: len, cpMax: len } } else { CHARRANGE { cpMin: 0, cpMax: 0 } };
+    }
     let mut links: Vec<(i32, i32)> = st.links.borrow().iter().map(|l| (l.0, l.1)).filter(|l| l.1 > l.0).collect();
     links.sort();
     links.dedup();

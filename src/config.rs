@@ -377,9 +377,11 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
         if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
             continue;
         }
-        if line.starts_with('[') && line.ends_with(']') {
+        // セクションの行([dictionary.d1]  ; 説明)も、後ろのコメントを外してから見る
+        let head = strip_comment(line).trim();
+        if head.starts_with('[') && head.ends_with(']') {
             finish(pending.take(), &mut cfg, &mut warns);
-            section = line[1..line.len() - 1].trim().to_string();
+            section = head[1..head.len() - 1].trim().to_string();
             if let Some(id) = section.strip_prefix("dictionary") {
                 let id = id.trim_start_matches('.').to_string();
                 let id = if id.is_empty() { format!("辞書{}", cfg.dicts.len() + 1) } else { id };
@@ -564,7 +566,7 @@ mod tests {
     fn trailing_comments() {
         // 説明書の例のように、値の後ろに「; 説明」を書ける
         let text = "[general]\nshared = true           ; 共用フォルダで運用する\ntitle = 社内用語集        ; ウィンドウに表示する名前\ntheme = dark\t; 配色\n\
-[dictionary.d1]\nname = メイン\npath = dictionary.db     ; 相対パス\nreadonly = true          ; 参照のみ\n";
+[dictionary.d1]          ; 先頭の辞書\nname = メイン\npath = dictionary.db     ; 相対パス\nreadonly = true          ; 参照のみ\n";
         let (c, w) = parse(text, Path::new("/b"), &env);
         assert!(w.is_empty(), "{w:?}");
         assert!(c.shared);
@@ -575,6 +577,29 @@ mod tests {
         // 空白の無い ; は値の一部
         let (c, _) = parse("[general]\ntitle = A;B\n", Path::new("/b"), &env);
         assert_eq!(c.title, "A;B");
+    }
+
+    #[test]
+    fn manual_examples_parse_cleanly() {
+        // 説明書(docs/manual.md)の ini の例を、そのまま設定ファイルにしても、警告が出ず、書いたとおりに効くこと
+        let manual = include_str!("../docs/manual.md");
+        let blocks: Vec<&str> = manual.split("```ini\n").skip(1).map(|b| b.split("```").next().unwrap_or("")).collect();
+        assert!(blocks.len() >= 2);
+        for b in &blocks {
+            let (c, w) = parse(b, Path::new("/b"), &env);
+            assert!(w.is_empty(), "{w:?}\n{b}");
+            // 値の後ろのコメントが、値に混ざっていない
+            assert!(!c.title.contains(';'));
+            for d in &c.dicts {
+                assert!(!d.name.contains(';') && !d.path.to_string_lossy().contains(';'), "{d:?}");
+            }
+            if b.contains("shared = true") {
+                assert!(c.shared);
+            }
+            if b.contains("readonly = true") {
+                assert!(c.dicts.iter().any(|d| d.readonly));
+            }
+        }
     }
 
     #[test]
