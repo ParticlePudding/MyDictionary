@@ -1396,7 +1396,7 @@ label(hwnd, "ウィンドウに表示する名前", (s(m), s(y + 8), s(180), s(2
                     if let Some(p) = pick_db_path(hwnd, "") {
                         let path = PathBuf::from(&p);
                         let name = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "新しい辞書".into());
-                        d.cfg.dicts.push(DictConf { id: String::new(), name, path, readonly: false });
+                        d.cfg.dicts.push(DictConf { id: String::new(), name, path, readonly: false, written: None });
                         let n = d.cfg.dicts.len() - 1;
                         reload_list(c, Some(n));
                         set_text(c.err, "");
@@ -1702,7 +1702,7 @@ unsafe fn pick_import_file(owner: HWND) -> Option<String> {
 }
 
 /// UTF-8 / UTF-16 でなければ、日本語版 Excel の既定である Shift_JIS(CP932)として読む
-unsafe fn decode_text(bytes: &[u8]) -> Option<String> {
+pub unsafe fn decode_text(bytes: &[u8]) -> Option<String> {
     if let Some(s) = import::decode_unicode(bytes) {
         return Some(s);
     }

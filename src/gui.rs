@@ -188,9 +188,16 @@ struct InitData {
     cfg: Config,
     cfg_path: PathBuf,
     warns: Vec<String>,
+    /// 設定ファイルを読めた(読めなかったときは、書かれていた内容を守るため、上書きしない)
+    cfg_ok: bool,
+    /// 読み込んだときの設定ファイルの更新日時(ほかの人の変更を上書きしないため)
+    cfg_stamp: Option<SystemTime>,
 }
 
 struct State {
+    /// 設定ファイルを読めたか、と読み込んだときの更新日時(InitData を参照)
+    cfg_ok: bool,
+    cfg_stamp: Option<SystemTime>,
     // 上段
     edit: HWND,
     btn_dict: HWND,
@@ -325,6 +332,41 @@ fn config_location() -> PathBuf {
     app_dir().join("MyDictionary.ini")
 }
 
+fn config_stamp(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// 設定ファイルを読む。UTF-8(BOM の有無を問わない)・UTF-16 のほか、Shift_JIS も読む(そのときは知らせを添える)
+fn read_config_text(path: &Path) -> Result<(String, Option<String>), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("設定ファイルを読み込めません({e})"))?;
+    if let Some(t) = crate::import::decode_unicode(&bytes) {
+        return Ok((t, None));
+    }
+    match unsafe { dialogs::decode_text(&bytes) } {
+        Some(t) => Ok((t, Some("設定ファイルが Shift_JIS で書かれています。設定の画面で保存すると UTF-8 に変わります(メモ帳などで UTF-8 で保存し直すこともできます)".into()))),
+        None => Err("設定ファイルの文字コードを判別できません(UTF-8 で保存してください)".into()),
+    }
+}
+
+/// 設定ファイルに書き込む。前の内容を .bak に控え、一時ファイルに書いてから置き換える
+/// (共有フォルダで、書きかけのファイルをほかの人が読まないように)
+fn write_config(st: &mut State, text: &str) -> Result<(), String> {
+    if !st.cfg_ok {
+        return Err("設定ファイルを読み込めなかったため、上書きしていません(書かれていた内容を守るため)。設定ファイルを直してから、再読み込みしてください".into());
+    }
+    let path = st.cfg_path.clone();
+    if path.exists() {
+        let _ = std::fs::copy(&path, path.with_extension("ini.bak"));
+    }
+    let tmp = path.with_extension("ini.tmp");
+    std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &path)).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("設定ファイルを保存できません: {e}")
+    })?;
+    st.cfg_stamp = config_stamp(&path);
+    Ok(())
+}
+
 fn load_config() -> InitData {
     let path = config_location();
     let base = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
@@ -335,18 +377,46 @@ fn load_config() -> InitData {
             warns.push(format!("設定ファイルを作成できません: {e}"));
         }
     }
-    let cfg = match std::fs::read_to_string(&path) {
-        Ok(text) => {
+    let cfg_stamp = config_stamp(&path);
+    let (cfg, cfg_ok) = match read_config_text(&path) {
+        Ok((text, note)) => {
             let (cfg, w) = config::parse(&text, &base, &|k| std::env::var(k).ok());
+            warns.extend(note);
             warns.extend(w);
-            cfg
+            (cfg, true)
         }
         Err(e) => {
-            warns.push(format!("設定ファイルを読み込めません(既定を使用): {e}"));
-            Config::default_for(&base)
+            warns.push(format!("{e}。既定の設定で起動しました。設定ファイルを直すまで、設定ファイルには書き込みません"));
+            (Config::default_for(&base), false)
         }
     };
-    InitData { cfg, cfg_path: path, warns }
+    InitData { cfg, cfg_path: path, warns, cfg_ok, cfg_stamp }
+}
+
+const INSTANCE_PROP: PCWSTR = w!("MyDictionaryInstance");
+
+/// 設定ファイルの場所から作る、二重起動の判定用の値(FNV-1a。大文字・小文字は区別しない)
+fn instance_key(cfg_path: &Path) -> u64 {
+    let text = cfg_path.to_string_lossy().to_lowercase();
+    // ウィンドウの印(32 ビット版でも入るように、ポインタの幅に収める)
+    text.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3)) & (usize::MAX as u64)
+}
+
+/// 同じ設定ファイルで動いている、このアプリのウィンドウ
+unsafe fn find_instance(key: u64) -> Option<HWND> {
+    unsafe extern "system" fn each(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let found = &mut *(lparam.0 as *mut (u64, Option<HWND>));
+        let mut class = [0u16; 64];
+        let n = GetClassNameW(hwnd, &mut class) as usize;
+        if String::from_utf16_lossy(&class[..n]) == CLASS_NAME.to_string().unwrap_or_default() && GetPropW(hwnd, INSTANCE_PROP).0 as usize as u64 == found.0 {
+            found.1 = Some(hwnd);
+            return FALSE;
+        }
+        TRUE
+    }
+    let mut found: (u64, Option<HWND>) = (key, None);
+    let _ = EnumWindows(Some(each), LPARAM(&mut found as *mut _ as isize));
+    found.1
 }
 
 unsafe fn state<'a>(hwnd: HWND) -> Option<&'a mut State> {
@@ -360,10 +430,13 @@ pub fn run() {
     unsafe {
         let background = std::env::args().any(|a| a == "--background");
 
-        // 二重起動: 既存ウィンドウを呼び出して終了
-        let _mutex = CreateMutexW(None, true, w!("Local\\MyDictionarySingleInstance"));
+        // 二重起動: 同じ設定ファイルを使うアプリが動いていれば、そのウィンドウを呼び出して終了する。
+        // 設定ファイルごとに分ける(個人用のアプリが動いていても、共有フォルダの exe と設定で起動できるように)
+        let key = instance_key(&config_location());
+        let name = wide(&format!("Local\\MyDictionary-{key:016x}"));
+        let _mutex = CreateMutexW(None, true, PCWSTR(name.as_ptr()));
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            if let Ok(existing) = FindWindowW(CLASS_NAME, PCWSTR::null()) {
+            if let Some(existing) = find_instance(key) {
                 let _ = PostMessageW(existing, WM_APP_SHOW, WPARAM(0), LPARAM(0));
             }
             return;
@@ -411,6 +484,8 @@ pub fn run() {
             Some(init_ptr as *const c_void),
         )
         .unwrap();
+        // 二重起動のとき、同じ設定ファイルのウィンドウを見分けるための印
+        let _ = SetPropW(hwnd, INSTANCE_PROP, HANDLE(key as usize as *mut c_void));
         ui::apply_dark(hwnd);
 
         // ウィンドウを先に出す(すぐ入力できる)。読み込みは裏で。
@@ -845,6 +920,8 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         warns: init.warns.clone(),
         cfg: init.cfg,
         cfg_path: init.cfg_path,
+        cfg_ok: init.cfg_ok,
+        cfg_stamp: init.cfg_stamp,
         dicts: Vec::new(),
         dict_mask: Vec::new(),
         links: RefCell::new(Vec::new()),
@@ -1294,7 +1371,7 @@ unsafe fn notice(st: &mut State, msg: &str) {
 
 fn writable(d: &Dict) -> Result<(), String> {
     if d.readonly {
-        return Err(format!("辞書「{}」は参照のみです(設定で変更できます)", d.name));
+        return Err(format!("辞書「{}」は参照のみのため、変更できません", d.name));
     }
     if d.error.is_some() {
         return Err(format!("辞書「{}」を読み込めていないため書き込めません", d.name));
@@ -2276,9 +2353,14 @@ unsafe fn set_sort(st: &mut State, sort: Sort) {
     // しおり表示の中で選んだ並び順は、設定に書かない(しおり表示を出ると、元の並び順に戻る)
     if !st.bm_view && sort != Sort::Bookmark && st.cfg.sort != sort && !st.cfg.shared {
         // 次回起動時も同じ並び順にする(共用の設定には書き込まない)
+        // sort の行だけを書き換える(手で書いたコメントやパスの書き方は、そのまま残す)
         st.cfg.sort = sort;
-        let base = st.cfg_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let _ = std::fs::write(&st.cfg_path, config::to_ini(&st.cfg, &base));
+        if let Ok((text, _)) = read_config_text(&st.cfg_path.clone()) {
+            let text = config::set_general_key(&text, "sort", sort.key());
+            if let Err(e) = write_config(st, &text) {
+                notice(st, &e);
+            }
+        }
     }
     if st.loaded {
         remember_selection(st);
@@ -3113,12 +3195,25 @@ unsafe fn do_settings(hwnd: HWND, st: &mut State) {
             return;
         }
     }
+    // 開いている間に、ほかの人(または手で)設定ファイルが変更されていたら、上書きしてよいかたずねる
+    if st.cfg_ok && config_stamp(&st.cfg_path) != st.cfg_stamp {
+        let text = format!(
+            "設定ファイルは、このアプリが読み込んだ後に変更されています(ほかの人が変更した可能性があります)。\n\n{}\n\n保存すると、その変更は消えます(前の内容は .bak に控えます)。保存しますか?\n\n「いいえ」を選ぶと保存しません。トレイの「設定ファイルを再読み込み」で、変更を読み込めます。",
+            st.cfg_path.display()
+        );
+        if message_box(hwnd, &text, "設定ファイルの変更", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES {
+            if dlg.imported {
+                start_load(hwnd, st, true);
+            }
+            return;
+        }
+    }
     let mut problems: Vec<String> = Vec::new();
     let dicts_changed = dlg.cfg.dicts != st.cfg.dicts;
     let was_shared = st.cfg.shared;
     let base = st.cfg_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    if let Err(e) = std::fs::write(&st.cfg_path, config::to_ini(&dlg.cfg, &base)) {
-        problems.push(format!("設定ファイルを保存できません: {e}"));
+    if let Err(e) = write_config(st, &config::to_ini(&dlg.cfg, &base)) {
+        problems.push(e);
     }
     st.cfg = dlg.cfg;
     st.warns.clear();
@@ -3157,6 +3252,8 @@ unsafe fn reload_config(hwnd: HWND, st: &mut State) {
     let init = load_config();
     st.cfg = init.cfg;
     st.cfg_path = init.cfg_path;
+    st.cfg_ok = init.cfg_ok;
+    st.cfg_stamp = init.cfg_stamp;
     st.warns = init.warns.clone();
     st.alerts = init.warns;
     if let Some(w) = register_hotkey(hwnd, st) {

@@ -30,13 +30,23 @@ pub struct Hotkey {
     pub text: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct DictConf {
     /// 設定ファイルでの ID(`[dictionary.<ID>]`)。保存しても変わらないように覚えておく。空なら保存のときに付ける
     pub id: String,
     pub name: String,
     pub path: PathBuf,
     pub readonly: bool,
+    /// 設定ファイルに書かれていたとおりの path の値と、それを解決したパス。
+    /// パスを変えていなければ、保存のときも書かれていたとおりに書く(相対パスや %APPDATA% を保つため)
+    pub written: Option<(String, PathBuf)>,
+}
+
+/// 比べるのは、辞書の中身(ID・名前・パス・参照のみ)だけ。書かれていた形(`written`)は比べない
+impl PartialEq for DictConf {
+    fn eq(&self, o: &Self) -> bool {
+        self.id == o.id && self.name == o.name && self.path == o.path && self.readonly == o.readonly
+    }
 }
 
 /// 候補リストの並び順
@@ -136,7 +146,7 @@ impl Config {
             title: String::new(),
             shared: false,
             theme: Theme::Light,
-            dicts: vec![DictConf { id: "main".into(), name: "メイン".into(), path: base.join("dictionary.db"), readonly: false }],
+            dicts: vec![DictConf { id: "main".into(), name: "メイン".into(), path: base.join("dictionary.db"), readonly: false, written: None }],
         }
     }
 }
@@ -253,7 +263,8 @@ pub fn to_ini(cfg: &Config, base: &Path) -> String {
     // 設定の画面から保存すると、ファイル全体を書き直す(手で書いたコメントは残らない)。
     // その代わり、各項目の説明を毎回書いておく
     s.push_str("; MyDictionary 設定ファイル(UTF-8)。設定の画面から保存すると、この説明以外のコメントは消えます。\r\n");
-    s.push_str("; 先頭が ; の行と、値の後ろの「 ; 」から行末までは、コメントです。\r\n\r\n[general]\r\n");
+    s.push_str("; 先頭が ; の行と、値の後ろの「 ; 」から行末までは、コメントです。\r\n");
+    s.push_str("; 値に「 ;」を含めるときや、前後の空白を残すときは、値全体を \"…\" で囲みます。\r\n\r\n[general]\r\n");
     s.push_str("; 呼び出しホットキー(例: Ctrl+Alt+D)。none で無効\r\n");
     s.push_str(&format!("hotkey = {}\r\n", cfg.hotkey.as_ref().map_or("none".to_string(), |h| h.text.clone())));
     s.push_str("; true にすると、閉じてもトレイに常駐する\r\n");
@@ -261,7 +272,7 @@ pub fn to_ini(cfg: &Config, base: &Path) -> String {
     s.push_str("; 候補の並び順: word(見出し語順)/ updated_asc / updated_desc\r\n");
     s.push_str(&format!("sort = {}\r\n", cfg.sort.key()));
     s.push_str("; ウィンドウに表示する名前。空なら MyDictionary\r\n");
-    s.push_str(&format!("title = {}\r\n", cfg.title));
+    s.push_str(&format!("title = {}\r\n", ini_value(&cfg.title)));
     s.push_str("; 共用フォルダで運用する(しおりは無効、並び順は保存しない)\r\n");
     s.push_str(&format!("shared = {}\r\n", cfg.shared));
     // 既定(明るい)のときは書かない(この設定を知らない古い版が、同じ設定ファイルを読んでも警告を出さないように)
@@ -271,8 +282,10 @@ pub fn to_ini(cfg: &Config, base: &Path) -> String {
     s.push_str("\r\n; 辞書。先頭が既定の登録先。path の相対パスは、この設定ファイルのあるフォルダが基準\r\n");
     let mut used: Vec<String> = Vec::new();
     for (i, d) in cfg.dicts.iter().enumerate() {
-        let path = match d.path.parent() {
-            Some(p) if p == base => d.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
+        // パスを変えていなければ、書かれていたとおりに書く。設定ファイルのフォルダの中なら、そこからの相対パスで書く
+        let path = match (&d.written, d.path.strip_prefix(base)) {
+            (Some((text, full)), _) if *full == d.path => text.clone(),
+            (_, Ok(rel)) if d.path.is_absolute() && !rel.as_os_str().is_empty() => rel.to_string_lossy().to_string(),
             _ => d.path.to_string_lossy().to_string(),
         };
         // ID は、読み込んだときのものを使う(無い・重なるときは、空いている d<番号> を付ける)
@@ -283,12 +296,48 @@ pub fn to_ini(cfg: &Config, base: &Path) -> String {
             (i + 1..).map(|n| format!("d{n}")).find(|c| valid(c)).unwrap_or_default()
         };
         used.push(id.clone());
-        s.push_str(&format!("\r\n[dictionary.{}]\r\nname = {}\r\npath = {}\r\n", id, d.name, path));
+        s.push_str(&format!("\r\n[dictionary.{}]\r\nname = {}\r\npath = {}\r\n", id, ini_value(&d.name), ini_value(&path)));
         if d.readonly {
             s.push_str("readonly = true\r\n");
         }
     }
     s
+}
+
+/// 設定ファイルの文章のうち、[general] の `key` の行だけを `key = value` に書き換える(ほかの行・コメントは残す)。
+/// その行が無ければ [general] の直後に足し、[general] も無ければ先頭に足す。改行の書き方は元に合わせる
+pub fn set_general_key(text: &str, key: &str, value: &str) -> String {
+    let nl = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    let mut in_general = false;
+    let mut header: Option<usize> = None;
+    for i in 0..lines.len() {
+        let t = strip_comment(lines[i].trim()).trim().to_string();
+        if t.starts_with('[') && t.ends_with(']') {
+            in_general = t[1..t.len() - 1].trim().eq_ignore_ascii_case("general");
+            if in_general && header.is_none() {
+                header = Some(i);
+            }
+            continue;
+        }
+        if in_general && !t.starts_with(';') && !t.starts_with('#') {
+            if let Some((k, _)) = t.split_once('=') {
+                if k.trim().eq_ignore_ascii_case(key) {
+                    lines[i] = format!("{key} = {value}");
+                    return lines.join(nl) + nl;
+                }
+            }
+        }
+    }
+    match header {
+        Some(h) => lines.insert(h + 1, format!("{key} = {value}")),
+        None => {
+            lines.insert(0, String::new());
+            lines.insert(0, format!("{key} = {value}"));
+            lines.insert(0, "[general]".into());
+        }
+    }
+    lines.join(nl) + nl
 }
 
 /// `%NAME%` を環境変数で置換する。未定義ならそのまま残す。
@@ -324,6 +373,16 @@ pub fn expand_env(s: &str, getenv: &dyn Fn(&str) -> Option<String>) -> String {
 /// 値の後ろのコメントを外す。空白(タブ)の後ろの `;` から行末までをコメントとみなす
 /// (`shared = true   ; 共用で運用する` の形。値の中の `;` は、直前が空白でなければ値の一部)
 fn strip_comment(v: &str) -> &str {
+    // "…" で囲んだ値: 閉じる " の後ろが、空か「;」で始まるコメントなら、囲みの中をそのまま値とする
+    let t = v.trim_start();
+    if let Some(body) = t.strip_prefix('"') {
+        for (i, _) in body.match_indices('"').collect::<Vec<_>>().into_iter().rev() {
+            let rest = body[i + 1..].trim_start();
+            if rest.is_empty() || rest.starts_with(';') {
+                return &body[..i];
+            }
+        }
+    }
     let b = v.as_bytes();
     for i in 1..b.len() {
         if b[i] == b';' && (b[i - 1] == b' ' || b[i - 1] == b'\t') {
@@ -331,6 +390,12 @@ fn strip_comment(v: &str) -> &str {
         }
     }
     v
+}
+
+/// 保存する値。そのままでは読み戻せない値(「 ;」を含む、前後に空白がある、" で始まる)は "…" で囲む
+fn ini_value(v: &str) -> String {
+    let needs = v.contains(" ;") || v.contains("\t;") || v.starts_with('"') || v.trim() != v;
+    if needs { format!("\"{v}\"") } else { v.to_string() }
 }
 
 fn parse_bool(v: &str) -> Option<bool> {
@@ -356,6 +421,7 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
     let mut warns = Vec::new();
     let mut section = String::new();
     let mut pending: Option<PendingDict> = None;
+    let mut seen_ids: Vec<String> = Vec::new();
 
     let finish = |p: Option<PendingDict>, cfg: &mut Config, warns: &mut Vec<String>| {
         if let Some(p) = p {
@@ -365,7 +431,7 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
                     let pb = PathBuf::from(&expanded);
                     let full = if pb.is_absolute() { pb } else { base.join(pb) };
                     let name = p.name.unwrap_or_else(|| p.id.clone());
-                    cfg.dicts.push(DictConf { id: p.id.clone(), name, path: full, readonly: p.readonly });
+                    cfg.dicts.push(DictConf { id: p.id.clone(), name, path: full.clone(), readonly: p.readonly, written: Some((path.clone(), full)) });
                 }
                 None => warns.push(format!("設定: 辞書「{}」に path がありません", p.id)),
             }
@@ -382,12 +448,22 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
         if head.starts_with('[') && head.ends_with(']') {
             finish(pending.take(), &mut cfg, &mut warns);
             section = head[1..head.len() - 1].trim().to_string();
-            if let Some(id) = section.strip_prefix("dictionary") {
+            // セクションの名前の大文字・小文字は区別しない([General] [Dictionary.Main])。ID は書いたとおりに覚える
+            let lower = section.to_ascii_lowercase();
+            if lower == "general" {
+                section = "general".into();
+            }
+            if let Some(id) = lower.starts_with("dictionary").then(|| &section["dictionary".len()..]) {
                 let id = id.trim_start_matches('.').to_string();
+                if !id.is_empty() && seen_ids.iter().any(|x: &String| x.eq_ignore_ascii_case(&id)) {
+                    warns.push(format!("設定: {}行目 辞書の ID「{}」が重なっています(保存すると別の ID に変わります)", n + 1, id));
+                }
+                seen_ids.push(id.clone());
                 let id = if id.is_empty() { format!("辞書{}", cfg.dicts.len() + 1) } else { id };
                 pending = Some(PendingDict { id, ..Default::default() });
             } else if section != "general" {
-                warns.push(format!("設定: {}行目 未知のセクション [{}]", n + 1, section));
+                warns.push(format!("設定: {}行目 未知のセクション [{}](次のセクションまでの行は使いません)", n + 1, section));
+                section = "?".into(); // 後ろの行を、一つずつ「セクションの外」と知らせないように
             }
             continue;
         }
@@ -395,14 +471,19 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
             warns.push(format!("設定: {}行目 「key = value」の形式ではありません", n + 1));
             continue;
         };
-        let (k, v) = (k.trim().to_ascii_lowercase(), strip_comment(v).trim());
+        let quoted = v.trim_start().starts_with('"') && strip_comment(v).len() < v.trim_start().len();
+        let (k, v) = (k.trim().to_ascii_lowercase(), if quoted { strip_comment(v) } else { strip_comment(v).trim() });
         if let Some(p) = pending.as_mut() {
             match k.as_str() {
                 "name" => p.name = Some(v.to_string()),
                 "path" => p.path = Some(v.to_string()),
                 "readonly" => match parse_bool(v) {
                     Some(b) => p.readonly = b,
-                    None => warns.push(format!("設定: {}行目 readonly は true / false で指定してください", n + 1)),
+                    None => {
+                        // 読めない値は、安全な側(参照のみ)にする
+                        p.readonly = true;
+                        warns.push(format!("設定: {}行目 readonly の値「{}」を解釈できないため、参照のみで開きます(true / false で指定してください)", n + 1, v));
+                    }
                 },
                 _ => warns.push(format!("設定: {}行目 未知のキー {}", n + 1, k)),
             }
@@ -420,24 +501,26 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
                 }
                 "close_to_tray" => match parse_bool(v) {
                     Some(b) => cfg.close_to_tray = b,
-                    None => warns.push(format!("設定: {}行目 close_to_tray は true / false", n + 1)),
+                    None => warns.push(format!("設定: {}行目 close_to_tray の値「{}」を解釈できないため、false を使います(true / false で指定してください)", n + 1, v)),
                 },
                 "sort" => match Sort::from_key(v) {
                     Some(x) => cfg.sort = x,
-                    None => warns.push(format!("設定: {}行目 sort は word / updated_asc / updated_desc", n + 1)),
+                    None => warns.push(format!("設定: {}行目 sort の値「{}」を解釈できないため、word を使います(word / updated_asc / updated_desc)", n + 1, v)),
                 },
                 "title" => cfg.title = v.to_string(),
                 "shared" => match parse_bool(v) {
                     Some(b) => cfg.shared = b,
-                    None => warns.push(format!("設定: {}行目 shared は true / false", n + 1)),
+                    None => warns.push(format!("設定: {}行目 shared の値「{}」を解釈できないため、false を使います(true / false で指定してください)", n + 1, v)),
                 },
                 "theme" => match Theme::from_key(v) {
                     Some(t) => cfg.theme = t,
-                    None => warns.push(format!("設定: {}行目 theme は light / dark / system", n + 1)),
+                    None => warns.push(format!("設定: {}行目 theme の値「{}」を解釈できないため、light を使います(light / dark / system)", n + 1, v)),
                 },
                 "timing_log" => {} // 廃止した設定(古い設定ファイルに残っていても無視する)
                 _ => warns.push(format!("設定: {}行目 未知のキー {}", n + 1, k)),
             }
+        } else if section == "?" {
+            // 未知のセクションの中(知らせは、セクションの行で1回だけ)
         } else {
             warns.push(format!("設定: {}行目 セクションの外に設定があります", n + 1));
         }
@@ -446,6 +529,12 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
 
     if cfg.dicts.is_empty() {
         cfg.dicts = Config::default_for(base).dicts;
+    }
+    // 同じファイルを2つの辞書として登録している(語が二重に出る。片方への変更が、もう片方にも出る)
+    for (i, a) in cfg.dicts.iter().enumerate() {
+        if let Some(b) = cfg.dicts[..i].iter().find(|b| b.path.to_string_lossy().to_lowercase() == a.path.to_string_lossy().to_lowercase()) {
+            warns.push(format!("設定: 辞書「{}」と「{}」は、同じファイルです({})。片方を消してください", b.name, a.name, a.path.display()));
+        }
     }
     (cfg, warns)
 }
@@ -509,6 +598,54 @@ mod tests {
     }
 
     #[test]
+    fn saving_keeps_how_paths_were_written() {
+        let base = Path::new("/base");
+        let text = "[General]\nshared = true\n\n[Dictionary.main]\nname = 「A ; B」\npath = %APPDATA%\\MyDict\\a.db\n\n[dictionary.sub]\nname = \"  前後に空白 ; あり \"  ; コメント\npath = sub/b.db\n";
+        let (cfg, w) = parse(text, base, &env);
+        assert!(w.is_empty(), "{w:?}");
+        assert!(cfg.shared); // [General] も general として読む
+        assert_eq!(cfg.dicts[0].id, "main");
+        assert_eq!(cfg.dicts[0].name, "「A"); // 「 ;」から後ろはコメント
+        assert_eq!(cfg.dicts[1].name, "  前後に空白 ; あり ");
+        let ini = to_ini(&cfg, base);
+        // 書かれていたとおりのパス(環境変数・相対パス)のまま保存する
+        assert!(ini.contains("path = %APPDATA%\\MyDict\\a.db\r\n"), "{ini}");
+        assert!(ini.contains("path = sub/b.db\r\n"), "{ini}");
+        // 「 ;」を含む名前は、囲んで保存し、読み戻しても変わらない
+        assert!(ini.contains("name = \"  前後に空白 ; あり \"\r\n"), "{ini}");
+        let (again, w) = parse(&ini, base, &env);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(again.dicts, cfg.dicts);
+        // パスを変えた辞書は、設定ファイルのフォルダの中なら相対パスで書く
+        let mut c2 = cfg.clone();
+        c2.dicts[0].path = base.join("x").join("c.db");
+        assert!(to_ini(&c2, base).contains(&format!("path = {}\r\n", Path::new("x").join("c.db").display())));
+    }
+
+    #[test]
+    fn set_one_key_keeps_the_rest() {
+        let text = "; 手で書いた説明\r\n[General]\r\nhotkey = none ; 使わない\r\nsort = word\r\n\r\n[dictionary.a]\r\npath = %APPDATA%\\a.db\r\n";
+        let out = set_general_key(text, "sort", "updated_desc");
+        assert_eq!(out, text.replace("sort = word", "sort = updated_desc"));
+        let out = set_general_key("[general]\nhotkey = none\n", "sort", "word");
+        assert_eq!(out, "[general]\nsort = word\nhotkey = none\n");
+        assert_eq!(set_general_key("[dictionary.a]\npath = a.db\n", "sort", "word"), "[general]\nsort = word\n\n[dictionary.a]\npath = a.db\n");
+    }
+
+    #[test]
+    fn unsafe_values_fall_back_safely() {
+        let base = Path::new("/base");
+        let text = "[general]\n[mystery]\na = 1\nb = 2\n[dictionary.a]\npath = a.db\nreadonly = はい\n[dictionary.A]\npath = A.DB\n";
+        let (cfg, w) = parse(text, base, &env);
+        assert!(cfg.dicts[0].readonly); // 読めない readonly は、参照のみにする
+        assert_eq!(w.iter().filter(|x| x.contains("mystery")).count(), 1); // 未知のセクションの中の行は、1つずつ知らせない
+        assert!(!w.iter().any(|x| x.contains("セクションの外")), "{w:?}");
+        assert!(w.iter().any(|x| x.contains("「はい」")), "{w:?}");
+        assert!(w.iter().any(|x| x.contains("重なって")), "{w:?}");
+        assert!(w.iter().any(|x| x.contains("同じファイル")), "{w:?}");
+    }
+
+    #[test]
     fn to_ini_roundtrip() {
         let base = Path::new("/base");
         let cfg = Config {
@@ -519,8 +656,8 @@ mod tests {
             shared: true,
             theme: Theme::System,
             dicts: vec![
-                DictConf { id: "main".into(), name: "メイン".into(), path: base.join("dictionary.db"), readonly: false },
-                DictConf { id: "ref".into(), name: "参照 用".into(), path: PathBuf::from("/other/dir/ref.db"), readonly: true },
+                DictConf { id: "main".into(), name: "メイン".into(), path: base.join("dictionary.db"), readonly: false, written: None },
+                DictConf { id: "ref".into(), name: "参照 用".into(), path: PathBuf::from("/other/dir/ref.db"), readonly: true, written: None },
             ],
         };
         let (back, warns) = parse(&to_ini(&cfg, base), base, &env);
@@ -535,7 +672,7 @@ mod tests {
         // ID が無い・重なる辞書には、空いている番号を付ける
         let mut c2 = cfg.clone();
         c2.dicts[1].id = "MAIN".into();
-        c2.dicts.push(DictConf { id: String::new(), name: "新".into(), path: base.join("new.db"), readonly: false });
+        c2.dicts.push(DictConf { id: String::new(), name: "新".into(), path: base.join("new.db"), readonly: false, written: None });
         let ini = to_ini(&c2, base);
         assert!(ini.contains("[dictionary.main]") && ini.contains("[dictionary.d2]") && ini.contains("[dictionary.d3]"), "{ini}");
         // ホットキー無し
