@@ -60,12 +60,14 @@ impl Undo {
 }
 
 /// 元に戻した結果
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Reverted {
     /// 元に戻した語の数
     pub done: usize,
     /// ほかの人がその後に変更または削除していたので、戻さなかった語の数
     pub skipped: usize,
+    /// 戻さなかった語の見出し語(知らせに出す)
+    pub skipped_words: Vec<String>,
 }
 
 fn read(conn: &Connection, id: i64) -> rusqlite::Result<Option<Snapshot>> {
@@ -120,20 +122,22 @@ pub fn retag(conn: &Connection, from: &str, to: Option<&str>) -> rusqlite::Resul
 /// 記録した操作を元に戻す。トランザクションは呼び出し側で管理する。
 pub fn revert(conn: &Connection, u: &Undo) -> rusqlite::Result<Reverted> {
     let mut r = Reverted::default();
-    let mut count = |n: usize| {
+    let mut count = |n: usize, word: &str| {
         if n > 0 {
             r.done += 1;
         } else {
             r.skipped += 1;
+            r.skipped_words.push(word.to_string());
         }
     };
-    // 書き換えた語: 自分が書いた更新日時のままなら、前の内容に戻す
-    for (before, ts_after) in &u.updated {
+    // 書き換えた語: 自分が書いた更新日時のままなら、前の内容に戻す。
+    // 新しい書き換えから順に戻す(同じ語を2回書き換えていても、1回目の前の内容まで戻るように)
+    for (before, ts_after) in u.updated.iter().rev() {
         let n = conn.execute(
             "UPDATE words SET word = ?1, reading = ?2, meaning = ?3, tags = ?4, link = ?5, updated_at = ?6 WHERE id = ?7 AND updated_at = ?8",
             params![before.word, before.reading, before.meaning, before.tags, before.link, before.updated_at, before.id, ts_after],
         )?;
-        count(n);
+        count(n, &before.word);
     }
     // 削除した語: 同じ id で入れ直す(その id がすでにあれば、入れない)
     for s in &u.deleted {
@@ -142,12 +146,13 @@ pub fn revert(conn: &Connection, u: &Undo) -> rusqlite::Result<Reverted> {
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 WHERE NOT EXISTS (SELECT 1 FROM words WHERE id = ?1)",
             params![s.id, s.word, s.reading, s.meaning, s.tags, s.link, s.updated_at],
         )?;
-        count(n);
+        count(n, &s.word);
     }
     // 追加した語: 自分が書いた更新日時のままなら、削除する
     for (id, ts) in &u.inserted {
         let n = conn.execute("DELETE FROM words WHERE id = ?1 AND updated_at = ?2", params![id, ts])?;
-        count(n);
+        let word = if n == 0 { read(conn, *id)?.map(|s| s.word).unwrap_or_default() } else { String::new() };
+        count(n, &word);
     }
     Ok(r)
 }
@@ -186,7 +191,7 @@ mod tests {
         let c = core::insert_entry(&conn, &f("c", "3"), None).unwrap();
         let u = Undo { inserted: vec![(c.id, c.updated_at)], ..Default::default() };
         assert_eq!((u.len(), u.is_empty()), (1, false));
-        assert_eq!(revert(&conn, &u).unwrap(), Reverted { done: 1, skipped: 0 });
+        assert_eq!(revert(&conn, &u).map(|r| (r.done, r.skipped)).unwrap(), (1, 0));
         assert_eq!(all(&conn), before);
 
         // 削除を元に戻す: 同じ id・同じ内容・同じ更新日時で戻る
@@ -194,7 +199,7 @@ mod tests {
         assert_eq!(snaps.len(), 2); // 無い id は読み飛ばす
         assert!(all(&conn).is_empty());
         let u = Undo { deleted: snaps, ..Default::default() };
-        assert_eq!(revert(&conn, &u).unwrap(), Reverted { done: 2, skipped: 0 });
+        assert_eq!(revert(&conn, &u).map(|r| (r.done, r.skipped)).unwrap(), (2, 0));
         assert_eq!(all(&conn), before);
         // 消した id は使い回されない(戻したあとに追加した語は、新しい id になる)
         let d = core::insert_entry(&conn, &f("d", "4"), None).unwrap();
@@ -206,7 +211,7 @@ mod tests {
         let ts = core::update(&conn, a.id, a.updated_at, &Fields { word: "a2".into(), meaning: "変更".into(), ..Default::default() }).unwrap();
         assert_ne!(all(&conn), before);
         let u = Undo { updated: vec![(snap_a, ts)], ..Default::default() };
-        assert_eq!(revert(&conn, &u).unwrap(), Reverted { done: 1, skipped: 0 });
+        assert_eq!(revert(&conn, &u).map(|r| (r.done, r.skipped)).unwrap(), (1, 0));
         assert_eq!(all(&conn), before);
 
         assert!(Undo::default().is_empty());
@@ -233,7 +238,7 @@ mod tests {
         core::update(&conn, d.id, d.updated_at, &f("d", "ほかの人の変更")).unwrap();
 
         // 元に戻す: b だけ戻る。a と d は、ほかの人の変更を残す
-        assert_eq!(revert(&conn, &u).unwrap(), Reverted { done: 1, skipped: 2 });
+        assert_eq!(revert(&conn, &u).map(|r| (r.done, r.skipped)).unwrap(), (1, 2));
         let now = all(&conn);
         assert_eq!(now.len(), 4);
         let get = |id: i64| now.iter().find(|s| s.id == id).unwrap();
@@ -246,7 +251,7 @@ mod tests {
         let e = core::insert_entry(&conn, &f("e", "5"), Some(500)).unwrap();
         core::delete_ids(&conn, &[e.id]).unwrap();
         let u = Undo { inserted: vec![(e.id, e.updated_at)], ..Default::default() };
-        assert_eq!(revert(&conn, &u).unwrap(), Reverted { done: 0, skipped: 1 });
+        assert_eq!(revert(&conn, &u).map(|r| (r.done, r.skipped)).unwrap(), (0, 1));
         drop(conn);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -275,7 +280,7 @@ mod tests {
 
         // 元に戻す
         let u = Undo { updated: changed, ..Default::default() };
-        assert_eq!(revert(&conn, &u).unwrap(), Reverted { done: 2, skipped: 0 });
+        assert_eq!(revert(&conn, &u).map(|r| (r.done, r.skipped)).unwrap(), (2, 0));
         assert_eq!(all(&conn), before);
 
         // 削除: タグを外す

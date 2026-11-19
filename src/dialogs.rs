@@ -276,6 +276,25 @@ struct EntryCtl {
     min_track: (i32, i32),
     /// 最初の、意味の欄の下端(これより下の部品は、画面を縦に広げた分だけ下へ動かす)
     meaning_bottom: i32,
+    /// 文字数の上限で入りきらなかったときの知らせ(直後に届く EN_CHANGE で消さないため)
+    max_hit: bool,
+}
+
+/// 登録画面の欄のどれかが、保存できる長さ(改行は1文字と数える)を超えていれば、その知らせ
+unsafe fn entry_over(c: &EntryCtl) -> Option<String> {
+    let text = |h: HWND| get_text(h).replace("\r\n", "\n");
+    let (meaning, link) = (text(c.meaning), text(c.link));
+    let (name, max) = core::too_long(&get_text(c.word), &get_text(c.reading), &meaning, &get_text(c.tags), &link)?;
+    let now = match name {
+        "意味" => meaning.encode_utf16().count(),
+        "参照先" => link.encode_utf16().count(),
+        _ => 0,
+    };
+    Some(if now > 0 {
+        format!("{name}が長すぎます(いま {now} 文字。{max} 文字まで。改行も1文字と数えます)。減らすまで保存できません")
+    } else {
+        format!("{name}は {max} 文字までです。減らすまで保存できません")
+    })
 }
 
 /// 見出し語の欄の下に出す、重複の知らせの行の高さ
@@ -434,13 +453,15 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
 
             // 入力できる文字数(既定の上限は約3万字で、超えた分は黙って切られる。上限を広げ、超えたら知らせる)
             // すでに上限より長い語(古い版で取り込んだもの)は、切らずに表示する(保存のときに知らせる)
+            // 複数行の欄(意味・参照先)は、改行を2文字(CR と LF)と数えるので、上限を2倍にしておき、
+            // 改行を1文字と数えた長さ(保存する長さ)が上限を超えたら、入力のたびに知らせる(entry_over を参照)
             let len16 = |s: &str| s.encode_utf16().count() + s.matches('\n').count();
             for (h, max, cur) in [
                 (word, core::MAX_WORD, len16(&d.word)),
                 (reading, core::MAX_READING, len16(&d.reading)),
                 (tags, core::MAX_TAGS, len16(&d.tags)),
-                (meaning, core::MAX_MEANING, len16(&d.meaning)),
-                (link, core::MAX_LINK, len16(&d.link)),
+                (meaning, core::MAX_MEANING * 2, len16(&d.meaning)),
+                (link, core::MAX_LINK * 2, len16(&d.link)),
             ] {
                 send(h, EM_SETLIMITTEXT, max.max(cur), 0);
             }
@@ -485,6 +506,7 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 dup_link,
                 fields,
                 pending_pics: Vec::new(),
+                max_hit: false,
                 anchors,
                 base: (crc.right, crc.bottom),
                 min_track: (wrc.right - wrc.left, wrc.bottom - wrc.top),
@@ -549,11 +571,17 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         E_MEANING => ("意味", core::MAX_MEANING),
                         _ => ("参照先", core::MAX_LINK),
                     };
-                    set_text(c.err, &format!("{name}は {max} 文字までです。入りきらなかった分は入力されていません"));
+                    let msg = entry_over(c).map(|m| format!("入りきらなかった分は入力されていません。{m}"));
+                    set_text(c.err, &msg.unwrap_or_else(|| format!("{name}は {max} 文字までです。入りきらなかった分は入力されていません")));
+                    c.max_hit = true;
                 }
-                (E_WORD | E_TAGS | E_MEANING, EN_CHANGE_) => {
+                (E_WORD | E_READING | E_TAGS | E_MEANING | E_LINK, EN_CHANGE_) => {
                     if !ui::is_busy() {
-                        set_text(c.err, "");
+                        if let Some(msg) = entry_over(c) {
+                            set_text(c.err, &msg);
+                        } else if !std::mem::take(&mut c.max_hit) {
+                            set_text(c.err, "");
+                        }
                         if id == E_WORD {
                             update_dup(c);
                         }
@@ -1754,7 +1782,8 @@ unsafe fn ask_import_mode(owner: HWND, dict_name: &str, total: usize, preview: &
         return match (button, radio) {
             (ID_GO, R_OVER) => Some(import::Mode::Overwrite),
             (ID_GO, R_SKIP) => Some(import::Mode::Skip),
-            (ID_GO, _) => Some(import::Mode::KeepBoth),
+            (ID_GO, R_KEEP) => Some(import::Mode::KeepBoth),
+            // 選んだ取り込み方が分からないときは、取り込まない(黙って別の取り込み方にしない)
             _ => None,
         };
     }
@@ -1764,6 +1793,20 @@ unsafe fn ask_import_mode(owner: HWND, dict_name: &str, total: usize, preview: &
         plans[0].summary()
     );
     (msg_box(owner, &ask, "インポート", MB_YESNO | MB_ICONQUESTION) == IDYES).then_some(import::Mode::KeepBoth)
+}
+
+/// 見本に出す、値の先頭。英数字の続き(数や品番)の途中では切らない
+fn sample_text(v: &str, n: usize) -> String {
+    let cs: Vec<char> = v.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let mut end = n.min(cs.len());
+    while end < cs.len() && end < n + 20 && cs[end].is_ascii_alphanumeric() && cs[end - 1].is_ascii_alphanumeric() {
+        end += 1;
+    }
+    let mut out: String = cs[..end].iter().collect();
+    if end < cs.len() {
+        out.push('…');
+    }
+    out
 }
 
 /// ファイルを選び、確認のうえ辞書へ取り込む。取り込んだら、結果と、元に戻すための記録を返す
@@ -1814,8 +1857,7 @@ unsafe fn import_into(owner: HWND, dict: &DictConf, backup_root: &std::path::Pat
     }
     let mut preview = String::new();
     for r in rows.iter().take(3) {
-        let m: String = r.meaning.chars().take(30).map(|c| if c == '\n' { ' ' } else { c }).collect();
-        preview.push_str(&format!("  ・{} — {}\n", r.word, m));
+        preview.push_str(&format!("  ・{} — {}\n", r.word, sample_text(&r.meaning, 30)));
     }
     if rows.len() > 3 {
         preview.push_str("  …\n");

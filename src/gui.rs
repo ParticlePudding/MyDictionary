@@ -242,6 +242,8 @@ struct State {
     marks: (Vec<String>, Vec<String>, Vec<String>),
     loaded: bool,
     loading: bool,
+    /// タグの名前の変更・削除の後、読み込みが終わったらタグの一覧を開き直す
+    reopen_tags: bool,
     gen: u32,
     advanced: bool,
     notice: Option<String>,
@@ -852,6 +854,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         marks: (Vec::new(), Vec::new(), Vec::new()),
         loaded: false,
         loading: false,
+        reopen_tags: false,
         gen: 0,
         advanced: false,
         notice: None,
@@ -1220,7 +1223,7 @@ fn link_label(st: &State, target: &str) -> String {
         return format!("クリックすると、タグ「{tag}」の語を表示します");
     }
     if let Some(path) = target.strip_prefix(core::IMAGE_SCHEME) {
-        let shown = st.img_slots.borrow().iter().any(|s| s.raw == path && s.shown.is_some());
+        let shown = st.img_slots.borrow().iter().any(|s| (s.raw == path || s.path == path) && s.shown.is_some());
         return if shown { format!("画像: {path}(クリックすると開きます)") } else { format!("画像を表示できません(ファイルが無いか、形式が違います): {path}") };
     }
     match target.strip_prefix(core::WORD_SCHEME) {
@@ -1980,8 +1983,13 @@ unsafe fn do_tags(hwnd: HWND, st: &mut State) {
         return;
     }
     // 名前の変更・削除をしたら、一覧を開き直す(続けて整理できるように)
+    // (変更の後は辞書を読み直すので、読み込みが終わってから開き直す。WM_APP_LOADED を参照)
     loop {
-        if !tags_once(hwnd, st) || st.loading {
+        if !tags_once(hwnd, st) {
+            break;
+        }
+        if st.loading {
+            st.reopen_tags = true;
             break;
         }
     }
@@ -2717,6 +2725,7 @@ unsafe fn do_undo(hwnd: HWND, st: &mut State) {
     let mut total = undo::Reverted::default();
     let mut left: Vec<(PathBuf, Undo)> = Vec::new(); // 戻せなかった分(あとでやり直せるように残す)
     let mut errors: Vec<String> = Vec::new();
+    let mut restored: Vec<(usize, i64)> = Vec::new();
     for (path, u) in op.parts {
         let Some(d) = st.dicts.iter().position(|x| x.path == path) else {
             errors.push(format!("辞書 {} は、いまの設定にありません", path.display()));
@@ -2733,6 +2742,9 @@ unsafe fn do_undo(hwnd: HWND, st: &mut State) {
             Ok(rv) => {
                 total.done += rv.done;
                 total.skipped += rv.skipped;
+                total.skipped_words.extend(rv.skipped_words);
+                // 削除を戻した語(1つだけなら、読み直した後にその語を選ぶ)
+                restored.extend(u.deleted.iter().map(|s| (d, s.id)));
             }
             Err(e) => {
                 errors.push(format!("辞書「{}」: {}", st.dicts[d].name, e));
@@ -2756,14 +2768,22 @@ unsafe fn do_undo(hwnd: HWND, st: &mut State) {
     if total.done > 0 {
         st.warns.push(format!("元に戻しました({})", op.label));
     }
+    if let [one] = restored.as_slice() {
+        st.pending_select = Some(*one);
+    }
     remember_selection(st);
     start_load(hwnd, st, true);
     if !errors.is_empty() {
         message_box(hwnd, &format!("元に戻せなかった操作があります。\n\n{}", errors.join("\n")), "元に戻す", MB_OK | MB_ICONWARNING);
     } else if total.skipped > 0 {
+        let mut names: Vec<String> = total.skipped_words.iter().filter(|w| !w.is_empty()).cloned().collect();
+        names.dedup();
         let text = format!(
-            "{} 件を元に戻しました。\n\n{} 件は、ほかの人がその後に変更または削除していたため、元に戻していません。",
-            total.done, total.skipped
+            "{} 件を元に戻しました。\n\n次の {} 件は、ほかの人がその後に変更または削除していたため、元に戻していません:\n{}{}",
+            total.done,
+            total.skipped,
+            names.iter().take(10).map(|w| format!("・{w}")).collect::<Vec<_>>().join("\n"),
+            if names.len() > 10 { "\n…" } else { "" }
         );
         message_box(hwnd, &text, "元に戻す", MB_OK | MB_ICONINFORMATION);
     }
@@ -2831,18 +2851,8 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
             set_undo(hwnd, st, Some(op));
             after_write(hwnd, st, d, stale, Some((d, id)));
             st.missing_link = None;
-            // 登録した語が、いまの検索に当たらないとき: その語を検索欄に入れて、選んだ状態にする
-            // (見えないまま、続けて押した Ctrl+D などが、先頭の別の語に効いてしまわないように)
-            if !stale && !st.matches.iter().any(|&i| st.entries[i as usize].dict == d && st.entries[i as usize].id == id) {
-                for h in [st.qw, st.qm, st.qt] {
-                    set_text(h, "");
-                }
-                if st.bm_view {
-                    set_bm_view(st, false);
-                }
-                set_text(st.edit, &core::search_text_for(&dlg.word));
-                refresh(st);
-                select_entry(st, d, id);
+            if !stale {
+                reveal_entry(st, d, id, &dlg.word);
             }
             let msg = if st.dicts.len() > 1 {
                 format!("「{}」を「{}」に登録しました", dlg.word, st.dicts[d].name)
@@ -2856,6 +2866,23 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
             report_write_error(hwnd, st, d, e)
         }
     }
+}
+
+/// 登録・編集した語が、いまの検索に当たらないとき: その語を検索欄に入れて、選んだ状態にする
+/// (見えないまま、続けて押した Ctrl+D などが、先頭の別の語に効いてしまわないように)
+unsafe fn reveal_entry(st: &mut State, d: usize, id: i64, word: &str) {
+    if st.matches.iter().any(|&i| st.entries[i as usize].dict == d && st.entries[i as usize].id == id) {
+        return;
+    }
+    for h in [st.qw, st.qm, st.qt] {
+        set_text(h, "");
+    }
+    if st.bm_view {
+        set_bm_view(st, false);
+    }
+    set_text(st.edit, &core::search_text_for(word));
+    refresh(st);
+    select_entry(st, d, id);
 }
 
 unsafe fn do_edit(hwnd: HWND, st: &mut State) {
@@ -2894,6 +2921,12 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
         }
         return;
     }
+    // 内容が変わっていなければ、書き込まない(更新日時を変えず、「元に戻す」にも積まない)
+    let nl = |s: &str| s.replace("\r\n", "\n");
+    if dlg.word == e.word && dlg.reading == e.reading && nl(&dlg.meaning) == nl(&e.meaning) && dlg.tags == e.tags && nl(&dlg.link) == nl(&e.link) {
+        notice(st, "変更が無いため、保存しませんでした");
+        return;
+    }
     // 読み込んだ時点の更新時刻と一致するときだけ更新する(他の人の変更を上書きしない)
     let fields = core::Fields { word: dlg.word.clone(), reading: dlg.reading.clone(), meaning: dlg.meaning.clone(), tags: dlg.tags.clone(), link: dlg.link.clone() };
     let (r, stale) = guarded(st, e.dict, |c| core::update(c, e.id, e.updated_at, &fields));
@@ -2910,6 +2943,9 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
             }
             core::sort_entries(&mut st.entries);
             after_write(hwnd, st, e.dict, stale, Some((e.dict, e.id)));
+            if !stale {
+                reveal_entry(st, e.dict, e.id, &dlg.word);
+            }
             notice(st, &format!("「{}」を更新しました", dlg.word));
             // 見出し語を変えた語に、ほかの語からのリンクがあったら知らせる(リンクは、元の見出し語のまま)
             if core::fold(&e.word) != core::fold(&dlg.word) {
@@ -2984,6 +3020,7 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
         return;
     }
 
+    let sel_words: Vec<String> = sel.iter().map(|&i| st.entries[i].word.clone()).collect();
     // 辞書ごとにまとめて1トランザクションで削除
     let mut by_dict: Vec<Vec<i64>> = vec![Vec::new(); st.dicts.len()];
     for &i in &sel {
@@ -3030,7 +3067,11 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
         save_bookmarks(st);
     }
     if !removed.is_empty() {
-        let op = UndoOp { label: format!("{} 件の削除", removed.len()), parts: undo_parts, bookmarks: dropped };
+        let label = match undo_parts.iter().flat_map(|(_, u)| u.deleted.iter()).collect::<Vec<_>>().as_slice() {
+            [one] => format!("「{}」の削除", short(&one.word)),
+            _ => format!("{} 件の削除", removed.len()),
+        };
+        let op = UndoOp { label, parts: undo_parts, bookmarks: dropped };
         set_undo(hwnd, st, Some(op));
     }
     if any_stale {
@@ -3039,7 +3080,8 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
         refresh(st);
     }
     match failed {
-        None => notice(st, &format!("{} 件を削除しました", removed.len())),
+        None if sel_words.len() == 1 => notice(st, &format!("「{}」を削除しました(元に戻す: Ctrl+Z)", sel_words[0])),
+        None => notice(st, &format!("{} 件を削除しました(元に戻す: Ctrl+Z)", removed.len())),
         Some((d, e)) => report_write_error(hwnd, st, d, e),
     }
 }
@@ -3296,6 +3338,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     notice(st, &w);
                 }
                 show_alerts(hwnd, st);
+                if std::mem::take(&mut st.reopen_tags) {
+                    let _ = PostMessageW(hwnd, WM_COMMAND, WPARAM(ID_TAGS | BN_CLICKED_ << 16), LPARAM(0));
+                }
                 // 壊れている辞書は、ローカルのバックアップから復元するかたずねる(辞書ごとに1回だけ)
                 for i in corrupt {
                     if st.asked_restore.insert(st.dicts[i].path.clone()) {

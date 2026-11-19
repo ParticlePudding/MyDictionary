@@ -145,6 +145,15 @@ pub fn fold(s: &str) -> String {
     out
 }
 
+/// 取り込みで「同じ見出し語」とみなすための形。`fold` でそろえたうえで、英字の大文字・小文字の別は残す
+/// (全角・半角やかなの書き方は違っても同じ語だが、pH と PH、Ca と CA は別の語として扱う)
+pub fn word_key(s: &str) -> String {
+    let mut out = fold(s);
+    out.push('\u{0}');
+    out.extend(s.chars().filter(|c| c.is_alphabetic() && (c.is_uppercase() || c.is_lowercase())).map(|c| if c.is_uppercase() { 'U' } else { 'l' }));
+    out
+}
+
 /// `fold` と同じ結果を、1文字ごとに「元の文字列での UTF-16 の範囲 (開始, 終了)」付きで返す。
 /// 合成で文字数が変わっても、強調表示の位置を元の文字列の上で求められるようにするため。
 fn fold_spans(s: &str) -> Vec<(char, usize, usize)> {
@@ -196,10 +205,12 @@ pub const MAX_MEANING: usize = 100_000;
 /// 表示や保存に使わない制御文字を取り除く。取り除いたら true も返す。
 /// - 制御文字(タブと改行は残す)、DEL、C1 制御文字
 /// - 文字の向きを強制する文字(U+202A〜202E、U+2066〜2069)。リンクの開く先の表示を偽装できるため
+/// - 幅の無い空白(U+200B、U+2060、U+FEFF)。見た目が同じなのに別の見出し語になるため
+///   (絵文字や一部の文字の組み立てに使う U+200C・U+200D は残す)
 pub fn clean_text(s: &str) -> (String, bool) {
     let bad = |c: char| {
         let u = c as u32;
-        (u < 0x20 && c != '\t' && c != '\n' && c != '\r') || u == 0x7F || (0x80..=0x9F).contains(&u) || (0x202A..=0x202E).contains(&u) || (0x2066..=0x2069).contains(&u)
+        (u < 0x20 && c != '\t' && c != '\n' && c != '\r') || u == 0x7F || (0x80..=0x9F).contains(&u) || (0x202A..=0x202E).contains(&u) || (0x2066..=0x2069).contains(&u) || matches!(u, 0x200B | 0x2060 | 0xFEFF)
     };
     if s.chars().any(bad) {
         (s.chars().filter(|&c| !bad(c)).collect(), true)
@@ -418,7 +429,7 @@ pub fn sort_entries(entries: &mut [Entry]) {
 }
 
 fn split_tags(input: &str) -> impl Iterator<Item = &str> {
-    input.split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | '、')).filter(|t| !t.is_empty())
+    input.split(|c: char| c.is_whitespace() || matches!(c, ',' | '，' | '、' | ';' | '；')).filter(|t| !t.is_empty())
 }
 
 /// 「#」や「*」だけの語は検索語として扱わない(入力途中とみなす)
@@ -763,11 +774,12 @@ fn clause_rank(c: &Clause, word: &str, rd: &str) -> u8 {
                     3
                 }
             }
-            Term::Glob { parts, .. } => {
-                // ワイルドカード: 見出し語全体が型どおり(前後に余分が無い)なら完全一致と同じ扱い
+            Term::Glob { parts, start, end } => {
+                // ワイルドカード: 見出し語全体が型どおり(前後に余分が無い)なら完全一致と同じ扱い。
+                // 前方・部分の判定でも、型の末尾の印(「*損」なら「損」で終わること)は守る
                 let whole = |w: &str| !w.is_empty() && glob(w, parts, true, true);
-                let head = |w: &str| !w.is_empty() && glob(w, parts, true, false);
-                let within = |w: &str| !w.is_empty() && glob(w, parts, false, false);
+                let head = |w: &str| !w.is_empty() && glob(w, parts, true, *end);
+                let within = |w: &str| !w.is_empty() && glob(w, parts, *start, *end);
                 if whole(word) || whole(rd) {
                     0
                 } else if head(word) || head(rd) {
@@ -1182,7 +1194,7 @@ pub fn label_disguised(label: &str, target: &str) -> bool {
 
 /// 表示用: UNIX秒(UTC)を日本時間(UTC+9)の "yyyy/MM/dd HH:mm:ss" にする。
 pub fn format_jst(unix: i64) -> String {
-    let t = unix + 9 * 3600;
+    let t = unix.clamp(-62_135_596_800, 253_402_300_799) + 9 * 3600; // 西暦1〜9999年の範囲に収める(計算があふれないように)
     let days = t.div_euclid(86400);
     let sod = t.rem_euclid(86400);
     // civil_from_days (Howard Hinnant)
@@ -1274,6 +1286,13 @@ mod tests {
         // 「*さ」: 見出し語全体が「さ」の語は無いので、含む語がそのままの順
         let e2 = vec![Entry::new(1, "あさ".into(), "".into(), "".into(), 0), Entry::new(2, "さ".into(), "".into(), "".into(), 0)];
         assert_eq!(filter(&e2, &q("*さ")), vec![1, 0]); // 型と完全に同じ語(さ)が先
+        // 「*損」: 「損」で終わる語(全損)が、「損」で始まるだけの語(損害。意味に「損」を含む)より先
+        let e3 = vec![
+            Entry::new(1, "損害".into(), "".into(), "受けた損".into(), 0),
+            Entry::new(2, "全損".into(), "".into(), "".into(), 0),
+            Entry::new(3, "損".into(), "".into(), "".into(), 0),
+        ];
+        assert_eq!(filter(&e3, &q("*損")), vec![2, 1, 0]);
     }
 
     #[test]

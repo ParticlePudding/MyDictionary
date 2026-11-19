@@ -99,7 +99,8 @@ pub fn parse(text: &str) -> Result<(Vec<Row>, usize), String> {
         }
         // links(配列)が無ければ link(文字列。改行区切り)を見る
         let links = if o.contains_key("links") { joined(o.get("links"), "\n") } else { joined(o.get("link"), "\n") };
-        let updated_at = o.get("updated_at").and_then(Value::as_i64).filter(|&t| t > 0);
+        // 0 以下や、9999年より後の値(計算があふれる)は、無いものとして扱う
+        let updated_at = o.get("updated_at").and_then(Value::as_i64).filter(|&t| t > 0 && t < 253_402_300_800);
         let id = o.get("id").and_then(Value::as_i64).filter(|&i| i > 0);
         rows.push(Row {
             word,
