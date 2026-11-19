@@ -97,6 +97,8 @@ const EN_CHANGE_: usize = 0x0300;
 const BN_CLICKED_: usize = 0;
 const LVM_SETCOLUMNWIDTH_: u32 = 0x101E;
 const LVM_ENSUREVISIBLE_: u32 = 0x1013;
+const LVM_GETTOPINDEX_: u32 = 0x1027;
+const LVM_SCROLL_: u32 = 0x1014;
 const LVM_SETIMAGELIST_: u32 = 0x1003;
 const LVM_GETITEMRECT_: u32 = 0x100E;
 const LVM_GETITEMSTATE_: u32 = 0x102C;
@@ -270,6 +272,8 @@ struct State {
     cell: Vec<u16>,
     /// 読み込み完了後に選択し直すレコード (辞書, id)
     pending_select: Option<(usize, i64)>,
+    /// 読み直した後に、候補リストのいちばん上に戻す語 (辞書の添字, id)
+    pending_top: Option<(usize, i64)>,
     /// 破損時の復元を一度たずねた辞書(同じ質問を繰り返さない)
     asked_restore: HashSet<PathBuf>,
 
@@ -760,6 +764,11 @@ unsafe fn reload_if_changed(hwnd: HWND, st: &mut State) {
 }
 
 unsafe fn remember_selection(st: &mut State) {
+    // 候補リストのいちばん上に見えている語も覚えておく(読み直した後、スクロールした位置に戻すため)
+    let top = send(st.list, LVM_GETTOPINDEX_, 0, 0).0 as usize;
+    if st.pending_top.is_none() {
+        st.pending_top = st.matches.get(top).map(|&i| (st.entries[i as usize].dict, st.entries[i as usize].id));
+    }
     let sel = selected_entries(st);
     if sel.len() == 1 && st.pending_select.is_none() {
         let e = &st.entries[sel[0]];
@@ -957,6 +966,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         notice: None,
         cell: Vec::new(),
         pending_select: None,
+        pending_top: None,
         asked_restore: HashSet::new(),
         hover_link: RefCell::new(None),
         back: Vec::new(),
@@ -1263,6 +1273,20 @@ unsafe fn select_row(st: &State, row: Option<usize>) {
             send(st.list, LVM_ENSUREVISIBLE_, r, 0);
         }
     });
+}
+
+/// 候補リストを、指定の語がいちばん上に来るようにスクロールする(見つからなければ何もしない)
+unsafe fn scroll_list_to(st: &State, dict: usize, id: i64) {
+    let Some(row) = st.matches.iter().position(|&i| st.entries[i as usize].dict == dict && st.entries[i as usize].id == id) else { return };
+    let top = send(st.list, LVM_GETTOPINDEX_, 0, 0).0 as i64;
+    let mut rc = RECT { left: 0, ..Default::default() }; // LVIR_BOUNDS
+    if send(st.list, LVM_GETITEMRECT_, top.max(0) as usize, &mut rc as *mut _ as isize).0 == 0 {
+        return;
+    }
+    let h = (rc.bottom - rc.top) as i64;
+    if h > 0 && row as i64 != top {
+        send(st.list, LVM_SCROLL_, 0, ((row as i64 - top) * h) as isize);
+    }
 }
 
 /// 指定のレコードを選択して見える位置へ(見つからなければ何もしない)
@@ -2465,6 +2489,7 @@ unsafe fn set_sort(st: &mut State, sort: Sort) {
     }
     if st.loaded {
         remember_selection(st);
+        st.pending_top = None; // 並びが変わるので、選んでいる語の位置を見せる
         refresh(st);
         if let Some((d, id)) = st.pending_select.take() {
             select_entry(st, d, id);
@@ -3568,6 +3593,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 refresh(st); // 読み込み中に入力された語句をここで反映
                 if let Some((d, id)) = st.pending_select.take() {
                     select_entry(st, d, id);
+                }
+                // 読み直す前にスクロールしていた位置に戻す(選んでいる語の位置へ飛ばないように)
+                if let Some((d, id)) = st.pending_top.take() {
+                    scroll_list_to(st, d, id);
                 }
                 if !st.warns.is_empty() {
                     let w = st.warns.join(" / ");
