@@ -1404,7 +1404,7 @@ unsafe fn update_status(st: &State) {
         let fields: &[HWND] = if st.advanced { &[st.edit, st.qw, st.qm] } else { &[st.edit] };
         let ex: Vec<String> = fields.iter().flat_map(|&h| core::excluded_words(&get_text(h))).collect();
         if !ex.is_empty() {
-            text.push_str(&format!("(除外: {}。- を文字として探すときは \\- と書きます)", ex.join("、")));
+            text.push_str(&format!("(除外: {}。文字として探すなら \\-)", ex.join("、")));
         }
     }
     let mut parts: Vec<String> = Vec::new();
@@ -3217,6 +3217,8 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
     }
 
     let sel_words: Vec<String> = sel.iter().map(|&i| st.entries[i].word.clone()).collect();
+    // 消す語のうち、候補リストでいちばん上の行
+    let first_row = st.matches.iter().position(|&m| sel.contains(&(m as usize))).unwrap_or(0);
     // 辞書ごとにまとめて1トランザクションで削除
     let mut by_dict: Vec<Vec<i64>> = vec![Vec::new(); st.dicts.len()];
     for &i in &sel {
@@ -3274,6 +3276,11 @@ unsafe fn do_delete(hwnd: HWND, st: &mut State) {
         start_load(hwnd, st, true);
     } else {
         refresh(st);
+        // 消した語のあった位置の語を選ぶ(先頭の語へ飛ばないように)
+        if !st.matches.is_empty() && !removed.is_empty() {
+            select_row(st, Some(first_row.min(st.matches.len() - 1)));
+            update_detail(st);
+        }
     }
     match failed {
         None if sel_words.len() == 1 => notice(st, &format!("「{}」を削除しました(元に戻す: Ctrl+Z)", sel_words[0])),
@@ -3677,7 +3684,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         } else if st.cfg.hotkey.is_some() {
                             // Esc では終了しない(終了すると、ホットキーで呼び出せなくなる)。最小化して、ホットキーで戻せるようにする
                             let _ = ShowWindow(hwnd, SW_MINIMIZE);
-                        } else if st.undo.is_some() || message_box(hwnd, "MyDictionary を終了しますか?", "終了の確認", MB_YESNO | MB_ICONQUESTION) == IDYES {
+                        } else if st.undo.is_some() || message_box(hwnd, "MyDictionary を終了しますか?", "終了の確認", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES {
                             // 元に戻せる操作があるときは、WM_CLOSE の確認(confirm_quit)が代わりにたずねる
                             let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
                         }
