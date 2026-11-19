@@ -294,7 +294,7 @@ pub fn to_ini(cfg: &Config, base: &Path) -> String {
         // パスを変えていなければ、書かれていたとおりに書く。設定ファイルのフォルダの中なら、そこからの相対パスで書く
         let path = match (&d.written, d.path.strip_prefix(base)) {
             (Some((text, full)), _) if *full == d.path => text.clone(),
-            (_, Ok(rel)) if d.path.is_absolute() && !rel.as_os_str().is_empty() => rel.to_string_lossy().to_string(),
+            (_, Ok(rel)) if !rel.as_os_str().is_empty() => rel.to_string_lossy().to_string(),
             _ => d.path.to_string_lossy().to_string(),
         };
         // ID は、読み込んだときのものを使う(無い・重なるときは、空いている d<番号> を付ける)
