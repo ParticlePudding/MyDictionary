@@ -61,6 +61,8 @@ const ID_UNDO: usize = 125; // 下段の「元に戻す」のリンク
 const ID_TAGS: usize = 126; // 絞り込みのタグ欄の横の「一覧…」
 const ID_UNDOKEY: usize = 127; // Ctrl+Z(入力欄の外で押したとき)
 const ID_COPYMEANING: usize = 128; // Ctrl+Shift+C: 選んでいる語の意味をコピー
+const ID_HELP: usize = 131; // F1: 説明書を開く
+const ID_RELOAD: usize = 130; // F5: 辞書を読み直す(ほかの人の変更をすぐ見る)
 const ID_MENUKEY: usize = 129; // Shift+F10 / アプリケーションキー: フォーカスのある所の右クリックメニュー
 /// 本文のタグのリンクを表す開く先の接頭辞(例: `tag:IT`)。クリックすると、そのタグで検索する
 const TAG_SCHEME: &str = "tag:";
@@ -169,6 +171,8 @@ struct ImgSlot {
     alt: String,
     /// 画像を表示しているときの、表示の大きさ(ピクセル)。クリックの判定に使う
     shown: Option<(i32, i32)>,
+    /// 読めなかったときの理由(まだ読んでいる間は None)
+    fail: Option<String>,
 }
 
 /// 画像を読むスレッドからの結果
@@ -179,7 +183,12 @@ struct PicMsg {
     path: String,
     stamp: Option<SystemTime>,
     pic: Option<Arc<Pic>>,
+    /// 読めなかったときの理由
+    fail: Option<String>,
 }
+
+/// 画像の透明な部分を、本文の背景(暗い配色の地)に重ねるか(設定 image_background)
+static IMAGE_DARK_BG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 覚えておく画像の数(同じ語を見直したときや、ウィンドウの大きさを変えたときに、読み直さない)
 const PIC_CACHE: usize = 24;
@@ -251,6 +260,8 @@ struct State {
     loading: bool,
     /// タグの名前の変更・削除の後、読み込みが終わったらタグの一覧を開き直す
     reopen_tags: bool,
+    /// しおり一覧を開く前の検索語(検索欄, 見出し語, 意味, タグ)。しおり一覧を出たときに戻す
+    bm_saved_query: Option<[String; 4]>,
     gen: u32,
     advanced: bool,
     notice: Option<String>,
@@ -261,7 +272,7 @@ struct State {
     asked_restore: HashSet<PathBuf>,
 
     /// マウスが乗っているリンクの開く先(左下に表示する)
-    hover_link: Option<String>,
+    hover_link: RefCell<Option<String>>,
     /// リンクで移動する前の状態(新しいものが後ろ)。起動中だけ持ち、保存はしない
     back: Vec<View>,
     /// 直前の操作を元に戻すための記録
@@ -445,6 +456,7 @@ pub fn run() {
         let init = load_config();
         // 配色は、ウィンドウを作る前に決める(設定を変えても、次に起動するまでは変わらない)
         ui::init_theme(init.cfg.theme);
+        IMAGE_DARK_BG.store(init.cfg.image_dark_bg, Ordering::Relaxed);
         // 本文に画像を入れる処理が COM を使う
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let icc = INITCOMMONCONTROLSEX {
@@ -529,6 +541,10 @@ pub fn run() {
                     Some(ID_BM)
                 } else if vk == VK_F2.0 {
                     Some(ID_EDITBTN)
+                } else if vk == VK_F5.0 {
+                    Some(ID_RELOAD)
+                } else if vk == VK_F1.0 {
+                    Some(ID_HELP)
                 } else {
                     None
                 };
@@ -833,7 +849,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
     let qm = adv_edit(ID_QM, "意味で絞り込み");
     let qt = adv_edit(ID_QT, "タグで絞り込み(複数はスペース区切りで AND)");
 
-    let btn_bmview = owner_button(hwnd, ID_BMVIEW, "★ しおり");
+    let btn_bmview = owner_button(hwnd, ID_BMVIEW, "しおり一覧");
     let btn_sort = owner_button(hwnd, ID_SORT, "並び: 見出し語順");
     // 候補リスト: 1列・見出し無し・行は自前で描画
     let list = create_child(
@@ -932,13 +948,14 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         loaded: false,
         loading: false,
         reopen_tags: false,
+        bm_saved_query: None,
         gen: 0,
         advanced: false,
         notice: None,
         cell: Vec::new(),
         pending_select: None,
         asked_restore: HashSet::new(),
-        hover_link: None,
+        hover_link: RefCell::new(None),
         back: Vec::new(),
         undo: None,
         detail_gen: Arc::new(AtomicU32::new(0)),
@@ -1149,8 +1166,16 @@ unsafe fn draw_row(st: &State, hdc: HDC, row: usize) {
     }
 
     // 2行目: 意味の抜粋
-    // 先頭の一部だけを使う。本文と同じく [[語]] の括弧は外し、改行は空白にする
-    let head: String = e.meaning.chars().take(240).collect();
+    // 先頭の一部だけを使う。本文と同じく [[語]] の括弧は外し、改行は空白にする。
+    // 長い意味で、一致した箇所が先頭に無いときは、最初に一致した箇所の少し前から見せる
+    let mut head: String = e.meaning.chars().take(240).collect();
+    if e.meaning.len() > head.len() && !st.marks.1.is_empty() && core::mark_ranges(&head, &st.marks.1).is_empty() {
+        let folded = core::fold(&e.meaning);
+        if let Some(byte) = st.marks.1.iter().filter_map(|t| folded.find(t.as_str())).min() {
+            let at = folded[..byte].chars().count(); // そろえた文字列での位置(元の文字列でも、ほぼ同じ位置)
+            head = format!("…{}", e.meaning.chars().skip(at.saturating_sub(40)).take(240).collect::<String>());
+        }
+    }
     let snippet: String = core::body_links(&head).0.chars().map(|c| if c == '\r' || c == '\n' { ' ' } else { c }).collect();
     let r2 = RECT { left: x0, top: y2, right: x1 - dict_w - if dict_w > 0 { s(10) } else { 0 }, bottom: rc.bottom };
     ui::draw_marked(hdc, &snippet, &core::mark_ranges(&snippet, &st.marks.1), &r2, ui::pal().muted, ui::pal().mark);
@@ -1300,8 +1325,14 @@ fn link_label(st: &State, target: &str) -> String {
         return format!("クリックすると、タグ「{tag}」の語を表示します");
     }
     if let Some(path) = target.strip_prefix(core::IMAGE_SCHEME) {
-        let shown = st.img_slots.borrow().iter().any(|s| (s.raw == path || s.path == path) && s.shown.is_some());
-        return if shown { format!("画像: {path}(クリックすると開きます)") } else { format!("画像を表示できません(ファイルが無いか、形式が違います): {path}") };
+        let slots = st.img_slots.borrow();
+        return match slots.iter().find(|s| s.raw == path || s.path == path) {
+            Some(s) if s.shown.is_some() => format!("画像: {path}(クリックすると開きます)"),
+            Some(ImgSlot { fail: Some(why), .. }) => format!("画像を表示できません({why}): {path}"),
+            Some(_) if st.img_mode.get() == 3 => format!("画像: {path}(この環境では本文に画像を入れられません。クリックすると開きます)"),
+            Some(_) => format!("画像: {path}(読み込んでいます)"),
+            None => format!("画像: {path}(自動では表示しない場所・数の画像です。クリックすると開きます)"),
+        };
     }
     match target.strip_prefix(core::WORD_SCHEME) {
         Some(word) if word_exists(st, word) => format!("リンク先: この辞書の「{}」", word.trim()),
@@ -1316,10 +1347,19 @@ fn word_exists(st: &State, word: &str) -> bool {
     st.entries.iter().any(|e| e.word_norm() == key)
 }
 
+/// リンクの開く先のうち、辞書にある語(そろえた形)。全件を1回だけ調べる
+fn existing_words<'a>(st: &State, targets: impl Iterator<Item = &'a str>) -> HashSet<String> {
+    let want: HashSet<String> = targets.filter_map(|t| t.strip_prefix(core::WORD_SCHEME)).map(|w| core::fold(w.trim())).collect();
+    if want.is_empty() {
+        return HashSet::new();
+    }
+    st.entries.iter().filter(|e| want.contains(e.word_norm())).map(|e| e.word_norm().to_string()).collect()
+}
+
 /// マウスが乗っているリンクが変わったら、左下の表示を切り替える
 unsafe fn set_hover_link(st: &mut State, target: Option<String>) {
-    if st.hover_link != target {
-        st.hover_link = target;
+    if *st.hover_link.borrow() != target {
+        *st.hover_link.borrow_mut() = target;
         update_status(st);
     }
 }
@@ -1331,12 +1371,12 @@ unsafe fn update_status(st: &State) {
         .filter_map(|d| d.error.as_ref().map(|e| format!("辞書「{}」を読み込めません: {}", d.name, e)))
         .collect();
     // 案内(リンクの開く先、操作の結果、エラー)を出している間は、下段を幅いっぱいに使う
-    let wide = st.hover_link.is_some() || st.notice.is_some() || !errs.is_empty();
+    let wide = st.hover_link.borrow().is_some() || st.notice.is_some() || !errs.is_empty();
     if st.status_wide.replace(wide) != wide {
         layout_status(st);
     }
     // リンクの上にマウスがある間は、開く先を表示する(クリックする前に確かめられるように)
-    if let Some(target) = &st.hover_link {
+    if let Some(target) = st.hover_link.borrow().as_ref() {
         set_text(st.status, &link_label(st, target));
         return;
     }
@@ -1355,6 +1395,15 @@ unsafe fn update_status(st: &State) {
     } else {
         format!("{} 件 / 全 {} 件", st.matches.len(), st.entries.len())
     };
+    // 除外している語(先頭の -)を示す(-OH のような語を探したつもりで、黙って除外されないように)
+    let mut text = text;
+    if st.loaded {
+        let fields: &[HWND] = if st.advanced { &[st.edit, st.qw, st.qm] } else { &[st.edit] };
+        let ex: Vec<String> = fields.iter().flat_map(|&h| core::excluded_words(&get_text(h))).collect();
+        if !ex.is_empty() {
+            text.push_str(&format!("(除外: {}。- を文字として探すときは \\- と書きます)", ex.join("、")));
+        }
+    }
     let mut parts: Vec<String> = Vec::new();
     if let Some(n) = &st.notice {
         parts.push(n.clone());
@@ -1502,10 +1551,22 @@ unsafe fn render(
     rich_format(st.rich, r_body, Some(12), false, ui::pal().text);
     rich_format(st.rich, r_gap2, Some(8), false, ui::pal().muted);
     rich_format(st.rich, r_head, Some(9), true, ui::pal().muted);
+    // リンク先の語があるかは、全件を1回だけ調べて決める(リンクが多い語でも、リンクの数×語の数にならないように)
+    let found = existing_words(st, links.iter().map(|l| l.1.as_str()).chain(body_links.iter().map(|l| l.2.as_str())));
+    // 行き先の無いリンクは点線にする: 未登録の語と、この PC のドライブ上の無いファイル
+    // (共有フォルダのファイルは、確かめると待たされることがあるので、確かめない)
+    let missing_word = |target: &str| match target.strip_prefix(core::WORD_SCHEME) {
+        Some(w) => !found.contains(&core::fold(w.trim())),
+        None => {
+            let p = core::resolve_path(target.trim().trim_matches('"'), base);
+            let local = p.as_bytes().get(1) == Some(&b':') && !p.starts_with("\\\\") && !base.as_os_str().is_empty();
+            local && !matches!(core::link_kind(target), core::LinkKind::Web | core::LinkKind::Scheme) && !Path::new(&p).exists()
+        }
+    };
     for (i, (bullet, name)) in r_links.iter().enumerate() {
         rich_format(st.rich, *bullet, Some(10), false, ui::pal().muted);
         rich_format(st.rich, *name, Some(10), false, ui::pal().accent);
-        let missing = links[i].1.strip_prefix(core::WORD_SCHEME).map_or(false, |w| !word_exists(st, w));
+        let missing = missing_word(&links[i].1);
         rich_link(st.rich, *name, missing);
         store.push((name.0 as i32, name.1 as i32, links[i].1.clone()));
     }
@@ -1514,7 +1575,7 @@ unsafe fn render(
         let r = (r_body.0 + a, r_body.0 + b);
         rich_format(st.rich, r, None, false, ui::pal().accent);
         // 未登録の語へのリンクと、画像(読み込めたら画像に置き換わる。読めなければ、このまま)は点線
-        let missing = target.strip_prefix(core::WORD_SCHEME).map_or(false, |w| !word_exists(st, w)) || target.starts_with(core::IMAGE_SCHEME);
+        let missing = missing_word(target) || target.starts_with(core::IMAGE_SCHEME);
         rich_link(st.rich, r, missing);
         store.push((r.0 as i32, r.1 as i32, target.clone()));
     }
@@ -1546,7 +1607,7 @@ unsafe fn render(
         let hosts = dict_hosts(st);
         for (a, b, path) in images.iter().filter(|i| pics::loadable(&i.2) && pics::auto_load(&core::resolve_path(&i.2, base), &hosts)).take(pics::MAX_IMAGES) {
             let alt: String = body.encode_utf16().skip(*a).take(b - a).map(|u| char::from_u32(u as u32).unwrap_or(' ')).collect();
-            slots.push(ImgSlot { start: (r_body.0 + a) as i32, end: (r_body.0 + b) as i32, path: core::resolve_path(path, base), raw: path.clone(), alt, shown: None });
+            slots.push(ImgSlot { start: (r_body.0 + a) as i32, end: (r_body.0 + b) as i32, path: core::resolve_path(path, base), raw: path.clone(), alt, shown: None, fail: None });
         }
         drop(slots);
         start_pics(st, gen);
@@ -1582,14 +1643,22 @@ unsafe fn start_pics(st: &State, gen: u32) {
             }
             let meta = std::fs::metadata(&path).ok();
             let stamp = meta.as_ref().and_then(|m| m.modified().ok());
-            let pic = match cached.iter().find(|c| c.0 == path && c.1 == stamp && stamp.is_some()) {
-                Some(c) => Some(c.2.clone()),
-                None => meta.filter(|m| m.is_file() && m.len() <= pics::MAX_BYTES).and_then(|_| std::fs::read(&path).ok()).and_then(|bytes| {
-                    let (_, w, h) = pics::probe(&bytes)?;
-                    Some(Arc::new(Pic { bytes, w, h }))
-                }),
+            let (pic, fail) = match cached.iter().find(|c| c.0 == path && c.1 == stamp && stamp.is_some()) {
+                Some(c) => (Some(c.2.clone()), None),
+                None => match &meta {
+                    Some(m) if !m.is_file() => (None, Some("ファイルではありません".to_string())),
+                    Some(m) if m.len() > pics::MAX_BYTES => (None, Some(format!("{} MB を超える画像は表示しません", pics::MAX_BYTES / 1024 / 1024))),
+                    Some(_) => match std::fs::read(&path) {
+                        Ok(bytes) => match pics::probe(&bytes) {
+                            Some((_, w, h)) => (Some(Arc::new(Pic { bytes, w, h })), None),
+                            None => (None, Some("画像の形式に対応していないか、ファイルが壊れています".to_string())),
+                        },
+                        Err(e) => (None, Some(format!("ファイルを読めません({e})"))),
+                    },
+                    None => (None, Some("ファイルが見つかりません".to_string())),
+                },
             };
-            let boxed = Box::into_raw(Box::new(PicMsg { gen, index, path, stamp, pic }));
+            let boxed = Box::into_raw(Box::new(PicMsg { gen, index, path, stamp, pic, fail }));
             if PostMessageW(HWND(hwnd as *mut c_void), WM_APP_IMAGE, WPARAM(0), LPARAM(boxed as isize)).is_err() {
                 drop(Box::from_raw(boxed));
                 return;
@@ -1654,8 +1723,9 @@ unsafe fn decode_dib(pic: &Pic, w: i32, h: i32) -> Option<Vec<u8>> {
     scaler.Initialize(&conv, w as u32, h as u32, WICBitmapInterpolationModeFant).ok()?;
     let mut pixels = vec![0u8; w as usize * h as usize * 4];
     scaler.CopyPixels(std::ptr::null(), w as u32 * 4, &mut pixels).ok()?;
-    // 透明な部分は、明るい地に重ねる(暗い配色でも。黒い線の図が見えなくならないように)
-    let bg = ui::LIGHT.bg.0;
+    // 透明な部分は、明るい地に重ねる(暗い配色でも。黒い線の図が見えなくならないように)。
+    // 設定 image_background = dark なら、本文の背景(暗い配色の地)に重ねる
+    let bg = if IMAGE_DARK_BG.load(Ordering::Relaxed) { ui::pal().bg.0 } else { ui::LIGHT.bg.0 };
     pics::dib_from_pbgra(&pixels, w as usize, h as usize, ((bg & 0xFF) as u8, ((bg >> 8) & 0xFF) as u8, ((bg >> 16) & 0xFF) as u8))
 }
 
@@ -1791,6 +1861,10 @@ unsafe fn refit_pics(st: &State) {
 
 /// 本文欄: 0件(案内)/ 1件(内容)/ 複数(件数)
 unsafe fn update_detail(st: &State) {
+    // 前の語のリンクの行き先の表示は消す(キーボードで別の語に移ったときも残らないように)
+    if st.hover_link.borrow_mut().take().is_some() {
+        update_status(st);
+    }
     let sel = selected_entries(st);
     match sel.len() {
         0 => {
@@ -1802,7 +1876,7 @@ unsafe fn update_detail(st: &State) {
                     "まだ語がありません",
                     "右上の「＋ 新規登録」(Ctrl+N)から、最初の語を登録できます。\n\
                      表計算ソフトなどで作った一覧(CSV / TSV / JSON)は、「設定」→「取り込む…」でまとめて入れられます。\n\
-                     意味の中に [[語]] と書くと、別の語へのリンクになります。使い方は、説明書(docs\\manual.md)を参照してください。",
+                     意味の中に [[語]] と書くと、別の語へのリンクになります。使い方は、F1 で開く説明書(manual.md)を参照してください。",
                 )
             } else if let Some(t) = missing.as_deref() {
                 (t, "Ctrl+N で、この語を見出し語にして登録できます。Alt+← で、リンクをたどる前の語に戻ります。")
@@ -2003,9 +2077,15 @@ unsafe fn jump_to_word(st: &mut State, word: &str) {
     }
     set_text(st.edit, &core::search_text_for(word));
     refresh(st);
-    // 検索と同じ規則でそろえて、見出し語が一致する語を選ぶ
+    // 検索と同じ規則でそろえて、見出し語が一致する語を選ぶ。
+    // 書いたとおりの大文字・小文字の語を先に選ぶ([[CA]] は Ca ではなく CA を開く)
     let key = core::fold(word.trim());
-    let row = st.matches.iter().position(|&i| st.entries[i as usize].word_norm() == key);
+    let exact = core::word_key(word.trim());
+    let row = st
+        .matches
+        .iter()
+        .position(|&i| core::word_key(&st.entries[i as usize].word) == exact)
+        .or_else(|| st.matches.iter().position(|&i| st.entries[i as usize].word_norm() == key));
     match row {
         Some(r) => {
             select_row(st, Some(r));
@@ -2173,7 +2253,7 @@ unsafe fn go_back(hwnd: HWND, st: &mut State) {
     if !st.loaded {
         return;
     }
-    st.hover_link = None;
+    *st.hover_link.borrow_mut() = None;
     if st.bm_view != v.bm_view {
         set_bm_view(st, v.bm_view);
     }
@@ -2223,6 +2303,18 @@ fn same_word_index(st: &State, skip: Option<(usize, i64)>) -> HashMap<String, Ve
         }
     }
     map
+}
+
+/// 同じ見出し語の知らせに添える、各語の見出し語と意味の冒頭(「Ca: カルシウム…」)
+fn word_previews(st: &State) -> HashMap<(usize, i64), String> {
+    st.entries
+        .iter()
+        .map(|e| {
+            let m: String = e.meaning.chars().take(24).map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).collect();
+            let more = if e.meaning.chars().count() > 24 { "…" } else { "" };
+            ((e.dict, e.id), format!("(「{}」: {m}{more})", e.word))
+        })
+        .collect()
 }
 
 // ---- しおり・並び順 ---------------------------------------------------------
@@ -2405,12 +2497,14 @@ unsafe fn copy_selected(hwnd: HWND, st: &mut State, what: usize) {
             let e = &st.entries[i];
             match what {
                 CM_COPY_WORD => e.word.clone(),
-                CM_COPY_MEANING => e.meaning.clone(),
-                _ => format!("{}\t{}", e.word, e.meaning.replace("\r\n", "\n").replace('\n', " ")),
+                CM_COPY_MEANING => core::display_text(&e.meaning).into_owned(), // リンク・画像の記法は外す(表示と同じ文)
+                _ => format!("{}\t{}", e.word, core::display_text(&e.meaning).replace("\r\n", "\n").replace('\n', " ")),
             }
         })
         .collect();
-    if ui::set_clipboard(hwnd, &lines.join("\n")) {
+    // 意味だけを複数コピーするときは、空行で区切る(意味の中の改行と見分けられるように)
+    let sep = if what == CM_COPY_MEANING { "\n\n" } else { "\n" };
+    if ui::set_clipboard(hwnd, &lines.join(sep)) {
         notice(st, &if sel.len() == 1 { "コピーしました".to_string() } else { format!("{} 件をコピーしました", sel.len()) });
     } else {
         notice(st, "コピーできませんでした(クリップボードを他のアプリが使用中です)");
@@ -2429,7 +2523,7 @@ unsafe fn list_menu(hwnd: HWND, st: &mut State, by_key: bool) {
     let gray = |on: bool| if on { MF_STRING } else { MF_STRING | MF_GRAYED };
     let marked = sel.iter().all(|&i| st.bm_map.contains_key(&(st.entries[i].dict, st.entries[i].id)));
     let _ = AppendMenuW(menu, MF_STRING, CM_COPY_WORD, w!("見出し語をコピー"));
-    let _ = AppendMenuW(menu, MF_STRING, CM_COPY_MEANING, w!("意味をコピー"));
+    let _ = AppendMenuW(menu, MF_STRING, CM_COPY_MEANING, w!("意味をコピー\tCtrl+Shift+C"));
     let _ = AppendMenuW(menu, MF_STRING, CM_COPY_BOTH, w!("見出し語と意味をコピー\tCtrl+C"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     if !st.cfg.shared {
@@ -2891,10 +2985,13 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
         _ if st.matches.is_empty() && !q.contains(char::is_whitespace) => q,
         _ => String::new(),
     };
+    // かなだけで検索して見つからなかったときは、読みの欄にも入れる(漢字の見出し語に直して登録できるように)
+    let is_kana = |c: char| matches!(c, 'ぁ'..='ゖ' | 'ァ'..='ヺ' | 'ー' | 'ｦ'..='ﾟ');
+    let reading = if !word.is_empty() && word.chars().all(is_kana) { word.clone() } else { String::new() };
     let mut dlg = EntryDlg {
         title: "新規登録".into(),
         word,
-        reading: String::new(),
+        reading,
         tags: String::new(),
         meaning: String::new(),
         link: String::new(),
@@ -2902,6 +2999,7 @@ unsafe fn do_new(hwnd: HWND, st: &mut State) {
         choice,
         show_choice: targets.len() > 1,
         same_words: same_word_index(st, None),
+        previews: word_previews(st),
         dict_names: st.dicts.iter().map(|d| d.name.clone()).collect(),
         targets: targets.clone(),
         orig_word: String::new(),
@@ -2989,6 +3087,7 @@ unsafe fn do_edit(hwnd: HWND, st: &mut State) {
         choice: 0,
         show_choice: false,
         same_words: same_word_index(st, Some((e.dict, e.id))),
+        previews: word_previews(st),
         dict_names: st.dicts.iter().map(|d| d.name.clone()).collect(),
         targets: vec![e.dict],
         orig_word: e.word.clone(),
@@ -3254,6 +3353,8 @@ unsafe fn reload_config(hwnd: HWND, st: &mut State) {
     st.cfg_path = init.cfg_path;
     st.cfg_ok = init.cfg_ok;
     st.cfg_stamp = init.cfg_stamp;
+    IMAGE_DARK_BG.store(st.cfg.image_dark_bg, Ordering::Relaxed);
+    st.pic_cache.borrow_mut().clear();
     st.warns = init.warns.clone();
     st.alerts = init.warns;
     if let Some(w) = register_hotkey(hwnd, st) {
@@ -3268,6 +3369,23 @@ unsafe fn reload_config(hwnd: HWND, st: &mut State) {
     apply_mode(hwnd, st);
     layout(hwnd, st);
     start_load(hwnd, st, false);
+}
+
+/// 説明書(manual.md)を開く。exe と同じフォルダ(または docs フォルダ)にあるものを、関連付けられたアプリで開く
+unsafe fn open_manual(hwnd: HWND, st: &mut State) {
+    let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
+    let found = [dir.join("manual.md"), dir.join("docs").join("manual.md")].into_iter().find(|p| p.is_file());
+    match found {
+        Some(p) => {
+            let w = wide(&p.to_string_lossy());
+            let r = ShellExecuteW(hwnd, w!("open"), PCWSTR(w.as_ptr()), PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
+            if r.0 as isize <= 32 {
+                // .md を開くアプリが無いときは、メモ帳で開く
+                let _ = ShellExecuteW(hwnd, w!("open"), w!("notepad.exe"), PCWSTR(w.as_ptr()), PCWSTR::null(), SW_SHOWNORMAL);
+            }
+        }
+        None => notice(st, "説明書(manual.md)が見つかりません。配布物の manual.md を、MyDictionary.exe と同じフォルダに置いてください"),
+    }
 }
 
 unsafe fn open_config(hwnd: HWND, st: &State) {
@@ -3468,6 +3586,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 (ID_DICTS, BN_CLICKED_) => do_select_dicts(hwnd, st),
                 (ID_UNDOKEY, _) => do_undo(hwnd, st),
+                (ID_HELP, _) => open_manual(hwnd, st),
+                (ID_RELOAD, _) => {
+                    if st.loaded {
+                        remember_selection(st);
+                        st.warns.push("辞書を読み直しました".into());
+                        start_load(hwnd, st, true);
+                    }
+                }
                 (ID_COPYMEANING, _) => copy_selected(hwnd, st, CM_COPY_MEANING),
                 (ID_MENUKEY, _) => {
                     let f = GetFocus();
@@ -3503,9 +3629,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let on = !st.bm_view;
                     set_bm_view(st, on);
                     if on {
-                        // まず全部のしおりが見えるよう、検索語は空にする(この後、しおりの中を検索できる)
+                        // まず全部のしおりが見えるよう、検索語は空にする(この後、しおりの中を検索できる)。
+                        // 空にする前の検索語は控えておき、しおり一覧を出たときに戻す
+                        st.bm_saved_query = Some([st.edit, st.qw, st.qm, st.qt].map(|h| get_text(h)));
                         for h in [st.edit, st.qw, st.qm, st.qt] {
                             set_text(h, "");
+                        }
+                    } else if let Some(saved) = st.bm_saved_query.take() {
+                        for (h, t) in [st.edit, st.qw, st.qm, st.qt].into_iter().zip(saved) {
+                            set_text(h, &t);
                         }
                     }
                     if st.loaded {
@@ -3525,7 +3657,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 refresh(st);
                             }
                             let _ = SetFocus(st.edit);
-                        } else {
+                        } else if st.cfg.close_to_tray {
+                            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+                        } else if st.cfg.hotkey.is_some() {
+                            // Esc では終了しない(終了すると、ホットキーで呼び出せなくなる)。最小化して、ホットキーで戻せるようにする
+                            let _ = ShowWindow(hwnd, SW_MINIMIZE);
+                        } else if st.undo.is_some() || message_box(hwnd, "MyDictionary を終了しますか?", "終了の確認", MB_YESNO | MB_ICONQUESTION) == IDYES {
+                            // 元に戻せる操作があるときは、WM_CLOSE の確認(confirm_quit)が代わりにたずねる
                             let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
                         }
                     }
@@ -3647,6 +3785,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if m.gen == st.detail_gen.load(Ordering::Relaxed) {
                         show_pic(st, m.index, pic);
                     }
+                } else if m.gen == st.detail_gen.load(Ordering::Relaxed) {
+                    if let Some(slot) = st.img_slots.borrow_mut().get_mut(m.index) {
+                        slot.fail = m.fail.clone();
+                    }
                 }
             }
             LRESULT(0)
@@ -3654,7 +3796,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_LINK => {
             let target = *Box::from_raw(lparam.0 as *mut String);
             if let Some(st) = state(hwnd) {
-                st.hover_link = None; // 移動や表示の切替で、リンクの位置が変わる
+                *st.hover_link.borrow_mut() = None; // 移動や表示の切替で、リンクの位置が変わる
                 open_link(hwnd, st, &target);
             }
             LRESULT(0)

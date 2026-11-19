@@ -134,6 +134,8 @@ pub struct Config {
     pub shared: bool,
     /// 画面の配色(変更は、次に起動したときから反映する)
     pub theme: Theme,
+    /// 暗い配色のとき、画像の透明な部分を暗い地に重ねる(既定は明るい地。黒い線の図が見えるように)
+    pub image_dark_bg: bool,
     pub dicts: Vec<DictConf>,
 }
 
@@ -146,6 +148,7 @@ impl Config {
             title: String::new(),
             shared: false,
             theme: Theme::Light,
+            image_dark_bg: false,
             dicts: vec![DictConf { id: "main".into(), name: "メイン".into(), path: base.join("dictionary.db"), readonly: false, written: None }],
         }
     }
@@ -168,6 +171,8 @@ title =\r\n\
 shared = false\r\n\
 ; 画面の配色: light(明るい)/ dark(暗い)/ system(Windows の設定に合わせる)。次に起動したときから反映されます\r\n\
 theme = light\r\n\
+; 暗い配色で、画像の透明な部分を重ねる地: light(明るい。黒い線の図が見える)/ dark(暗い。白い線の図や切り抜き写真が自然に見える)\r\n\
+;image_background = dark\r\n\
 \r\n\
 ; 辞書の定義。[dictionary.任意のID] を必要なだけ書きます。先頭が既定の登録先です。\r\n\
 ; path は相対パスなら、この設定ファイルのあるフォルダ基準。%APPDATA% などの環境変数も使えます。\r\n\
@@ -278,6 +283,10 @@ pub fn to_ini(cfg: &Config, base: &Path) -> String {
     // 既定(明るい)のときは書かない(この設定を知らない古い版が、同じ設定ファイルを読んでも警告を出さないように)
     if cfg.theme != Theme::Light {
         s.push_str(&format!("theme = {}\r\n", cfg.theme.key()));
+    }
+    if cfg.image_dark_bg {
+        s.push_str("; 暗い配色で、画像の透明な部分を重ねる地: light(明るい)/ dark(暗い)\r\n");
+        s.push_str("image_background = dark\r\n");
     }
     s.push_str("\r\n; 辞書。先頭が既定の登録先。path の相対パスは、この設定ファイルのあるフォルダが基準\r\n");
     let mut used: Vec<String> = Vec::new();
@@ -516,6 +525,11 @@ pub fn parse(text: &str, base: &Path, getenv: &dyn Fn(&str) -> Option<String>) -
                     Some(t) => cfg.theme = t,
                     None => warns.push(format!("設定: {}行目 theme の値「{}」を解釈できないため、light を使います(light / dark / system)", n + 1, v)),
                 },
+                "image_background" => match v.to_ascii_lowercase().as_str() {
+                    "light" => cfg.image_dark_bg = false,
+                    "dark" => cfg.image_dark_bg = true,
+                    _ => warns.push(format!("設定: {}行目 image_background の値「{}」を解釈できないため、light を使います(light / dark)", n + 1, v)),
+                },
                 "timing_log" => {} // 廃止した設定(古い設定ファイルに残っていても無視する)
                 _ => warns.push(format!("設定: {}行目 未知のキー {}", n + 1, k)),
             }
@@ -655,6 +669,7 @@ mod tests {
             title: "社内 用語集".into(),
             shared: true,
             theme: Theme::System,
+            image_dark_bg: false,
             dicts: vec![
                 DictConf { id: "main".into(), name: "メイン".into(), path: base.join("dictionary.db"), readonly: false, written: None },
                 DictConf { id: "ref".into(), name: "参照 用".into(), path: PathBuf::from("/other/dir/ref.db"), readonly: true, written: None },
@@ -763,6 +778,11 @@ mod tests {
         assert_eq!(c.theme, Theme::Light);
         assert!(w.iter().any(|x| x.contains("theme")));
         assert_eq!((Theme::Dark.key(), Theme::from_key("x")), ("dark", None));
+        // 画像の透明な部分の地
+        let (c, w) = parse("[general]\nimage_background = dark\n", base, &env);
+        assert!(w.is_empty() && c.image_dark_bg);
+        assert!(parse(&to_ini(&c, base), base, &env).0.image_dark_bg);
+        assert!(!to_ini(&Config::default_for(base), base).contains("image_background"));
     }
 
     #[test]

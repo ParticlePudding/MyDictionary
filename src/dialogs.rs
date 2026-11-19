@@ -225,6 +225,8 @@ pub struct EntryDlg {
     pub show_choice: bool,
     /// 同じ見出し語の語を調べるための索引: そろえた見出し語(`core::fold`)→ (辞書の添字, id)。編集中の語自身は含めない
     pub same_words: HashMap<String, Vec<(usize, i64)>>,
+    /// 同じ見出し語の知らせに添える、すでにある語の見出し語と意味の冒頭((辞書の添字, id) で引く)
+    pub previews: HashMap<(usize, i64), String>,
     /// 辞書の名前(`same_words` の辞書の添字で引く)
     pub dict_names: Vec<String>,
     /// 登録先の候補(`choices` と同じ並び)の、辞書の添字。編集のときは、その語の辞書1つ
@@ -379,7 +381,7 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             // タグの欄の右に、すでにあるタグから選ぶボタン
             let pick_w = 84;
             let tags = ui::field(hwnd, E_TAGS, (s(m), s(y + 22), s(fw - pick_w - 8), s(CTL_H)), dpi, false, &mut fields, fonts.base);
-            button(hwnd, "選ぶ…", E_TAGPICK, (s(m + fw - pick_w), s(y + 22), s(pick_w), s(CTL_H)), true);
+            let pick = button(hwnd, "選ぶ…", E_TAGPICK, (s(m + fw - pick_w), s(y + 22), s(pick_w), s(CTL_H)), true);
             y += 66;
 
             label(hwnd, "意味(リンクは [表示名](開く先)、画像は ![説明](パス) と書けます)", (s(m), s(y), s(fw - 130), s(20)), fonts.small, 0);
@@ -411,10 +413,12 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             label(hwnd, "参照先(任意。1行に1つ。「表示名 | URL」と書くと表示名を付けられます)", (s(m), s(y), s(fw), s(20)), fonts.small, 0);
             let link = ui::field(hwnd, E_LINK, (s(m), s(y + 22), s(fw), s(76)), dpi, true, &mut fields, fonts.base);
             y += 22 + 76 + 12;
-            // Tab の順番: 入力欄(見出し語 → 読み → タグ → 意味 → 参照先)を先に、リンク(「画像を追加…」「その語を表示」)は後に回す
-            // (知らせのリンクが出たり消えたりしても、欄の間の移動の順番が変わらないように)
+            // Tab の順番: 入力欄(見出し語 → 読み → タグ → 意味 → 参照先)を先に、
+            // タグの「選ぶ…」とリンク(「画像を追加…」「その語を表示」)は後に回す
+            // (タグを入れて Tab を押すと意味の欄へ移る。知らせのリンクが出たり消えたりしても、欄の間の移動の順番が変わらない)
             let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-            let _ = SetWindowPos(add_pic, link, 0, 0, 0, 0, flags);
+            let _ = SetWindowPos(pick, link, 0, 0, 0, 0, flags);
+            let _ = SetWindowPos(add_pic, pick, 0, 0, 0, 0, flags);
             let _ = SetWindowPos(dup_link, add_pic, 0, 0, 0, 0, flags);
 
             let hinst = GetModuleHandleW(None).unwrap();
@@ -579,7 +583,11 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                     if !ui::is_busy() {
                         if let Some(msg) = entry_over(c) {
                             set_text(c.err, &msg);
-                        } else if !std::mem::take(&mut c.max_hit) {
+                        } else if std::mem::take(&mut c.max_hit) {
+                            // 上限の知らせを残す
+                        } else if id == E_READING && get_text(c.reading).chars().any(|ch| ch.is_ascii_alphabetic()) {
+                            set_text(c.err, "読みには、ひらがなを入れてください(ローマ字の読みでは、かなで検索しても見つかりません)");
+                        } else {
                             set_text(c.err, "");
                         }
                         if id == E_WORD {
@@ -831,7 +839,11 @@ unsafe fn update_dup(c: &EntryCtl) {
     let key = core::fold(get_text(c.word).trim());
     match d.same_words.get(&key).filter(|h| !key.is_empty() && !h.is_empty()) {
         Some(hits) => {
-            set_text(c.dup, &dup_text(hits, &d.dict_names));
+            let mut text = dup_text(hits, &d.dict_names);
+            if let Some(p) = hits.first().and_then(|h| d.previews.get(h)) {
+                text.push_str(&format!(" {p}"));
+            }
+            set_text(c.dup, &text);
             let _ = ShowWindow(c.dup_link, SW_SHOW);
         }
         None => {

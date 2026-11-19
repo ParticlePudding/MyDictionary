@@ -570,6 +570,23 @@ fn is_or_word(raw: &str) -> bool {
     raw == "OR" || raw == "ＯＲ"
 }
 
+/// 先頭の `-` が「除外」の印なら、その後ろ。次の語は除外にせず、書いたとおりに探す:
+/// - `-` の後ろが数字(`-2` `-01-01` `-2147024891`。負の数や日付の一部)
+/// - `\-` で始まる語(`\-OH` `\-Werror` は、`-OH` `-Werror` を探す。`fold` の後の形で判定する)
+fn split_neg(t: &str) -> Option<&str> {
+    let rest = t.strip_prefix('-')?;
+    (!rest.starts_with(|c: char| c.is_ascii_digit())).then_some(rest)
+}
+
+/// 検索欄に書かれた、除外する語(下段に「除外中」と出すため)。OR や入力途中の `-` だけの語は除く
+pub fn excluded_words(input: &str) -> Vec<String> {
+    input
+        .split_whitespace()
+        .filter_map(|raw| split_neg(&fold(raw)).map(|_| raw.chars().skip(1).collect::<String>()))
+        .filter(|w| !w.is_empty() && is_term(w))
+        .collect()
+}
+
 /// 入力欄1つぶんを節の列にする。`tag_field` はタグ欄(カンマ・読点でも区切る)。
 /// `-` や `|` だけ、`a|` のような入力途中の形は、その部分を無視する。
 fn parse_clauses(input: &str, tag_field: bool) -> Vec<Clause> {
@@ -582,9 +599,9 @@ fn parse_clauses(input: &str, tag_field: bool) -> Vec<Clause> {
             continue;
         }
         let t = fold(raw);
-        let (neg, body) = match t.strip_prefix('-') {
+        let (neg, body) = match split_neg(&t) {
             Some(rest) => (true, rest),
-            None => (false, t.as_str()),
+            None => (false, t.strip_prefix('\\').filter(|r| r.starts_with('-')).unwrap_or(t.as_str())),
         };
         if body.starts_with('|') && !neg && !out.is_empty() {
             join = true;
@@ -804,7 +821,8 @@ impl Query {
         let all = pieces(&p.all);
         let mut word = all.clone();
         word.extend(pieces(&p.word));
-        let mut meaning = all.clone();
+        // 意味の欄では、英数字1文字の語(「a」「2」)は強調しない(本文の英数字が、ほとんど強調されてしまうため)
+        let mut meaning: Vec<String> = all.iter().filter(|t| !(t.chars().count() == 1 && t.is_ascii())).cloned().collect();
         meaning.extend(pieces(&p.meaning));
         let mut tag = all;
         tag.extend(pieces(&p.tag));
@@ -1138,6 +1156,8 @@ pub fn link_kind(link: &str) -> LinkKind {
         "wsc", "hta", "lnk", "url", "reg", "inf", "jar", "cpl", "dll", "ocx", "sys", "appref-ms", "application", "appx", "appxbundle", "msix",
         "msixbundle", "chm", "hlp", "gadget", "scf", "library-ms", "searchconnector-ms", "settingcontent-ms", "diagcab", "xll", "iso", "img",
         "vhd", "vhdx", "docm", "dotm", "xlsm", "xltm", "xlam", "pptm", "potm", "ppam", "sldm", "website", "theme", "themepack", "ins", "isp",
+        // スクリプト(処理系が入っていれば、開くと実行される)
+        "py", "pyw", "pyc", "pyz", "rb", "rbw", "pl", "sh", "bash", "ahk", "au3", "php", "tcl", "lua", "ps1xml", "mshxml", "sct", "cab",
     ];
     // スキーム(2文字以上。1文字はドライブ名)
     if let Some((scheme, _)) = l.split_once(':') {
@@ -1296,6 +1316,19 @@ mod tests {
     }
 
     #[test]
+    fn minus_followed_by_digit_is_text() {
+        let e = vec![
+            Entry::new(1, "-2147024891".into(), "".into(), "エラーの番号".into(), 0),
+            Entry::new(2, "-OH".into(), "".into(), "ヒドロキシ基".into(), 0),
+            Entry::new(3, "OH".into(), "".into(), "".into(), 0),
+        ];
+        assert_eq!(filter(&e, &q("-2147024891")), vec![0]); // 数字が続く - は、文字として探す
+        assert_eq!(filter(&e, &q("\\-OH")), vec![1]); // \- は、- を文字として探す
+        assert_eq!(filter(&e, &q("OH -ヒドロキシ")), vec![2]); // それ以外の - は除外
+        assert_eq!(excluded_words("OH -ヒドロキシ -2 \\-x -"), vec!["ヒドロキシ".to_string()]);
+    }
+
+    #[test]
     fn and_search_and_tags() {
         let e = sample();
         assert_eq!(filter(&e, &q("apple company")), vec![2]);
@@ -1373,11 +1406,11 @@ mod tests {
         assert_eq!(mark_ranges("😀辞書の辞", &t(&["辞書"])), vec![(2, 4)]);
         assert!(mark_ranges("abc", &t(&[])).is_empty());
         assert!(mark_ranges("abc", &t(&["zzz", ""])).is_empty());
-        let q = Query { all: "A b".into(), word: "W".into(), tag: "t1,t2".into(), ..Default::default() };
+        let q = Query { all: "A bc".into(), word: "W".into(), tag: "t1,t2".into(), ..Default::default() };
         let (w, m, tg) = q.mark_terms();
-        assert_eq!(w, t(&["a", "b", "w"]));
-        assert_eq!(m, t(&["a", "b"]));
-        assert_eq!(tg, t(&["a", "b", "t1", "t2"]));
+        assert_eq!(w, t(&["a", "bc", "w"]));
+        assert_eq!(m, t(&["bc"])); // 意味では、英数字1文字の語は強調しない
+        assert_eq!(tg, t(&["a", "bc", "t1", "t2"]));
     }
 
     #[test]
@@ -1876,6 +1909,7 @@ mod tests {
         assert_eq!(link_kind("C:\\docs\\spec.pdf"), LinkKind::Other);
         assert_eq!(link_kind("\\\\server\\share\\folder"), LinkKind::Other);
         assert_eq!(link_kind("mailto:a@example.com"), LinkKind::Other);
+        assert_eq!(link_kind("\\\\fs01\\tools\\setup.py"), LinkKind::Executable); // スクリプトも強い警告
         // すり抜けの形: 末尾のピリオド・空白、ストリームの指定、実行されうる種類の追加
         assert_eq!(link_kind("C:\\Windows\\System32\\calc.exe."), LinkKind::Executable);
         assert_eq!(link_kind("C:\\x\\a.exe . ."), LinkKind::Executable);

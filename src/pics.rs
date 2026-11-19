@@ -130,14 +130,21 @@ pub fn fit(w: u32, h: u32, max_w: i32, dpi: i32) -> (i32, i32) {
     (dw.max(1) as i32, dh.max(1) as i32)
 }
 
-/// 表示する大きさ。`fit` に加えて、高さも `max_h` に収める(縦に長い画像で、本文が埋まらないように)
+/// 表示する大きさ。`fit` に加えて、縦長の画像は、高さも `max_h` に収める(本文が画像で埋まらないように)。
+/// ただし、幅は `max_w` の半分(元がそれより小さければ元の幅)より細くしない(細長い図面が読めなくならないように)。
+/// 横長の画像は、幅だけを合わせる
 pub fn fit_box(w: u32, h: u32, max_w: i32, max_h: i32, dpi: i32) -> (i32, i32) {
     let (dw, dh) = fit(w, h, max_w, dpi);
     let max_h = max_h.max(16);
-    if dh > max_h {
-        (((dw as i64 * max_h as i64) / dh as i64).max(1) as i32, max_h)
+    if dh <= dw || dh <= max_h {
+        return (dw, dh);
+    }
+    let (cw, ch) = (((dw as i64 * max_h as i64) / dh as i64).max(1) as i32, max_h);
+    let min_w = dw.min(max_w.max(16) / 2);
+    if cw >= min_w {
+        (cw, ch)
     } else {
-        (dw, dh)
+        (min_w, ((dh as i64 * min_w as i64) / dw as i64).max(1) as i32)
     }
 }
 
@@ -359,8 +366,13 @@ mod tests {
         assert_eq!(fit(1, 10000, 600, 96), (1, 10000));
         assert_eq!(fit(4000, 1, 600, 96), (600, 1));
         // 高さの上限: 縦長の画像は、高さに合わせて縮める
-        assert_eq!(fit_box(300, 3000, 600, 400, 96), (40, 400));
+        // 縦長: 高さを収めるが、幅は表示幅の半分(300)より細くしない
+        assert_eq!(fit_box(300, 3000, 600, 400, 96), (300, 3000));
+        assert_eq!(fit_box(600, 900, 600, 400, 96), (300, 450));
+        assert_eq!(fit_box(400, 500, 600, 400, 96), (320, 400));
+        // 横長: 幅だけを合わせる(高さの上限は使わない)
         assert_eq!(fit_box(1200, 900, 600, 1000, 96), (600, 450));
+        assert_eq!(fit_box(1200, 900, 600, 200, 96), (600, 450));
     }
 
     #[test]

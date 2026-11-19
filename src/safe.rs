@@ -188,6 +188,21 @@ pub fn restore(db: &Path, backup: &Path) -> Result<(), String> {
     if !file_ok(backup) {
         return Err("バックアップ自体が壊れています".into());
     }
+    // 置き換える前の(壊れた)ファイルは、バックアップと同じ場所に控えておく(後から調べたり、残っている語を取り出したりできるように)
+    if db.exists() {
+        if let Some(dir) = backup.parent() {
+            let secs = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+            let _ = std::fs::copy(db, dir.join(format!("replaced-{secs}.db")));
+            // 控えは、新しい3つだけ残す
+            let mut old: Vec<PathBuf> = std::fs::read_dir(dir)
+                .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.file_name().map_or(false, |n| n.to_string_lossy().starts_with("replaced-"))).collect())
+                .unwrap_or_default();
+            old.sort();
+            for p in old.iter().rev().skip(3) {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
     let mut tmp_name = db.file_name().map(|s| s.to_os_string()).unwrap_or_default();
     tmp_name.push(".restore-tmp");
     let tmp = db.with_file_name(tmp_name);

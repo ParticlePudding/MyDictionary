@@ -44,6 +44,7 @@ jobs:
           name: MyDictionary-windows-x64
           path: |
             target/release/MyDictionary.exe
+            docs/manual.md
             LICENSE
             THIRD-PARTY-NOTICES.txt
           if-no-files-found: error
@@ -62,7 +63,7 @@ jobs:
             sleep 5
           fi
           # タグが無ければ、このコミットに作られる
-          gh release create "$TAG" target/release/MyDictionary.exe LICENSE THIRD-PARTY-NOTICES.txt \
+          gh release create "$TAG" target/release/MyDictionary.exe docs/manual.md LICENSE THIRD-PARTY-NOTICES.txt \
             --target "$GITHUB_SHA" \
             --title "MyDictionary ${TAG#v}" \
             --notes-file docs/release-notes.md
