@@ -293,9 +293,9 @@ unsafe fn entry_over(c: &EntryCtl) -> Option<String> {
         _ => 0,
     };
     Some(if now > 0 {
-        format!("{name}が長すぎます(いま {now} 文字。{max} 文字まで。改行も1文字と数えます)。減らすまで保存できません")
+        format!("{name}が長すぎます(いま {now} 文字。{max} 文字まで)。保存できません")
     } else {
-        format!("{name}は {max} 文字までです。減らすまで保存できません")
+        format!("{name}は {max} 文字までです。保存できません")
     })
 }
 
@@ -575,7 +575,7 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         E_MEANING => ("意味", core::MAX_MEANING),
                         _ => ("参照先", core::MAX_LINK),
                     };
-                    let msg = entry_over(c).map(|m| format!("入りきらなかった分は入力されていません。{m}"));
+                    let msg = entry_over(c).map(|m| format!("一部が入りませんでした。{m}"));
                     set_text(c.err, &msg.unwrap_or_else(|| format!("{name}は {max} 文字までです。入りきらなかった分は入力されていません")));
                     c.max_hit = true;
                 }
@@ -586,7 +586,7 @@ unsafe extern "system" fn entry_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         } else if std::mem::take(&mut c.max_hit) {
                             // 上限の知らせを残す
                         } else if id == E_READING && get_text(c.reading).chars().any(|ch| ch.is_ascii_alphabetic()) {
-                            set_text(c.err, "読みには、ひらがなを入れてください(ローマ字の読みでは、かなで検索しても見つかりません)");
+                            set_text(c.err, "読みは、ひらがなで入れてください(ローマ字では、かなで探せません)");
                         } else {
                             set_text(c.err, "");
                         }
