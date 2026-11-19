@@ -260,6 +260,8 @@ struct State {
     loading: bool,
     /// タグの名前の変更・削除の後、読み込みが終わったらタグの一覧を開き直す
     reopen_tags: bool,
+    /// Alt+← で戻ったときの、本文のスクロールの位置(後から入る画像の後でも、この位置にする)。語を表示し直すと消す
+    scroll_target: Cell<Option<POINT>>,
     /// しおり一覧を開く前の検索語(検索欄, 見出し語, 意味, タグ)。しおり一覧を出たときに戻す
     bm_saved_query: Option<[String; 4]>,
     gen: u32,
@@ -948,6 +950,7 @@ unsafe fn on_create(hwnd: HWND, init: InitData) -> State {
         loaded: false,
         loading: false,
         reopen_tags: false,
+        scroll_target: Cell::new(None),
         bm_saved_query: None,
         gen: 0,
         advanced: false,
@@ -1772,6 +1775,10 @@ unsafe fn show_pic(st: &State, index: usize, pic: &Pic) {
     send(st.rich, EM_EXGETSEL, 0, &mut sel as *mut _ as isize);
     let mut scroll = POINT::default();
     send(st.rich, EM_GETSCROLLPOS, 0, &mut scroll as *mut _ as isize);
+    // Alt+← で戻った直後は、戻す先のスクロールの位置を使う(画像が後から入って、位置がずれないように)
+    if let Some(p) = st.scroll_target.get() {
+        scroll = p;
+    }
     send(st.rich, WM_SETREDRAW, 0, 0);
     send(st.rich, EM_SETREADONLY, 0, 0);
     let before = rich_text_len(st.rich);
@@ -1861,6 +1868,7 @@ unsafe fn refit_pics(st: &State) {
 
 /// 本文欄: 0件(案内)/ 1件(内容)/ 複数(件数)
 unsafe fn update_detail(st: &State) {
+    st.scroll_target.set(None);
     // 前の語のリンクの行き先の表示は消す(キーボードで別の語に移ったときも残らないように)
     if st.hover_link.borrow_mut().take().is_some() {
         update_status(st);
@@ -2269,6 +2277,7 @@ unsafe fn go_back(hwnd: HWND, st: &mut State) {
     if let Some((d, id)) = v.selected {
         select_entry(st, d, id);
         send(st.rich, EM_SETSCROLLPOS, 0, &v.scroll as *const _ as isize);
+        st.scroll_target.set(Some(v.scroll));
     }
     notice(st, "リンクで移動する前の表示に戻りました");
 }
@@ -2653,6 +2662,12 @@ unsafe extern "system" fn rich_subclass(hwnd: HWND, msg: u32, wparam: WPARAM, lp
                     SetCursor(LoadCursorW(None, IDC_HAND).unwrap());
                     return LRESULT(1);
                 }
+            }
+        }
+        WM_MOUSEWHEEL | WM_VSCROLL | WM_KEYDOWN | WM_LBUTTONDOWN => {
+            // 自分でスクロールしたら、Alt+← で戻した位置にはもう合わせない
+            if let Some(st) = st.as_ref() {
+                st.scroll_target.set(None);
             }
         }
         WM_MOUSEMOVE => {
